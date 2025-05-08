@@ -4,6 +4,14 @@
 Run #1 产物保持不可变；本文中的修正口径只适用于后续运行和只读诊断，不回写历史产物。
 真实评测必须在本地 preflight 通过后，显式运行 DEV 命令。
 
+## 当前保留配置
+
+经过 Run #6 至 Run #9 的 DEV 受控实验，普通 ChatBI 运行保留：NL2SQL 初次生成和有界
+repair 均为 `reasoning="disabled"`、`max_tokens=1024`；结果分析为
+`reasoning="disabled"`、`max_tokens=1024`。这是默认配置，不代表任何 TEST 结果。
+环境变量仍可有意覆盖默认预算，实际 provider 运行必须以 preflight 和 provenance 中的解析值
+为准。历史 Run #5 至 Run #9 产物保持原样，仅作为实验记录，不改变当前默认配置。
+
 ## DEV Baseline Run #1
 
 以下是冻结 Run #1 的历史观察，不能作为新的运行结果或产品质量承诺：
@@ -37,11 +45,12 @@ DEV Baseline Run #2（run ID：`9dd19827-0329-4618-914e-3a72f5d5e16c`）的调�
 23 次以同样的 512-token 截断并产生结构化解析失败。这是已确认的输出容量瓶颈，不是对模型
 质量的重新评估。
 
-因此，后续 ChatBI provider DEV 运行将统一使用 `1024` output tokens：首次和有界 repair 的
-NL2SQL 生成共用 `chatbi_nl2sql_max_tokens=1024`，结果分析使用
-`chatbi_analysis_max_tokens=1024`。修复次数、prompt、response schema、temperature、模型、
-比较器和数据集均不变；历史 Run #1/Run #2 产物不回写，TEST split 仍不可用。该调整只修正已
-确认的输出预算限制，在新的 DEV 运行前不宣称质量提升。
+因此，A5.7d1 及其后续已记录的 1024-token 运行使用：首次和有界 repair 的 NL2SQL 生成共用
+`chatbi_nl2sql_max_tokens=1024`，结果分析使用 `chatbi_analysis_max_tokens=1024`。这段数字只
+描述对应的历史运行；后续窄实验可以显式改变 NL2SQL 配置，但不得回写历史产物。修复次数、
+prompt、response schema、temperature、模型、比较器和数据集均不变；历史 Run #1/Run #2 产物不
+回写，TEST split 仍不可用。该调整只修正已确认的输出预算限制，在新的 DEV 运行前不宣称质量
+提升。
 
 ## A5.7d2 分析契约硬化（未运行 provider）
 
@@ -57,6 +66,68 @@ Run #4 已确认 A5.7d2 消除了 analysis token-limit failure；剩余可见质
 NL2SQL 投影规则：按问题选择恰好足够的列或派生值，不自动暴露 join/filter/group/order 的
 辅助列，并在问题明确时保持请求顺序。该修改不包含 case ID、fixture 表名、reference SQL
 或期望答案，也尚未运行新的 DEV/TEST provider 评测，不宣称准确率提升。
+
+## A5.7d4 生成稳定性实验（未运行 provider）
+
+A5.7d4 只在 NL2SQL 初次生成和有界 repair 请求中显式设置 provider-neutral 的
+`reasoning=disabled`；DeepSeek 适配器因此发送 `thinking: {"type":"disabled"}`。结果分析、
+其他 LLM task、prompt v3、结构化输出契约、1024-token 上限、重试策略、验证器、执行器和冻结
+数据集均不变。下一次 provider 运行的 provenance 会记录实际 NL2SQL reasoning mode，Run #5
+不会被回写或重新解释；本次未运行 DEV/TEST provider 评测。
+
+## A5.7d5 低推理 NL2SQL 实验（未运行 provider）
+
+A5.7d5 是一个只改变 NL2SQL 初次生成和有界 repair 推理控制的窄实验：应用层使用
+provider-neutral 的 `reasoning=low`，DeepSeek 适配器在请求边界映射为
+`thinking: {"type":"enabled"}` 与 `reasoning_effort: "low"`。`None` 仍表示不发送显式推理
+控制，`disabled` 仍表示 `thinking.type=disabled`；结果分析、其他 LLM task、prompt
+`a5.3-v3`、JSON 单字段 SQL contract、temperature、1024 output-token 上限、重试策略、验证器、
+执行器和冻结数据集均不变。初次生成与 repair 使用同一 `low` 设置，repair 不回落到 provider
+默认推理模式。
+
+下一次 provider artifact 会在配置 provenance 中记录 provider-neutral reasoning mode、实际
+`thinking.type`、`reasoning_effort`、解析后的 output-token budget，以及 model、dataset/fixture
+fingerprint 和 Git revision/dirty 状态；不记录 chain-of-thought。Run #5（provider 默认/高推理诊断）
+和 Run #6（disabled 稳定性基线）保持原样，本轮实现尚未运行 DEV/TEST provider 评测。
+
+本实验不改变 comparator。`alias_derived` 只是问题类别，不是别名失败类别；normalized result
+comparator 本来就忽略输出列名/别名，`result_mismatch` 诊断必须归因于列数、列顺序、行值、行粒度、
+排序或其他实际语义差异，不能把 alias 单独计为 Execution Accuracy 失败。
+
+## A5.7d6 高推理 + 2048 输出预算实验（历史 Run #9）
+
+A5.7d6 是一次仅用于 DEV 的受控历史实验：NL2SQL 初次生成和有界 repair 都使用
+provider-neutral 的 `reasoning="high"`，DeepSeek 适配器在请求边界发送
+`thinking: {"type":"enabled"}` 与 `reasoning_effort: "high"`；两者的 `max_tokens` 都为
+`2048`。结果分析保持 `reasoning="disabled"` 和 `chatbi_analysis_max_tokens=1024`。prompt
+`a5.3-v3`、JSON 单字段 SQL contract、temperature、provider/model、gateway retry、Agent
+预算、validator、executor、comparator、冻结 DEV 数据集和 fixture 均不变。
+
+Run #5 的 `reasoning=None` 没有记录 provider 的有效 reasoning 参数，因此只能作为“provider
+默认/高推理倾向”的诊断，不能证明与显式 `high` 语义完全等价。Run #8 与 Run #5 的比较仍
+必须以各自 provenance 中的有效 provider 配置为准。Run #5 至 Run #9 的 artifact 均保持原样；
+每个 artifact 记录解析后的 NL2SQL/repair 预算、provider-effective thinking 字段、analysis
+独立预算以及 model、dataset/fixture fingerprint、Git revision 和 dirty 状态，不记录
+chain-of-thought。
+
+`Settings` 仍遵循环境变量优先级：已有的
+`KNOWLEDGE_SCOPE_CHATBI_NL2SQL_MAX_TOKENS=512` 会有意覆盖默认值。当前默认值已恢复为
+`1024`；历史 Run #9 的 `2048` 是实验配置，不是普通运行默认值。任何 provider 运行都必须以
+preflight 和 artifact provenance 核对实际解析预算；analysis budget 不受该变量影响。
+
+## A5.7d8 保留配置决策（DEV）
+
+reasoning 与 output budget 实验已经结束。保留 `DISABLED + 1024`：Run #6 在 DEV 50 条中
+首次生成可解析 `50/50`，没有首次截断或终态 generation failure，Execution Accuracy 为
+`21/47 = 44.68%`；Run #9 的 `HIGH + 2048` 同为 `21/47 = 44.68%`，但首次生成仍有
+`3` 次截断、`1` 次终态 generation failure，输出 token 为 `33,384`，total P95 为
+`13,332.6 ms`；Run #6 的 output token 为 `6,104`、total P95 为 `2,807.7 ms`。这些数字全部是 DEV 观察，不能
+作为冻结 TEST 性能或模型质量结论。
+
+下列配置均不保留为默认：`LOW + 1024`（Run #7）、`HIGH + 1024`（Run #8）和
+`HIGH + 2048`（Run #9）。Run #7/Run #8/Run #9 的 provider 产物是不可变历史证据；不会
+被覆盖、删除或回写。Run #9 的 negative safe success 为 `0/3`，该未解决问题留在后续的
+语义与安全优化工作中，本决策不改变拒答行为。
 
 ## 冻结输入
 

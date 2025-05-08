@@ -203,6 +203,16 @@ def test_settings_load_prefixed_environment_variables(monkeypatch: pytest.Monkey
     assert settings.sparse_bm25_b == 0.6
 
 
+def test_chatbi_nl2sql_budget_environment_override_remains_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWLEDGE_SCOPE_CHATBI_NL2SQL_MAX_TOKENS", "512")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.chatbi_nl2sql_max_tokens == 512
+
+
 def test_extraction_retry_setting_allows_at_most_one_corrective_retry() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, graph_extraction_max_parse_retries=2)

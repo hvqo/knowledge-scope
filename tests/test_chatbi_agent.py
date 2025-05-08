@@ -22,6 +22,7 @@ from knowledge_scope.chatbi import (
     QueryLifecycleState,
     QueryPolicy,
     QueryTruncationReason,
+    ResultContract,
     SchemaDiscoveryResult,
     SchemaSnapshot,
     SQLCandidate,
@@ -35,6 +36,37 @@ from knowledge_scope.llm.schemas import LLMRequest, LLMResult
 
 DATASOURCE_ID = UUID("11111111-1111-4111-8111-111111111111")
 _FINGERPRINT = "a" * 64
+
+
+def _generation_payload(
+    sql: str = "SELECT 1",
+    *,
+    expression: str = "1",
+    result_contract: bool = False,
+) -> str:
+    if not result_contract:
+        return json.dumps({"sql": sql}, ensure_ascii=False)
+    return json.dumps(
+        {
+            "result_contract": {
+                "row_grain": "scalar",
+                "grain_keys": [],
+                "output_columns": [
+                    {
+                        "kind": "derived",
+                        "expression": expression,
+                        "source_columns": [],
+                        "alias": "answer",
+                    }
+                ],
+                "group_by": [],
+                "order_by": [],
+                "limit": None,
+            },
+            "sql": sql,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _candidate(sql: str = "SELECT 42 AS answer") -> SQLCandidate:
@@ -95,6 +127,7 @@ class _FakeGeneration:
         max_tokens: int | None = None,
         previous_sql: str | None = None,
         validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         self.calls.append(
             {
@@ -105,13 +138,14 @@ class _FakeGeneration:
                 "max_tokens": max_tokens,
                 "previous_sql": previous_sql,
                 "validation_error": validation_error,
+                "previous_contract": previous_contract,
             }
         )
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
         return response, LLMResult(
-            text='{"sql":"SELECT 1"}',
+            text=_generation_payload(),
             provider="fake-generation",
             model="fake-model",
             input_tokens=10,
@@ -204,7 +238,11 @@ class _FailingGateway:
         raise error
 
 
-def _registered_generation_service(gateway: _ScriptedGateway) -> NL2SQLService:
+def _registered_generation_service(
+    gateway: _ScriptedGateway,
+    *,
+    result_contract_enabled: bool = False,
+) -> NL2SQLService:
     """Use the real registered-datasource generation path with a tiny snapshot."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
     data_source = DataSource(
@@ -252,6 +290,7 @@ def _registered_generation_service(gateway: _ScriptedGateway) -> NL2SQLService:
         gateway,
         schema_discovery=_Discovery(),
         data_source_provider=_Provider(),
+        result_contract_enabled=result_contract_enabled,
     )
 
 
@@ -358,7 +397,7 @@ async def test_agent_uses_registered_nl2sql_discovery_path_before_execution() ->
             assert datasource_id == DATASOURCE_ID
             return data_source
 
-    gateway = _ScriptedGateway(['{"sql":"SELECT 1"}', '{"answer":"1","warning":null}'])
+    gateway = _ScriptedGateway([_generation_payload(), '{"answer":"1","warning":null}'])
     discovery = FakeDiscovery()
     generation = NL2SQLService(
         gateway,
@@ -382,7 +421,7 @@ async def test_agent_uses_registered_nl2sql_discovery_path_before_execution() ->
     assert result.usage.input_tokens == 16
     assert result.usage.output_tokens == 8
     assert gateway.requests[0].max_tokens == 1024
-    assert gateway.requests[0].reasoning is None
+    assert gateway.requests[0].reasoning == "disabled"
     assert gateway.requests[1].max_tokens == 1024
     assert gateway.requests[1].reasoning == "disabled"
 
@@ -486,8 +525,35 @@ async def test_malformed_generation_is_repaired_with_bounded_feedback() -> None:
 
 
 @pytest.mark.anyio
+async def test_result_contract_mismatch_uses_one_bounded_repair() -> None:
+    gateway = _ScriptedGateway(
+        [
+            _generation_payload(expression="2", result_contract=True),
+            _generation_payload(result_contract=True),
+            '{"answer":"1","warning":null}',
+        ]
+    )
+    generation = _registered_generation_service(gateway, result_contract_enabled=True)
+    execution = _FakeExecution([_execution_result(rows=[["1"]])])
+
+    result = await ChatBIAgentService(generation, execution, gateway).ask(
+        DATASOURCE_ID,
+        "查询结果",
+        policy=QueryPolicy(),
+        max_chars=10_000,
+    )
+
+    assert result.answer == "1"
+    assert result.repair_attempts == 1
+    assert len(gateway.requests) == 3
+    assert '"previous_result_contract"' in gateway.requests[1].messages[1].content
+    assert gateway.requests[0].max_tokens == gateway.requests[1].max_tokens == 1024
+    assert gateway.requests[0].reasoning == gateway.requests[1].reasoning == "disabled"
+
+
+@pytest.mark.anyio
 async def test_malformed_initial_nl2sql_preserves_completed_call_usage() -> None:
-    gateway = _ScriptedGateway(["not json", '{"sql":"SELECT 1"}', '{"answer":"1","warning":null}'])
+    gateway = _ScriptedGateway(["not json", _generation_payload(), '{"answer":"1","warning":null}'])
     generation = _registered_generation_service(gateway)
     execution = _FakeExecution([_execution_result(rows=[["1"]])])
 
@@ -535,7 +601,7 @@ async def test_provider_failure_preserves_safe_failure_usage() -> None:
 
 @pytest.mark.anyio
 async def test_malformed_repair_nl2sql_preserves_initial_and_repair_usage() -> None:
-    gateway = _ScriptedGateway(['{"sql":"SELECT 1"}', "not json"])
+    gateway = _ScriptedGateway([_generation_payload(), "not json"])
     generation = _registered_generation_service(gateway)
     execution = _FakeExecution(
         [
