@@ -3661,6 +3661,18 @@ def evaluate_provider_artifact(
         raise SemanticEvaluationError("provider artifact dataset fingerprint mismatch")
     artifact_provenance = artifact.get("provenance")
     artifact_provenance = artifact_provenance if isinstance(artifact_provenance, dict) else {}
+    if artifact.get("artifact_schema_version") == "a5.7h2-provider-run-v3":
+        if not isinstance(policy_artifact, SemanticPolicyArtifactV3):
+            raise SemanticEvaluationError(
+                "a5.7h2 provider artifacts require the frozen g3 semantic policy"
+            )
+        if artifact_provenance.get("semantic_policy_version") != policy_artifact.schema_version:
+            raise SemanticEvaluationError("provider artifact semantic policy version mismatch")
+        if (
+            artifact_provenance.get("semantic_policy_fingerprint")
+            != policy_artifact.policy_fingerprint
+        ):
+            raise SemanticEvaluationError("provider artifact semantic policy fingerprint mismatch")
     artifact_fixture_version = artifact.get(
         "fixture_version", artifact_provenance.get("fixture_version")
     )
