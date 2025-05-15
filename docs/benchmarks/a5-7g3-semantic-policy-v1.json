@@ -1,0 +1,933 @@
+{
+  "schema_version": "a5.7g3-semantic-policy-v1",
+  "provenance": "DEV questions reviewed against the trusted chatbi-demo schema and frozen projection policy.",
+  "dataset_fingerprint": "60c75c597da8fc71a0fa5b25d335b63410b44a4ab3a403da40ca72c5ae375ab3",
+  "fixture_version": "chatbi-demo-v2",
+  "fixture_fingerprint": "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d",
+  "fixture_schema_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+  "policy_fingerprint": "7da8b8c4b843dd1cdb50bc56cb2f826a02b625d1c797084f3000dbdb8cdf70ee",
+  "schema": {
+    "schema_version": "a5.7f2c-schema-v1",
+    "fixture_version": "chatbi-demo-v2",
+    "fixture_fingerprint": "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d",
+    "fixture_schema_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+    "schema_metadata_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+    "catalog_schema": "chatbi_demo",
+    "relations": [
+      {
+        "relation": "chatbi_demo.customers",
+        "kind": "table",
+        "columns": [
+          "customer_id",
+          "customer_name"
+        ],
+        "column_metadata": [
+          {
+            "position": 1,
+            "name": "customer_id",
+            "type": "bigint",
+            "nullable": false
+          },
+          {
+            "position": 2,
+            "name": "customer_name",
+            "type": "text",
+            "nullable": false
+          }
+        ],
+        "primary_key": [
+          "customer_id"
+        ],
+        "unique_constraints": [],
+        "not_null_columns": [
+          "customer_id",
+          "customer_name"
+        ],
+        "foreign_keys": [],
+        "check_constraints": []
+      },
+      {
+        "relation": "chatbi_demo.regions",
+        "kind": "table",
+        "columns": [
+          "region_code",
+          "region_name",
+          "market"
+        ],
+        "column_metadata": [
+          {
+            "position": 1,
+            "name": "region_code",
+            "type": "text",
+            "nullable": false
+          },
+          {
+            "position": 2,
+            "name": "region_name",
+            "type": "text",
+            "nullable": false
+          },
+          {
+            "position": 3,
+            "name": "market",
+            "type": "text",
+            "nullable": false
+          }
+        ],
+        "primary_key": [
+          "region_code"
+        ],
+        "unique_constraints": [
+          [
+            "region_name"
+          ]
+        ],
+        "not_null_columns": [
+          "region_code",
+          "region_name",
+          "market"
+        ],
+        "foreign_keys": [],
+        "check_constraints": []
+      },
+      {
+        "relation": "chatbi_demo.sales",
+        "kind": "table",
+        "columns": [
+          "sale_id",
+          "customer_id",
+          "region_code",
+          "sold_on",
+          "amount"
+        ],
+        "column_metadata": [
+          {
+            "position": 1,
+            "name": "sale_id",
+            "type": "bigint",
+            "nullable": false
+          },
+          {
+            "position": 2,
+            "name": "customer_id",
+            "type": "bigint",
+            "nullable": false
+          },
+          {
+            "position": 3,
+            "name": "region_code",
+            "type": "text",
+            "nullable": false
+          },
+          {
+            "position": 4,
+            "name": "sold_on",
+            "type": "date",
+            "nullable": false
+          },
+          {
+            "position": 5,
+            "name": "amount",
+            "type": "numeric(12,2)",
+            "nullable": false
+          }
+        ],
+        "primary_key": [
+          "sale_id"
+        ],
+        "unique_constraints": [],
+        "not_null_columns": [
+          "sale_id",
+          "customer_id",
+          "region_code",
+          "sold_on",
+          "amount"
+        ],
+        "foreign_keys": [
+          {
+            "source_relation": "chatbi_demo.sales",
+            "source_columns": [
+              "customer_id"
+            ],
+            "target_relation": "chatbi_demo.customers",
+            "target_columns": [
+              "customer_id"
+            ]
+          },
+          {
+            "source_relation": "chatbi_demo.sales",
+            "source_columns": [
+              "region_code"
+            ],
+            "target_relation": "chatbi_demo.regions",
+            "target_columns": [
+              "region_code"
+            ]
+          }
+        ],
+        "check_constraints": [
+          {
+            "columns": [
+              "amount"
+            ],
+            "definition": "CHECK (amount >= 0::numeric)"
+          }
+        ]
+      },
+      {
+        "relation": "chatbi_demo.region_sales",
+        "kind": "view",
+        "columns": [
+          "region_code",
+          "region_name",
+          "sale_count",
+          "total_amount"
+        ],
+        "column_metadata": [
+          {
+            "position": 1,
+            "name": "region_code",
+            "type": "text",
+            "nullable": true
+          },
+          {
+            "position": 2,
+            "name": "region_name",
+            "type": "text",
+            "nullable": true
+          },
+          {
+            "position": 3,
+            "name": "sale_count",
+            "type": "bigint",
+            "nullable": true
+          },
+          {
+            "position": 4,
+            "name": "total_amount",
+            "type": "numeric",
+            "nullable": true
+          }
+        ],
+        "primary_key": [],
+        "unique_constraints": [],
+        "not_null_columns": [],
+        "foreign_keys": [],
+        "check_constraints": []
+      }
+    ]
+  },
+  "defaults": {
+    "row_grain": "detail",
+    "required_fields": [],
+    "optional_fields": [],
+    "identity_fields": [],
+    "semantic_order_required": false,
+    "allow_safe_extra_fields": false,
+    "authoring_confidence": "product_rule_derived",
+    "human_rationale": "显式列出的 DEV 问题均有独立策略，不使用默认回退。"
+  },
+  "cases": {
+    "simple-01": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "customer_name"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户标签可能重复，保留稳定身份并按题目要求排序。"
+    },
+    "simple-02": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "region_name",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求销售编号、地区、金额及编号顺序。"
+    },
+    "simple-03": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sold_on",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求销售发生时间和金额。"
+    },
+    "simple-04": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_name"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确询问指定客户的名称。"
+    },
+    "aggregation-01": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求全部销售金额合计。"
+    },
+    "aggregation-02": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:count:sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求销售记录数量。"
+    },
+    "aggregation-03": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:avg:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求平均销售金额。"
+    },
+    "aggregation-04": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:max:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求最高销售金额。"
+    },
+    "aggregation-05": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:min:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求最低销售金额。"
+    },
+    "aggregation-06": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:count:customer_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求客户数量。"
+    },
+    "group-by-01": {
+      "row_grain": "grouped",
+      "required_fields": [
+        "region_name",
+        "aggregate:count:sale_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "地区名称在受信模式中唯一，地区级汇总无需额外展示编码。"
+    },
+    "group-by-02": {
+      "row_grain": "grouped",
+      "required_fields": [
+        "customer_id",
+        "aggregate:count:sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目要求按客户编号统计并按编号排列。"
+    },
+    "group-by-03": {
+      "row_grain": "grouped",
+      "required_fields": [
+        "customer_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目要求按客户编号汇总销售金额。"
+    },
+    "group-by-04": {
+      "row_grain": "grouped",
+      "required_fields": [
+        "region_name",
+        "aggregate:max:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "地区名称的唯一约束足以区分地区汇总。"
+    },
+    "group-by-05": {
+      "row_grain": "grouped",
+      "required_fields": [
+        "region_name",
+        "aggregate:avg:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "地区名称的唯一约束足以区分地区汇总。"
+    },
+    "top-k-01": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求金额排序、并列规则和前两笔销售。"
+    },
+    "top-k-02": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "sold_on"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求最早销售及其日期。"
+    },
+    "top-k-03": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "sold_on"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求最近销售及其日期。"
+    },
+    "top-k-04": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求金额最低的销售。"
+    },
+    "predicate-01": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "product_rule_derived",
+      "human_rationale": "题目询问哪些销售，稳定销售身份用于区分事实行。"
+    },
+    "predicate-02": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "product_rule_derived",
+      "human_rationale": "题目询问哪些销售，稳定销售身份用于区分事实行。"
+    },
+    "predicate-03": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "product_rule_derived",
+      "human_rationale": "题目询问哪些销售，稳定销售身份用于区分事实行。"
+    },
+    "predicate-04": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "product_rule_derived",
+      "human_rationale": "题目询问哪些销售，稳定销售身份用于区分事实行。"
+    },
+    "join-01": {
+      "row_grain": "detail",
+      "required_fields": [
+        "customer_name",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求每笔销售对应的客户名称和金额。"
+    },
+    "join-02": {
+      "row_grain": "pair",
+      "required_fields": [
+        "customer_id",
+        "customer_name",
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id",
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求客户与销售编号之间的对应关系。"
+    },
+    "join-03": {
+      "row_grain": "detail",
+      "required_fields": [
+        "customer_name",
+        "amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求华东销售对应的客户名称和金额。"
+    },
+    "join-04": {
+      "row_grain": "detail",
+      "required_fields": [
+        "customer_name",
+        "sold_on"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求每笔销售对应的客户名称和日期。"
+    },
+    "join-05": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "aggregate:min:sold_on"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户编号是客户实体身份，最早日期是题目要求的度量。"
+    },
+    "join-06": {
+      "row_grain": "detail",
+      "required_fields": [
+        "customer_name"
+      ],
+      "optional_fields": [
+        "amount"
+      ],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "product_rule_derived",
+      "human_rationale": "逐笔销售对应客户名称，金额只作为有用的附加展示。"
+    },
+    "multi-join-01": {
+      "row_grain": "pair",
+      "required_fields": [
+        "customer_id",
+        "customer_name",
+        "region_name",
+        "aggregate:count:sale_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id",
+        "region_code"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户与地区组成请求的关系粒度，客户编号用于消除同名歧义。"
+    },
+    "multi-join-02": {
+      "row_grain": "pair",
+      "required_fields": [
+        "market",
+        "region_name",
+        "aggregate:count:distinct:customer_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "region_code"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "地区名称在模式中唯一，地区编码作为内部关系身份。"
+    },
+    "multi-join-03": {
+      "row_grain": "pair",
+      "required_fields": [
+        "region_name",
+        "customer_id",
+        "aggregate:count:sale_id"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "region_code",
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "地区与客户组成关系粒度，客户编号用于消除同名歧义。"
+    },
+    "multi-join-04": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "amount",
+        "customer_name",
+        "region_name"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求最高销售及其客户和地区。"
+    },
+    "date-01": {
+      "row_grain": "scalar",
+      "required_fields": [
+        "aggregate:count:sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求一月销售数量。"
+    },
+    "date-02": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [
+        "sold_on",
+        "amount"
+      ],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目询问二月发生的销售，销售编号是稳定事实身份。"
+    },
+    "date-03": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "sold_on"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确要求首月销售编号和日期。"
+    },
+    "null-01": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "题目询问未产生销售的客户，客户编号保证实体可区分。"
+    },
+    "null-02": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "aggregate:count:sale_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户编号保证客户级统计不因同名而合并。"
+    },
+    "null-03": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "customer_name",
+        "aggregate:max:sold_on"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户标签可能重复，保留编号和最近日期以区分实体。"
+    },
+    "empty-01": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目明确指定销售编号并询问该事实。"
+    },
+    "empty-02": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "customer_name"
+      ],
+      "optional_fields": [],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "题目询问哪些客户，编号用于区分可能同名的客户。"
+    },
+    "derived-01": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "derived:amount_minus_overall_average"
+      ],
+      "optional_fields": [
+        "amount"
+      ],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目要求逐笔销售相对总体平均值的差额。"
+    },
+    "derived-02": {
+      "row_grain": "entity",
+      "required_fields": [
+        "region_name",
+        "derived:region_sales_share"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目要求各地区占全部销售的比例，唯一地区名称足够。"
+    },
+    "derived-03": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "aggregate:avg:amount"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "客户编号保证客户级平均值不因同名而合并。"
+    },
+    "cte-set-01": {
+      "row_grain": "entity",
+      "required_fields": [
+        "customer_id",
+        "aggregate:sum:amount"
+      ],
+      "optional_fields": [
+        "customer_name"
+      ],
+      "identity_fields": [
+        "customer_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "题目要求客户累计额比较，客户编号是实体身份。"
+    },
+    "cte-set-02": {
+      "row_grain": "detail",
+      "required_fields": [
+        "sale_id",
+        "amount"
+      ],
+      "optional_fields": [
+        "region_name"
+      ],
+      "identity_fields": [
+        "sale_id"
+      ],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "explicit",
+      "human_rationale": "题目要求高于所在地区均值的销售及金额。"
+    },
+    "cte-set-03": {
+      "row_grain": "entity",
+      "required_fields": [
+        "region_name"
+      ],
+      "optional_fields": [],
+      "identity_fields": [],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false,
+      "authoring_confidence": "schema_required",
+      "human_rationale": "题目要求满足条件的地区，唯一地区名称足够。"
+    }
+  }
+}
