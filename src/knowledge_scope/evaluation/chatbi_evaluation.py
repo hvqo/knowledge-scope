@@ -65,6 +65,7 @@ from knowledge_scope.chatbi.nl2sql_models import (
     NL2SQL_PROMPT_VERSION,
     ResultContract,
     SQLCandidate,
+    ValidatedSQL,
 )
 from knowledge_scope.chatbi.policy import QueryPolicy, SQLDialect, default_query_policy
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
@@ -76,6 +77,7 @@ from knowledge_scope.chatbi.schemas import (
     QueryLifecycleState,
     QueryTruncationReason,
 )
+from knowledge_scope.evaluation.semantic_evidence import SemanticEvidenceRecord
 from knowledge_scope.llm import LLMGateway, LLMResult, create_llm_provider
 from knowledge_scope.llm.observability import provider_observation_context
 from knowledge_scope.llm.schemas import LLMProviderInvocation, LLMRequest
@@ -1373,6 +1375,9 @@ class ChatBIEvaluationObservation(_EvaluationModel):
     stages: EvaluationStageState = Field(default_factory=EvaluationStageState)
     provider_invocations: list[LLMProviderInvocation] = Field(default_factory=list)
     result_contract_diagnostics: list[ResultContractDiagnostic] = Field(default_factory=list)
+    # Evaluation-only sidecar.  Production ChatBI never constructs or consumes
+    # this field; the provider runner fills it after validation/execution.
+    semantic_evidence: SemanticEvidenceRecord | None = None
 
 
 class ChatBICaseRunner(Protocol):
@@ -1698,6 +1703,7 @@ class _TimingState:
         self.analysis_ms = 0.0
         self.total_ms = 0.0
         self.execution_result: QueryExecutionResult | None = None
+        self.validated_sql: ValidatedSQL | None = None
         self.stages = EvaluationStageState()
         self.generation_provider_called = False
 
@@ -1710,6 +1716,7 @@ class _TimingState:
         self.analysis_ms = 0.0
         self.total_ms = 0.0
         self.execution_result = None
+        self.validated_sql = None
         self.stages = EvaluationStageState()
         self.generation_provider_called = False
 
@@ -1831,6 +1838,8 @@ class _TimedValidation:
         started = perf_counter()
         try:
             result = await self._inner._validate_registered_candidate(*args, **kwargs)
+            if isinstance(result, ValidatedSQL):
+                self._timing.validated_sql = result
             self._timing.stages = self._timing.stages.model_copy(update={"validation": "passed"})
             return result
         except BaseException:
