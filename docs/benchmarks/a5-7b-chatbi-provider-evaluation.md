@@ -189,6 +189,18 @@ CHECK 约束。表/视图集合、结构指纹和数据指纹必须同时匹配�
 元数据不参与计算。应用数据库与固定评测数据库的标准化 `(server, port, database)` 身份也
 必须不同，冲突会在任何 fixture DDL 之前 fail closed。
 
+这里的 catalog 指纹是评测用的 authoritative schema provenance，不等同于生产
+`SchemaSnapshot.fingerprint`。它通过已注册的 v2 datasource 重新读取包含
+`region_sales` 的 view 和 `sales.amount >= 0` 的 CHECK，再用共享 canonical helper 计算；
+可执行的 schema/context 仍由 `_v2_query_policy` 控制，当前 `allow_views=false` 不会因为
+provenance 观察到 view 而改变。严格 provenance gate 在 provider 构造前执行，指纹不匹配时
+不会创建 provider、调用 provider 或开始 DEV cases。
+
+成功的 v3 运行会在现有 `fixture_schema_fingerprint` 之外记录同一已验证值的
+`authoritative_schema_fingerprint`。评测 timing 中的 native `ValidatedSQL` fingerprint
+保持不变，SemanticEvidence 使用显式 evaluation binding 对齐已通过 gate 的 catalog
+fingerprint。Run #12/#13 不回写、不补录；历史 Run #13 仍按原 artifact 读取并保持其诊断性质。
+
 ## 权威数据源注册
 
 preflight 会在本地 PostgreSQL 中创建或校验上述隔离数据库，并在 KnowledgeScope

@@ -113,8 +113,15 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     select_v2_provider_contract_diagnostic_cases,
     select_v2_provider_diagnostic_cases,
 )
+from knowledge_scope.evaluation.chatbi_schema_fingerprint import normalize_check_definition
+from knowledge_scope.evaluation.chatbi_schema_provenance import (
+    canonical_postgres_schema_payload,
+    discover_postgres_schema_provenance,
+)
+from knowledge_scope.evaluation.schema_provenance import EvaluationValidatedSQL
 from knowledge_scope.evaluation.semantic_evidence import (
     SEMANTIC_EVIDENCE_VERSION,
+    SemanticEvidenceError,
     SemanticEvidenceRecord,
     build_unavailable_semantic_evidence,
     capture_semantic_evidence,
@@ -372,6 +379,7 @@ def test_contract_only_prompt_is_schema_data_and_contains_no_sql_generation_cont
         "chatbi-eval-v2-dev-run-10.json",
         "chatbi-eval-v2-dev-run-11.json",
         "chatbi-eval-v2-dev-run-12.json",
+        "chatbi-eval-v2-dev-run-13.json",
     ),
 )
 def test_historical_provider_artifacts_without_contract_diagnostics_remain_readable(
@@ -424,6 +432,44 @@ def test_full_v2_semantic_evidence_artifact_round_trips_through_real_reader() ->
         for record in reloaded.records
         if record.semantic_evidence is not None
     )
+
+
+def test_v3_roundtrip_retains_verified_authoritative_schema_fingerprint() -> None:
+    artifact = DEFAULT_PROVIDER_OUTPUT_V2
+    if not artifact.is_file():
+        pytest.skip("historical provider artifact is not present in the local runtime")
+
+    legacy = V2ProviderRun.model_validate_json(artifact.read_text(encoding="utf-8"))
+    payload = legacy.model_dump(mode="json")
+    payload["artifact_schema_version"] = CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3
+    payload["provenance"]["semantic_evidence_version"] = SEMANTIC_EVIDENCE_VERSION
+    payload["provenance"]["semantic_policy_version"] = EXPECTED_SEMANTIC_POLICY_G3_VERSION
+    payload["provenance"]["semantic_policy_fingerprint"] = EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT
+    payload["provenance"]["authoritative_schema_fingerprint"] = (
+        EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
+    )
+    for record in payload["records"]:
+        evidence = build_unavailable_semantic_evidence(
+            case_id=record["case_id"],
+            split=record["split"],
+            datasource_id=legacy.datasource_id,
+            dataset_fingerprint=legacy.dataset_fingerprint,
+            fixture_fingerprint=legacy.fixture_fingerprint,
+            schema_fingerprint=legacy.fixture_schema_fingerprint,
+            prompt_version="a5.3-v3",
+            reasoning_mode="disabled",
+            reason="v3_roundtrip_test",
+        )
+        record["semantic_evidence"] = evidence.model_dump(mode="json")
+
+    run = V2ProviderRun.model_validate(payload)
+    reloaded = V2ProviderRun.model_validate_json(run.model_dump_json())
+
+    assert (
+        reloaded.provenance.authoritative_schema_fingerprint
+        == EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
+    )
+    assert all(record.semantic_evidence is not None for record in reloaded.records)
 
 
 def test_serialized_v2_semantic_evidence_rejects_unknown_fields() -> None:
@@ -595,6 +641,62 @@ async def test_wrapped_authoritative_validation_produces_available_semantic_evid
 
     assert evidence.evidence_status.value == "available"
     assert "validated_sql_unavailable" not in evidence.unavailable_reasons
+
+
+def test_evaluation_schema_binding_keeps_native_validation_fingerprint_separate() -> None:
+    native_payload = _test_validated_sql().model_dump()
+    native_payload["schema_fingerprint"] = (
+        "bfb282adc1bb8c6e8597f02b572aa6c9484e3de0b946daa944b39f471f09a94b"
+    )
+    native = ValidatedSQL._from_validator(**native_payload)
+    bound = EvaluationValidatedSQL(native, EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2)
+
+    assert bound.native_schema_fingerprint == native.schema_fingerprint
+    assert native.schema_fingerprint != bound.evaluation_schema_fingerprint
+    assert native.model_dump()["schema_fingerprint"] == native.schema_fingerprint
+
+    result = ChatBIResult(
+        query_id=uuid4(),
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        execution_status=QueryLifecycleState.SUCCEEDED,
+        row_count=0,
+        sql_attempts=1,
+        repair_attempts=0,
+        usage=ChatBIUsageSummary(llm_calls=0, provider_attempts=0),
+    )
+    with pytest.raises(SemanticEvidenceError):
+        capture_semantic_evidence(
+            case_id="native-mismatch",
+            split="dev",
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+            fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+            schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+            synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+            validated_sql=native,
+            execution_result=None,
+            chatbi_result=result,
+            provider_invocations=[],
+            prompt_version="a5.3-v3",
+            reasoning_mode="disabled",
+        )
+
+    evidence = capture_semantic_evidence(
+        case_id="bound-evaluation",
+        split="dev",
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        validated_sql=bound,
+        execution_result=None,
+        chatbi_result=result,
+        provider_invocations=[],
+        prompt_version="a5.3-v3",
+        reasoning_mode="disabled",
+    )
+    assert evidence.evidence_status.value == "available"
 
 
 def test_v2_provenance_uses_resolved_budgets() -> None:
@@ -1189,6 +1291,142 @@ def test_v2_schema_payload_is_independent_of_catalog_row_order() -> None:
     )
 
 
+def test_v2_check_definition_normalization_preserves_frozen_contract() -> None:
+    assert normalize_check_definition("CHECK (amount >= 0::numeric)") == (
+        "CHECK (amount >= 0::numeric)"
+    )
+    assert normalize_check_definition("check ((amount >= (0)::numeric))") == (
+        "CHECK (amount >= 0::numeric)"
+    )
+
+
+def test_v2_authoritative_payload_includes_view_and_check_without_executable_widening() -> None:
+    payload = canonical_postgres_schema_payload(
+        [
+            _CatalogRow(
+                relation_name="sales",
+                relation_kind="table",
+                column_position=1,
+                column_name="amount",
+                data_type="numeric",
+                not_null=True,
+            ),
+            _CatalogRow(
+                relation_name="region_sales",
+                relation_kind="view",
+                column_position=1,
+                column_name="region_code",
+                data_type="text",
+                not_null=False,
+            ),
+        ],
+        [
+            _CatalogRow(
+                relation_name="sales",
+                constraint_type="c",
+                columns=[],
+                referenced_schema=None,
+                referenced_relation=None,
+                referenced_columns=[],
+                check_definition="CHECK ((amount >= (0)::numeric))",
+            )
+        ],
+        schema=CHATBI_EVALUATION_V2_SCHEMA,
+    )
+
+    relations = payload["relations"]
+    assert isinstance(relations, list)
+    assert {(item["kind"], item["name"]) for item in relations} == {
+        ("table", "sales"),
+        ("view", "region_sales"),
+    }
+    sales = next(item for item in relations if item["name"] == "sales")
+    assert sales["constraints"][0]["check_definition"] == "CHECK (amount >= 0::numeric)"
+    assert _v2_query_policy(Settings(_env_file=None)).allow_views is False
+
+
+@pytest.mark.anyio
+async def test_v2_schema_provenance_mismatch_stops_before_provider_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+    bootstrap = SimpleNamespace(
+        data_source=SimpleNamespace(id=CHATBI_EVALUATION_V2_DATASOURCE_ID),
+        fixture_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        environment_was_present=True,
+        fixture_data_fingerprint=EXPECTED_FIXTURE_DATA_FINGERPRINT_V2,
+        database_created=False,
+        datasource_created=False,
+    )
+
+    class _Engine:
+        async def dispose(self) -> None:
+            return None
+
+    class _Registry:
+        def __init__(self, _session_factory: object) -> None:
+            pass
+
+        async def get(self, _datasource_id: object) -> object:
+            return SimpleNamespace(id=CHATBI_EVALUATION_V2_DATASOURCE_ID)
+
+    async def fake_ensure(_settings: Settings, *, fixture_path: Any) -> object:
+        return bootstrap
+
+    async def fake_authoritative(_data_source: object) -> object:
+        return SimpleNamespace(
+            fingerprint="0" * 64,
+            schema=CHATBI_EVALUATION_V2_SCHEMA,
+            relation_labels=(
+                "chatbi_demo.customers",
+                "chatbi_demo.regions",
+                "chatbi_demo.sales",
+                "chatbi_demo.region_sales",
+            ),
+        )
+
+    provider_created = False
+    execution_started = False
+
+    def fail_provider(_settings: Settings) -> object:
+        nonlocal provider_created
+        provider_created = True
+        raise AssertionError("provider factory must not run")
+
+    async def fail_execution(*_args: object, **_kwargs: object) -> object:
+        nonlocal execution_started
+        execution_started = True
+        raise AssertionError("provider cases must not run")
+
+    monkeypatch.setattr(provider_module, "current_git_revision", lambda: "a" * 40)
+    monkeypatch.setattr(provider_module, "current_git_dirty", lambda: False)
+    monkeypatch.setattr(
+        provider_module,
+        "_verify_v2_dataset_and_fixture",
+        lambda _dataset_path, _fixture_path: (dataset, EXPECTED_FIXTURE_FINGERPRINT_V2),
+    )
+    monkeypatch.setattr(provider_module, "_check_provider_configuration", lambda _settings: None)
+    monkeypatch.setattr(provider_module, "ensure_authoritative_v2_datasource", fake_ensure)
+    monkeypatch.setattr(provider_module, "create_database_engine", lambda _settings: _Engine())
+    monkeypatch.setattr(provider_module, "create_session_factory", lambda _engine: object())
+    monkeypatch.setattr(provider_module, "DatabaseDataSourceProvider", _Registry)
+    monkeypatch.setattr(
+        provider_module,
+        "_discover_v2_authoritative_schema_provenance",
+        fake_authoritative,
+    )
+    monkeypatch.setattr(provider_module, "create_llm_provider", fail_provider)
+    monkeypatch.setattr(provider_module, "_execute_v2_provider_cases", fail_execution)
+
+    with pytest.raises(V2ProviderBenchmarkError, match="frozen fingerprint"):
+        await provider_module.run_v2_provider_benchmark(
+            Settings(_env_file=None),
+            output_path=None,
+        )
+    assert provider_created is False
+    assert execution_started is False
+
+
 def test_v2_provider_policy_is_fixed_to_the_isolated_business_schema() -> None:
     settings = Settings(_env_file=None, chatbi_allowed_schemas=["public"])
 
@@ -1292,6 +1530,18 @@ async def test_v2_start_git_state_is_captured_before_output_directory_creation(
     ) -> str:
         return "fixture-data-fingerprint"
 
+    async def fake_authoritative(_data_source: object) -> object:
+        return SimpleNamespace(
+            fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+            schema=CHATBI_EVALUATION_V2_SCHEMA,
+            relation_labels=(
+                "chatbi_demo.customers",
+                "chatbi_demo.regions",
+                "chatbi_demo.sales",
+                "chatbi_demo.region_sales",
+            ),
+        )
+
     monkeypatch.setattr(provider_module, "current_git_revision", lambda: "a" * 40)
     monkeypatch.setattr(provider_module, "current_git_dirty", fake_current_git_dirty)
     monkeypatch.setattr(
@@ -1304,6 +1554,9 @@ async def test_v2_start_git_state_is_captured_before_output_directory_creation(
     monkeypatch.setattr(provider_module, "create_database_engine", lambda _settings: _Engine())
     monkeypatch.setattr(provider_module, "create_session_factory", lambda _engine: object())
     monkeypatch.setattr(provider_module, "DatabaseDataSourceProvider", _Registry)
+    monkeypatch.setattr(
+        provider_module, "_discover_v2_authoritative_schema_provenance", fake_authoritative
+    )
     monkeypatch.setattr(provider_module, "_discover_and_verify_v2_schema", fake_discover)
 
     context = await _prepare_v2_preflight(
@@ -1316,6 +1569,7 @@ async def test_v2_start_git_state_is_captured_before_output_directory_creation(
 
     assert context.git_revision == "a" * 40
     assert context.git_dirty is dirty
+    assert context.authoritative_schema_fingerprint == EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
     assert output_path.parent.is_dir()
 
 
@@ -1341,6 +1595,7 @@ def test_preflight_report_is_provider_free_and_safe() -> None:
         dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
         fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
         fixture_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        authoritative_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
         fixture_data_fingerprint="0" * 64,
         datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
         split="dev",
@@ -1370,11 +1625,7 @@ class _DeterministicV2Gateway:
         self.requests.append(request)
         if request.task_type == "nl2sql":
             response = (
-                '{"result_contract":{"row_grain":"detail","grain_keys":["chatbi_demo.customers.customer_id"],'
-                '"output_columns":[{"kind":"source","source":"chatbi_demo.customers.customer_name"}],'
-                '"group_by":[],"order_by":[{"key":"chatbi_demo.customers.customer_id",'
-                '"direction":"asc"}],"limit":null},'
-                '"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
+                '{"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
             )
             input_tokens, output_tokens = 13, 8
         elif request.task_type == "chatbi_analysis":
@@ -1412,6 +1663,17 @@ async def test_v2_schema_fingerprint_rejects_structural_mutations(
 
     assert await _fixture_schema_fingerprint(postgres_test_database) == (
         EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
+    )
+    provenance = await discover_postgres_schema_provenance(
+        postgres_test_database,
+        schema=CHATBI_EVALUATION_V2_SCHEMA,
+    )
+    assert provenance.fingerprint == EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
+    assert provenance.relation_labels == (
+        "chatbi_demo.customers",
+        "chatbi_demo.regions",
+        "chatbi_demo.sales",
+        "chatbi_demo.region_sales",
     )
     mutations = (
         (
@@ -1486,6 +1748,37 @@ async def test_v2_schema_fingerprint_rejects_structural_mutations(
         assert await _fixture_schema_fingerprint(postgres_test_database) == (
             EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
         ), label
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("KNOWLEDGE_SCOPE_RUN_CHATBI_EVAL_V2_PROVIDER_INTEGRATION") != "1",
+    reason="set KNOWLEDGE_SCOPE_RUN_CHATBI_EVAL_V2_PROVIDER_INTEGRATION=1 to run",
+)
+@pytest.mark.anyio
+async def test_v2_authoritative_schema_provenance_is_repeatably_deterministic(
+    postgres_test_engine: Any,
+    postgres_test_database: str,
+) -> None:
+    """The same catalog state produces the same complete provenance twice."""
+    fixture_sql = DEFAULT_FIXTURE_PATH_V2.read_text(encoding="utf-8")
+    async with postgres_test_engine.begin() as connection:
+        for statement in fixture_sql.split(";"):
+            if statement.strip():
+                await connection.exec_driver_sql(statement)
+
+    first = await discover_postgres_schema_provenance(
+        postgres_test_database,
+        schema=CHATBI_EVALUATION_V2_SCHEMA,
+    )
+    second = await discover_postgres_schema_provenance(
+        postgres_test_database,
+        schema=CHATBI_EVALUATION_V2_SCHEMA,
+    )
+
+    assert first.payload == second.payload
+    assert first.fingerprint == second.fingerprint == EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2
+    assert "chatbi_demo.region_sales" in first.relation_labels
 
 
 @pytest.mark.integration

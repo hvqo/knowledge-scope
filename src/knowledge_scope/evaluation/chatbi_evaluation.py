@@ -81,6 +81,7 @@ from knowledge_scope.chatbi.schemas import (
     QueryLifecycleState,
     QueryTruncationReason,
 )
+from knowledge_scope.evaluation.schema_provenance import EvaluationValidatedSQL
 from knowledge_scope.evaluation.semantic_evidence import SemanticEvidenceRecord
 from knowledge_scope.llm import LLMGateway, LLMResult, create_llm_provider
 from knowledge_scope.llm.observability import provider_observation_context
@@ -1707,7 +1708,7 @@ class _TimingState:
         self.analysis_ms = 0.0
         self.total_ms = 0.0
         self.execution_result: QueryExecutionResult | None = None
-        self.validated_sql: ValidatedSQL | None = None
+        self.validated_sql: ValidatedSQL | EvaluationValidatedSQL | None = None
         self.stages = EvaluationStageState()
         self.generation_provider_called = False
 
@@ -1833,24 +1834,41 @@ class _TimedGeneration:
 
 
 class _TimedValidation:
-    def __init__(self, inner: NL2SQLService, timing: _TimingState) -> None:
+    def __init__(
+        self,
+        inner: NL2SQLService,
+        timing: _TimingState,
+        *,
+        evaluation_schema_fingerprint: str | None = None,
+    ) -> None:
         self._inner = inner
         self._timing = timing
+        self._evaluation_schema_fingerprint = evaluation_schema_fingerprint
 
     async def _validate_registered_candidate(self, *args: Any, **kwargs: Any) -> Any:
         schema_before = self._timing.schema_prep_ms
         started = perf_counter()
         try:
             result = await self._inner._validate_registered_candidate(*args, **kwargs)
+            validated: ValidatedSQL | None = None
             if isinstance(result, _RegisteredValidation):
                 # The execution path returns the complete trusted registration
                 # envelope.  The evidence sidecar must observe the exact
                 # nested validation result rather than reconstructing it.
-                self._timing.validated_sql = result.validated
+                validated = result.validated
             elif isinstance(result, ValidatedSQL):
                 # Keep compatibility with the small direct-validation seam
                 # used by older evaluation doubles.
-                self._timing.validated_sql = result
+                validated = result
+            if validated is not None:
+                self._timing.validated_sql = (
+                    EvaluationValidatedSQL(
+                        validated,
+                        self._evaluation_schema_fingerprint,
+                    )
+                    if self._evaluation_schema_fingerprint is not None
+                    else validated
+                )
             self._timing.stages = self._timing.stages.model_copy(update={"validation": "passed"})
             return result
         except BaseException:

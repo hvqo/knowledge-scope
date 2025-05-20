@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -46,6 +48,53 @@ def _optional_text(mapping: Mapping[str, Any], key: str) -> str | None:
     if value is not None and not isinstance(value, str):
         raise SchemaFingerprintError(f"schema metadata field {key!r} must be a string or null")
     return value
+
+
+def _balanced_outer_parentheses(value: str) -> bool:
+    """Return whether *value* is enclosed by one balanced parenthesis pair."""
+    if len(value) < 2 or value[0] != "(" or value[-1] != ")":
+        return False
+    depth = 0
+    for index, character in enumerate(value):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(value) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def normalize_check_definition(value: str | None) -> str | None:
+    """Normalize equivalent PostgreSQL CHECK display forms.
+
+    PostgreSQL's ``pg_get_constraintdef`` output can vary in harmless ways
+    across server versions, notably redundant parentheses around the complete
+    predicate or a numeric literal before a type cast.  This helper only
+    removes those formatting differences; it does not parse or reinterpret a
+    predicate.  The frozen representation remains ``CHECK (...)``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SchemaFingerprintError("schema check definition must be a string or null")
+    normalized = " ".join(unicodedata.normalize("NFC", value).split())
+    if not normalized:
+        raise SchemaFingerprintError("schema check definition must not be empty")
+    match = re.fullmatch(r"(?i:check)\s*\((.*)\)", normalized)
+    if match is None:
+        return normalized
+    body = match.group(1).strip()
+    while _balanced_outer_parentheses(body):
+        body = body[1:-1].strip()
+    body = re.sub(
+        r"\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*\)::",
+        r"\1::",
+        body,
+    )
+    return f"CHECK ({body})"
 
 
 def _sequence(mapping: Mapping[str, Any], key: str) -> list[Any]:
@@ -120,7 +169,9 @@ def canonical_schema_payload(
                     "referenced_schema": _optional_text(constraint, "referenced_schema"),
                     "referenced_relation": _optional_text(constraint, "referenced_relation"),
                     "referenced_columns": list(raw_referenced_columns),
-                    "check_definition": _optional_text(constraint, "check_definition"),
+                    "check_definition": normalize_check_definition(
+                        _optional_text(constraint, "check_definition")
+                    ),
                 }
             )
         # Preserve the provider's frozen ordering contract.  The old
@@ -156,5 +207,6 @@ def schema_fingerprint(payload: Mapping[str, object]) -> str:
 __all__ = [
     "SchemaFingerprintError",
     "canonical_schema_payload",
+    "normalize_check_definition",
     "schema_fingerprint",
 ]
