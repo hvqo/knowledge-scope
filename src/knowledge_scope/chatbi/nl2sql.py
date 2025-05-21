@@ -16,6 +16,7 @@ from knowledge_scope.llm.schemas import (
     LLMRequest,
     LLMResponseFormat,
     LLMResult,
+    LLMTaskType,
     StructuredOutputBoundaryDiagnostic,
     StructuredOutputBoundaryObservation,
 )
@@ -97,10 +98,15 @@ class LLMUsageMetadata:
     input_tokens: int | None
     output_tokens: int | None
     provider_attempts: int
-    task_type: Literal["nl2sql"] = "nl2sql"
+    task_type: LLMTaskType = "nl2sql"
 
     @classmethod
-    def from_result(cls, result: LLMResult) -> LLMUsageMetadata:
+    def from_result(
+        cls,
+        result: LLMResult,
+        *,
+        task_type: LLMTaskType = "nl2sql",
+    ) -> LLMUsageMetadata:
         if not isinstance(result, LLMResult):
             raise TypeError("result must be a normalized LLM result")
         return cls(
@@ -109,10 +115,16 @@ class LLMUsageMetadata:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             provider_attempts=result.provider_attempts,
+            task_type=task_type,
         )
 
     @classmethod
-    def from_error(cls, error: LLMError) -> LLMUsageMetadata | None:
+    def from_error(
+        cls,
+        error: LLMError,
+        *,
+        task_type: LLMTaskType = "nl2sql",
+    ) -> LLMUsageMetadata | None:
         """Carry safe provider metadata when a call failed after an attempt."""
         if error.provider is None or error.model is None:
             return None
@@ -122,6 +134,7 @@ class LLMUsageMetadata:
             input_tokens=error.input_tokens,
             output_tokens=error.output_tokens,
             provider_attempts=error.provider_attempts,
+            task_type=task_type,
         )
 
 
@@ -1270,15 +1283,45 @@ class NL2SQLService:
                 ChatBIErrorCategory.POLICY_VIOLATION,
                 "NL2SQL datasource does not match the query input",
             )
+        request = await self.prepare_for_registered_data_source(
+            datasource_id,
+            query,
+            policy=policy,
+            max_chars=max_chars,
+        )
+        return await self._generate_and_validate(request, max_tokens=max_tokens)
+
+    async def prepare_for_registered_data_source(
+        self,
+        datasource_id: UUID,
+        query: NL2SQLInput,
+        *,
+        policy: QueryPolicy,
+        max_chars: int,
+    ) -> _NL2SQLRequest:
+        """Prepare a trusted, request-local schema context without generating SQL.
+
+        This seam is used by the eligibility gate.  It accepts only a
+        registered datasource ID and public question input; the datasource and
+        schema snapshot are always resolved internally through the existing
+        registry/discovery path.  The returned internal request is an
+        orchestration value, not an authorization capability.
+        """
+        if not isinstance(datasource_id, UUID) or not isinstance(query, NL2SQLInput):
+            raise TypeError("datasource_id and query must use the registered input contracts")
+        if query.datasource_id != datasource_id:
+            raise ChatBIError(
+                ChatBIErrorCategory.POLICY_VIOLATION,
+                "NL2SQL datasource does not match the query input",
+            )
         data_source = await self._get_registered_data_source(datasource_id)
-        request = await self._build_request_for_data_source(
+        return await self._build_request_for_data_source(
             data_source,
             question=query.question,
             model=query.model,
             policy=policy,
             max_chars=max_chars,
         )
-        return await self._generate_and_validate(request, max_tokens=max_tokens)
 
     async def validate_for_registered_data_source(
         self,
@@ -1329,11 +1372,9 @@ class NL2SQLService:
                 ChatBIErrorCategory.POLICY_VIOLATION,
                 "NL2SQL datasource does not match the query input",
             )
-        data_source = await self._get_registered_data_source(datasource_id)
-        request = await self._build_request_for_data_source(
-            data_source,
-            question=query.question,
-            model=query.model,
+        request = await self.prepare_for_registered_data_source(
+            datasource_id,
+            query,
             policy=policy,
             max_chars=max_chars,
         )
