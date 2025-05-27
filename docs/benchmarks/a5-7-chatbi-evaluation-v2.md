@@ -154,3 +154,20 @@ artifact。加载测试会重新计算指纹并核对 v1 fixture 未变，防止
 本版本不修改 v2 fixture、v1 数据集或生产 Agent、NL2SQL 安全校验、SQL 执行、MCP、检索和
 frontend。冻结数据集质量为已验证；provider benchmark 尚未运行，因此不得将 provider
 准确率、Execution Accuracy、端到端准确率、延迟或 token 使用量写入冻结结论。
+
+## A5.7i6 harness 历史
+
+A5.7i6 首次尝试只完成了 `simple-01` 的 eligibility、NL2SQL 和 analysis 三个 provider
+调用，随后评测脚本访问了不存在的 `V2ProviderCaseRecord.sql_attempts` 字段并中止。该次
+尝试没有正式 `run_id`，没有生成有效 artifact；这三个调用不作为 benchmark evidence。
+
+A5.7i6a 仅修复评测基础设施：gated 记录从权威 `ChatBIResult.sql_attempts`、任务级 usage
+和安全的 provider invocation metadata 采集指标，负例在 eligibility 之后必须保持
+NL2SQL、validation、execution、analysis 均为零。未来新运行必须从 `DEV case 1` 开始，
+只有完整的 50 条 DEV case 都成功收集后才允许发布
+`a5.7i6-gated-chatbi-dev-v1` artifact；不提供自动续跑或把部分运行当作正式结果。
+
+正式 gated provider run 在构造 provider 前执行 clean-worktree preflight。Git status 中存在
+tracked、staged 或未被忽略的 untracked 变更时立即失败，不构造 provider、不执行 case，也不发布
+artifact；ignored 的 benchmark/runtime 文件不构成 dirty。artifact 仍保留 commit SHA，并将
+`git_dirty=false` 作为已通过 preflight 的不变量。
