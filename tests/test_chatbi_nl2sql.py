@@ -33,7 +33,11 @@ from knowledge_scope.chatbi.nl2sql import (
     NL2SQLGenerationError,
     _parse_generation_payload_with_observation,
 )
-from knowledge_scope.chatbi.nl2sql_models import ValidatedSQL, _NL2SQLRequest
+from knowledge_scope.chatbi.nl2sql_models import (
+    NL2SQL_PROMPT_VERSION,
+    ValidatedSQL,
+    _NL2SQLRequest,
+)
 from knowledge_scope.chatbi.sql_validation import _SQLSafetyValidator, _validate_sql_candidate
 from knowledge_scope.llm.schemas import LLMRequest, LLMResult
 
@@ -263,7 +267,7 @@ async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens(
     )
 
     assert candidate.sql == "SELECT 1"
-    assert candidate.prompt_version == "a5.3-v3"
+    assert candidate.prompt_version == NL2SQL_PROMPT_VERSION
     assert candidate.result_contract is None
     assert [item.max_tokens for item in gateway.requests] == [1024, 1024]
     assert [item.reasoning for item in gateway.requests] == ["disabled", "disabled"]
@@ -687,7 +691,7 @@ def test_prompt_is_versioned_and_contains_only_question_and_structural_context()
     messages = build_nl2sql_messages(request)
 
     assert [message.role for message in messages] == ["system", "user"]
-    assert "a5.3-v3" in messages[0].content
+    assert NL2SQL_PROMPT_VERSION in messages[0].content
     assert "result_contract" not in messages[0].content
     assert request.question in messages[1].content
     assert "Approved semantic schema context JSON" in messages[1].content
@@ -707,7 +711,15 @@ def test_nl2sql_prompt_enforces_sql_only_exact_projection_contract() -> None:
     )
 
     required_rules = (
-        "Select exactly the columns or derived values needed",
+        "Every field explicitly requested by the user must remain visible",
+        "Distinguish dimensions that identify or group entities from metrics",
+        "Choose the intended row grain",
+        "use stable identity in GROUP BY",
+        "do not expose internal IDs in detail results",
+        "Do not replace a field-specific count with COUNT(*)",
+        "Every non-aggregated requested dimension",
+        "Preserve explicitly requested filters, date boundaries, ordering, and ranking/top-k",
+        "Select only the columns or derived values needed",
         "Never use SELECT *",
         "Do not return explanations",
     )
@@ -717,6 +729,26 @@ def test_nl2sql_prompt_enforces_sql_only_exact_projection_contract() -> None:
     assert repair_messages[0].content == base_messages[0].content
     assert "case_id" not in base_messages[0].content
     assert "reference_sql" not in base_messages[0].content
+
+
+def test_nl2sql_prompt_result_shape_rules_are_general_and_not_evaluation_leaked() -> None:
+    request = _request(question="按地区统计销售额并返回销售额最高的地区")
+    prompt = build_nl2sql_messages(request)[0].content
+
+    assert "dimensions" in prompt
+    assert "metrics" in prompt
+    assert "one entity" in prompt
+    assert "one group" in prompt
+    assert "COUNT(*)" in prompt
+    assert "Columns used only for joins, filters, grouping, or deterministic tie-breaking" in prompt
+    for leaked_value in (
+        "simple-01",
+        "aggregation-02",
+        "reference_sql",
+        "expected rows",
+        "SemanticPolicy",
+    ):
+        assert leaked_value not in prompt
 
 
 def test_result_contract_prompt_remains_explicit_diagnostic_only() -> None:

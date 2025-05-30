@@ -503,7 +503,7 @@ def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
     assert configuration.nl2sql_reasoning == "disabled"
     assert configuration.nl2sql_thinking_type == "disabled"
     assert configuration.nl2sql_reasoning_effort is None
-    assert configuration.nl2sql_prompt_version == "a5.3-v3"
+    assert configuration.nl2sql_prompt_version == "a5.7j2-v1"
     assert configuration.nl2sql_result_contract_enabled is False
 
     diagnostic_configuration = _v2_configuration(
