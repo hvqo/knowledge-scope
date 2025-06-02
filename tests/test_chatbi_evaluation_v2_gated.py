@@ -14,7 +14,7 @@ from knowledge_scope.chatbi import (
     QueryTruncationReason,
 )
 from knowledge_scope.chatbi.eligibility import EligibilityAssessment
-from knowledge_scope.chatbi.nl2sql import LLMUsageMetadata
+from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE, LLMUsageMetadata
 from knowledge_scope.chatbi.schemas import QueryEligibilityReasonCode
 from knowledge_scope.evaluation import chatbi_evaluation_v2_gated as gated_module
 from knowledge_scope.evaluation.chatbi_evaluation import (
@@ -44,6 +44,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     V2ProviderCaseRecord,
 )
 from knowledge_scope.llm import LLMProviderInvocation
+from knowledge_scope.shared.config import Settings
 
 DATASET = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
 DATASOURCE_ID = CHATBI_EVALUATION_V2_DATASOURCE_ID
@@ -435,6 +436,57 @@ def test_clean_worktree_preflight_reaches_provider_construction_boundary(
     assert preflight.git_revision == "a" * 40
     assert preflight.git_dirty is False
     assert isinstance(runner, _StubRunner)
+
+
+@pytest.mark.anyio
+async def test_gated_provider_rejects_test_before_any_provider_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("TEST must be rejected before gated preflight")
+
+    monkeypatch.setattr(gated_module, "preflight_gated_benchmark", fail_if_called)
+
+    with pytest.raises(GatedEvaluationPreflightError, match="only the frozen DEV split"):
+        await gated_module.run_gated_v2_provider_benchmark(
+            Settings(_env_file=None),
+            split="test",
+            output_path=None,
+        )
+
+
+def test_gated_runtime_configuration_keeps_retained_provider_budget() -> None:
+    settings = Settings(_env_file=None)
+
+    gated_module._validate_gated_runtime_configuration(settings)
+
+    assert NL2SQL_REASONING_MODE == "disabled"
+    assert settings.chatbi_nl2sql_max_tokens == 1024
+    assert settings.chatbi_analysis_max_tokens == 1024
+
+    with pytest.raises(GatedEvaluationPreflightError, match="1024 NL2SQL"):
+        gated_module._validate_gated_runtime_configuration(
+            settings.model_copy(update={"chatbi_nl2sql_max_tokens": 512})
+        )
+
+
+@pytest.mark.anyio
+async def test_captured_eligibility_service_preserves_real_assessment() -> None:
+    assessment = _assessment(
+        "eligible",
+        QueryEligibilityReasonCode.ELIGIBLE_ANALYTICAL,
+        llm_call_made=True,
+    )
+
+    class _Delegate:
+        async def assess_for_registered_data_source(self, *_args: object, **_kwargs: object):
+            return assessment
+
+    captured = gated_module._CapturedEligibilityService(_Delegate())
+    assert await captured.assess_for_registered_data_source(uuid4(), object()) is assessment
+    assert captured.assessment is assessment
+    captured.reset()
+    assert captured.assessment is None
 
 
 def test_gated_aggregate_keeps_formal_accuracy_denominator_on_positive_cases() -> None:

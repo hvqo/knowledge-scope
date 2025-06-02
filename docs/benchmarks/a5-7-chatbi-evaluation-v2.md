@@ -155,6 +155,16 @@ artifact。加载测试会重新计算指纹并核对 v1 fixture 未变，防止
 frontend。冻结数据集质量为已验证；provider benchmark 尚未运行，因此不得将 provider
 准确率、Execution Accuracy、端到端准确率、延迟或 token 使用量写入冻结结论。
 
+## Provider 评测入口
+
+仓库保留两条用途不同的入口：
+
+- `uv run knowledgescope chatbi eval-v2-provider --split dev` 是历史 direct/legacy harness，直接走 NL2SQL 评测路径，不包含 Query Eligibility；它的既有行为用于历史兼容。
+- `uv run knowledgescope chatbi eval-v2-gated-provider --split dev` 走注册数据源、可信 Schema Discovery、`ChatBIEligibilityService` 和生产 `ChatBIAgentService`。只有 eligibility 为 `eligible` 时才进入 NL2SQL、validation、execution 和 analysis；`clarify`、`refuse`、`unavailable` 会终止在 gate，后续阶段均为零。
+
+A5.7j2 的正式 provider 评测必须使用 gated 入口。该命令只接受冻结 DEV split；`--split test` 会在 provider 构造前拒绝。评测输出沿用既有
+`a5.7i6-gated-chatbi-dev-v1` artifact schema，当前 NL2SQL prompt 版本单独记录在 provenance 中；本文件不包含新的 provider benchmark 结果。
+
 ## A5.7i6 harness 历史
 
 A5.7i6 首次尝试只完成了 `simple-01` 的 eligibility、NL2SQL 和 analysis 三个 provider

@@ -21,7 +21,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -35,6 +35,17 @@ from pydantic import (
     model_validator,
 )
 
+from knowledge_scope.chatbi import (
+    NL2SQL_REASONING_MODE,
+    ChatBIAgentLimits,
+    ChatBIAgentService,
+    ChatBIEligibilityService,
+    EnvironmentCredentialResolver,
+    NL2SQLService,
+    PostgresExecutionAdapter,
+    SQLExecutionService,
+    create_postgres_schema_discovery_service,
+)
 from knowledge_scope.chatbi.agent import ChatBIResult
 from knowledge_scope.chatbi.eligibility import (
     ELIGIBILITY_GATE_VERSION,
@@ -42,6 +53,7 @@ from knowledge_scope.chatbi.eligibility import (
     EligibilityStructuredErrorCategory,
 )
 from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION
+from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.chatbi.schemas import QueryEligibilityReasonCode, QueryLifecycleState
 from knowledge_scope.evaluation.chatbi_evaluation import (
     ChatBIEvaluationError,
@@ -59,15 +71,49 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     ChatBIEvaluationV2Difficulty,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
+    CHATBI_EVALUATION_V2_CREDENTIAL_ENV,
+    CHATBI_EVALUATION_V2_DATASOURCE_ID,
+    CHATBI_EVALUATION_V2_DATASOURCE_IDENTITY,
+    DEFAULT_DATASET_V2,
+    DEFAULT_FIXTURE_PATH_V2,
+    EXPECTED_FIXTURE_FINGERPRINT_V2,
     EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT,
     EXPECTED_SEMANTIC_POLICY_G3_VERSION,
     V2ProviderCaseRecord,
+    V2ProviderPreflightReport,
     V2ProviderSplit,
+    _prepare_v2_preflight,
+    _TimedAnalysisGateway,
+    _TimedDiscovery,
+    _TimedExecutionAdapter,
+    _TimedExecutionService,
+    _TimedGeneration,
+    _TimedGenerationGateway,
+    _TimedValidation,
+    _TimingState,
+    _v2_query_policy,
     _v2_record,
+    _V2AgentRunner,
+    _V2PreflightContext,
 )
-from knowledge_scope.evaluation.chatbi_semantic_evaluation import SemanticComparison
+from knowledge_scope.evaluation.chatbi_semantic_evaluation import (
+    DEFAULT_G3_SEMANTIC_POLICY_PATH,
+    SemanticComparison,
+    SemanticEvaluationError,
+    compare_semantic_result,
+    load_semantic_policy_v3,
+    policy_for_case,
+)
 from knowledge_scope.evaluation.semantic_evidence import SEMANTIC_EVIDENCE_VERSION
+from knowledge_scope.llm import LLMGateway, create_llm_provider
 from knowledge_scope.llm.schemas import LLMProviderInvocation
+from knowledge_scope.llm.usage import (
+    CompositeProviderInvocationRecorder,
+    DatabaseUsageRecorder,
+    InMemoryProviderInvocationRecorder,
+)
+from knowledge_scope.shared.config import Settings
+from knowledge_scope.shared.database import create_database_engine, create_session_factory
 
 GATED_PROVIDER_ARTIFACT_VERSION = "a5.7i6-gated-chatbi-dev-v1"
 GATED_PROVIDER_BENCHMARK_VERSION = "a5.7i6a"
@@ -75,6 +121,9 @@ GATED_DEV_CASE_COUNT = 50
 GATED_DEV_POSITIVE_COUNT = 47
 GATED_DEV_NEGATIVE_COUNT = 3
 GATED_TASK_TYPES = ("chatbi_eligibility", "nl2sql", "chatbi_analysis")
+DEFAULT_GATED_PROVIDER_OUTPUT_V2 = Path(
+    "data/evaluation/a5-7/provider/chatbi-gated-dev-a5-7j2.json"
+)
 GATED_STAGE_TO_TASK = {
     "eligibility": "chatbi_eligibility",
     "generation": "nl2sql",
@@ -93,6 +142,106 @@ class GatedEvaluationIncompleteError(ValueError):
 
 class GatedEvaluationPreflightError(ValueError):
     """Raised before a gated provider can be constructed."""
+
+
+class _CapturedEligibilityService:
+    """Capture the real gate assessment without changing the Agent contract."""
+
+    def __init__(self, delegate: ChatBIEligibilityService) -> None:
+        self._delegate = delegate
+        self.assessment: EligibilityAssessment | None = None
+
+    def reset(self) -> None:
+        self.assessment = None
+
+    async def assess_for_registered_data_source(
+        self, *args: Any, **kwargs: Any
+    ) -> EligibilityAssessment:
+        assessment = await self._delegate.assess_for_registered_data_source(*args, **kwargs)
+        if not isinstance(assessment, EligibilityAssessment):
+            raise GatedEvaluationMetricError("eligibility service returned an invalid assessment")
+        self.assessment = assessment
+        return assessment
+
+
+class _GatedRuntimeResources:
+    """Own provider/database resources created after the gated preflight."""
+
+    def __init__(self) -> None:
+        self.provider: Any | None = None
+        self.app_engine: Any | None = None
+
+    async def aclose(self) -> None:
+        provider = self.provider
+        app_engine = self.app_engine
+        self.provider = None
+        self.app_engine = None
+        try:
+            if provider is not None:
+                await provider.aclose()
+        finally:
+            if app_engine is not None:
+                await app_engine.dispose()
+
+
+class _GatedProductionCaseRunner:
+    """Run one case through the real eligibility-gated Agent chain."""
+
+    def __init__(
+        self,
+        runner: Any,
+        eligibility: _CapturedEligibilityService,
+        semantic_policy: Any,
+        resources: _GatedRuntimeResources,
+    ) -> None:
+        self._runner = runner
+        self._eligibility = eligibility
+        self._semantic_policy = semantic_policy
+        self._resources = resources
+
+    async def run(
+        self, case: ChatBIEvaluationCaseV2
+    ) -> tuple[ChatBIEvaluationObservation, EligibilityAssessment]:
+        self._eligibility.reset()
+        observation = await self._runner.run(case)
+        assessment = self._eligibility.assessment
+        if assessment is None:
+            raise GatedEvaluationMetricError(
+                f"{case.case_id}: production Agent did not capture an eligibility assessment"
+            )
+        return observation, assessment
+
+    def semantic_diagnostic(
+        self,
+        case: ChatBIEvaluationCaseV2,
+        observation: ChatBIEvaluationObservation,
+    ) -> GatedSemanticDiagnostic:
+        if not case.positive or case.expected_result is None:
+            return GatedSemanticDiagnostic.unavailable()
+        if observation.execution_result is None or case.reference_sql is None:
+            return GatedSemanticDiagnostic.unavailable()
+        try:
+            policy = policy_for_case(
+                self._semantic_policy,
+                case_id=case.case_id,
+                question=case.question,
+                expected=case.expected_result,
+                expected_sql=case.reference_sql,
+            )
+            comparison = compare_semantic_result(
+                observation.execution_result,
+                case.expected_result,
+                policy=policy,
+                actual_sql=observation.result.redacted_sql,
+                expected_sql=case.reference_sql,
+                schema=self._semantic_policy.schema,
+            )
+        except (SemanticEvaluationError, TypeError, ValueError):
+            return GatedSemanticDiagnostic.unavailable()
+        return GatedSemanticDiagnostic.from_comparison(comparison)
+
+    async def aclose(self) -> None:
+        await self._resources.aclose()
 
 
 class GatedCaseRunner(Protocol):
@@ -782,10 +931,247 @@ async def collect_gated_dev_cases(
     if sum(case.positive for case in selected) != GATED_DEV_POSITIVE_COUNT:
         raise GatedEvaluationMetricError("gated DEV selection must contain 47 positive cases")
     records: list[GatedCaseRecord] = []
+    semantic_diagnostic_factory = getattr(runner, "semantic_diagnostic", None)
     for case in selected:
         observation, eligibility = await runner.run(case)
-        records.append(collect_gated_case_record(case, observation, eligibility))
+        semantic_diagnostic = (
+            semantic_diagnostic_factory(case, observation)
+            if callable(semantic_diagnostic_factory)
+            else None
+        )
+        if semantic_diagnostic is not None and not isinstance(
+            semantic_diagnostic, GatedSemanticDiagnostic
+        ):
+            raise GatedEvaluationMetricError(
+                f"{case.case_id}: semantic diagnostic provider returned an invalid result"
+            )
+        records.append(
+            collect_gated_case_record(
+                case,
+                observation,
+                eligibility,
+                semantic_diagnostic=semantic_diagnostic,
+            )
+        )
     return records
+
+
+def _build_gated_case_runner(
+    settings: Settings,
+    context: _V2PreflightContext,
+    semantic_policy: Any,
+    resources: _GatedRuntimeResources,
+) -> _GatedProductionCaseRunner:
+    """Construct the production Agent graph after all provider-free checks."""
+    resources.app_engine = create_database_engine(settings)
+    session_factory = create_session_factory(resources.app_engine)
+    registry = DatabaseDataSourceProvider(session_factory)
+    resources.provider = create_llm_provider(settings)
+    timing = _TimingState()
+    usage_recorder = DatabaseUsageRecorder(session_factory)
+    invocation_recorder = InMemoryProviderInvocationRecorder()
+    invocation_sink = CompositeProviderInvocationRecorder(usage_recorder, invocation_recorder)
+    discovery = create_postgres_schema_discovery_service(
+        connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+        statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+    )
+    gateway = LLMGateway(
+        resources.provider,
+        usage_recorder,
+        settings,
+        invocation_sink,
+    )
+    timed_discovery = _TimedDiscovery(discovery, timing)
+    generation = NL2SQLService(
+        _TimedGenerationGateway(gateway, timing),
+        schema_discovery=timed_discovery,
+        data_source_provider=registry,
+        max_tokens=settings.chatbi_nl2sql_max_tokens,
+        result_contract_enabled=False,
+    )
+    timed_generation = _TimedGeneration(generation, timing)
+    eligibility = _CapturedEligibilityService(ChatBIEligibilityService(generation, gateway))
+    policy = _v2_query_policy(settings)
+    execution = SQLExecutionService(
+        _TimedValidation(
+            generation,
+            timing,
+            evaluation_schema_fingerprint=context.authoritative_schema_fingerprint,
+        ),
+        EnvironmentCredentialResolver(),
+        _TimedExecutionAdapter(
+            PostgresExecutionAdapter(
+                connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+                statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+            ),
+            timing,
+        ),
+    )
+    timed_execution = _TimedExecutionService(execution, timing)
+    agent = ChatBIAgentService(
+        timed_generation,
+        timed_execution,
+        _TimedAnalysisGateway(gateway, timing),
+        limits=ChatBIAgentLimits.from_settings(settings),
+        eligibility_service=eligibility,
+    )
+    runner = _V2AgentRunner(
+        agent,
+        timing,
+        CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        policy,
+        settings.chatbi_schema_context_max_chars,
+        invocation_recorder,
+        invocation_sink,
+        None,
+        evidence_dataset_fingerprint=context.dataset.fingerprint,
+        evidence_fixture_fingerprint=context.fixture_fingerprint,
+        evidence_schema_fingerprint=context.authoritative_schema_fingerprint,
+        evidence_synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+    )
+    return _GatedProductionCaseRunner(runner, eligibility, semantic_policy, resources)
+
+
+def _validate_gated_runtime_configuration(settings: Settings) -> None:
+    """Reject configuration that would make the frozen gated run incomparable."""
+    if NL2SQL_REASONING_MODE != "disabled":
+        raise GatedEvaluationPreflightError(
+            "gated evaluation requires disabled NL2SQL reasoning configuration"
+        )
+    if settings.chatbi_nl2sql_max_tokens != 1024:
+        raise GatedEvaluationPreflightError("gated evaluation requires 1024 NL2SQL output tokens")
+    if settings.chatbi_analysis_max_tokens != 1024:
+        raise GatedEvaluationPreflightError("gated evaluation requires 1024 analysis output tokens")
+
+
+async def preflight_gated_provider_benchmark(
+    settings: Settings,
+    *,
+    split: str,
+    dataset_path: Path = DEFAULT_DATASET_V2,
+    fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
+    output_path: Path | None = None,
+) -> V2ProviderPreflightReport:
+    """Run the complete gated provider-free preflight without constructing a provider."""
+    if split != V2ProviderSplit.DEV.value:
+        raise GatedEvaluationPreflightError(
+            "eligibility-gated provider evaluation permits only the frozen DEV split"
+        )
+    _validate_gated_runtime_configuration(settings)
+    environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
+    try:
+        preflight = preflight_gated_benchmark()
+        context = await _prepare_v2_preflight(
+            settings,
+            split=split,
+            dataset_path=dataset_path,
+            fixture_path=fixture_path,
+            output_path=output_path,
+        )
+        if context.git_revision != preflight.git_revision or context.git_dirty:
+            raise GatedEvaluationPreflightError(
+                "gated preflight Git provenance changed unexpectedly"
+            )
+        return V2ProviderPreflightReport(
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_fingerprint=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
+            authoritative_schema_fingerprint=context.authoritative_schema_fingerprint,
+            fixture_data_fingerprint=context.fixture_data_fingerprint,
+            datasource_id=context.bootstrap.data_source.id,
+            split="dev",
+            selected_case_count=len(context.selected_cases),
+            selected_test_case_count=0,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            provider_configured=True,
+            database_created=context.bootstrap.database_created,
+            datasource_created=context.bootstrap.datasource_created,
+            git_revision=preflight.git_revision,
+            git_dirty=False,
+            semantic_policy_version=context.semantic_policy_version,
+            semantic_policy_fingerprint=context.semantic_policy_fingerprint,
+        )
+    finally:
+        if not environment_was_present:
+            os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
+
+
+async def run_gated_v2_provider_benchmark(
+    settings: Settings,
+    *,
+    split: str = V2ProviderSplit.DEV.value,
+    dataset_path: Path = DEFAULT_DATASET_V2,
+    fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
+    output_path: Path | None = DEFAULT_GATED_PROVIDER_OUTPUT_V2,
+) -> GatedProviderRun:
+    """Run the frozen DEV cases through eligibility and the production Agent."""
+    if split != V2ProviderSplit.DEV.value:
+        raise GatedEvaluationPreflightError(
+            "eligibility-gated provider evaluation permits only the frozen DEV split"
+        )
+    _validate_gated_runtime_configuration(settings)
+    environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
+    started_at = datetime.now(UTC)
+    resources = _GatedRuntimeResources()
+    runner: _GatedProductionCaseRunner | None = None
+    try:
+        first_preflight = preflight_gated_benchmark()
+        context = await _prepare_v2_preflight(
+            settings,
+            split=split,
+            dataset_path=dataset_path,
+            fixture_path=fixture_path,
+            output_path=output_path,
+        )
+        if context.git_revision != first_preflight.git_revision or context.git_dirty:
+            raise GatedEvaluationPreflightError(
+                "gated preflight Git provenance changed unexpectedly"
+            )
+        semantic_policy = load_semantic_policy_v3(DEFAULT_G3_SEMANTIC_POLICY_PATH)
+        second_preflight, runner = construct_gated_provider(
+            lambda: _build_gated_case_runner(settings, context, semantic_policy, resources)
+        )
+        if second_preflight.git_revision != first_preflight.git_revision:
+            raise GatedEvaluationPreflightError(
+                "gated Git revision changed before provider construction"
+            )
+        records = await collect_gated_dev_cases(context.selected_cases, runner)
+        completed_at = datetime.now(UTC)
+        case_ids = tuple(case.case_id for case in context.selected_cases)
+        provenance = GatedRunProvenance(
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_fingerprint=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
+            fixture_data_fingerprint=context.fixture_data_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            datasource_identity=CHATBI_EVALUATION_V2_DATASOURCE_IDENTITY,
+            case_ids=case_ids,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,
+            semantic_policy_version=context.semantic_policy_version,
+            semantic_policy_fingerprint=context.semantic_policy_fingerprint,
+            git_revision=second_preflight.git_revision,
+            git_dirty=False,
+        )
+        artifact = build_gated_artifact(
+            provenance,
+            records,
+            expected_case_ids=case_ids,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        if output_path is not None:
+            write_gated_artifact(output_path, artifact)
+        return artifact
+    finally:
+        if runner is not None:
+            await runner.aclose()
+        else:
+            await resources.aclose()
+        if not environment_was_present:
+            os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
 
 
 def build_gated_artifact(
@@ -845,6 +1231,7 @@ def write_gated_artifact(path: Path, artifact: GatedProviderRun) -> None:
 
 
 __all__ = [
+    "DEFAULT_GATED_PROVIDER_OUTPUT_V2",
     "GATED_DEV_CASE_COUNT",
     "GATED_DEV_NEGATIVE_COUNT",
     "GATED_DEV_POSITIVE_COUNT",
@@ -870,5 +1257,7 @@ __all__ = [
     "collect_gated_dev_cases",
     "construct_gated_provider",
     "preflight_gated_benchmark",
+    "preflight_gated_provider_benchmark",
+    "run_gated_v2_provider_benchmark",
     "write_gated_artifact",
 ]
