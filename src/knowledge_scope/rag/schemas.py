@@ -16,6 +16,7 @@ RAGRetrievalMode = Literal["dense", "unified"]
 RAGBranchStatus = Literal["success", "empty", "failed", "timed_out", "cancelled"]
 RAGCitationModality = Literal["text", "image", "table", "formula"]
 RAGCitationBranchName = Literal["dense", "sparse", "graph", "multimodal"]
+RAGCitationSnippetKind = Literal["source", "representation"]
 
 
 class RAGQueryRequest(BaseModel):
@@ -95,6 +96,8 @@ class RAGCitation(BaseModel):
     source_block_ids: list[str] = Field(min_length=1)
     section_path: list[str]
     section_title: str | None = None
+    snippet: str | None = Field(default=None, max_length=1_000)
+    snippet_kind: RAGCitationSnippetKind | None = None
     final_rank: int | None = Field(default=None, ge=1)
     final_reranker_score: float | None = None
     branch_provenance: list[RAGCitationBranch] = Field(default_factory=list)
@@ -161,6 +164,17 @@ class RAGCitation(BaseModel):
                 raise ValueError("Evidence citations require modality and representations")
         if (self.final_rank is None) != (self.final_reranker_score is None):
             raise ValueError("final rank and score must be provided together")
+        if (self.snippet is None) != (self.snippet_kind is None):
+            raise ValueError("citation snippet and snippet kind must be provided together")
+        if self.snippet is not None and not self.snippet.strip():
+            raise ValueError("citation snippet must not be blank")
+        if self.candidate_kind == "chunk" and self.snippet_kind not in {None, "source"}:
+            raise ValueError("chunk citations require source snippets")
+        if self.candidate_kind == "evidence" and self.snippet_kind not in {
+            None,
+            "representation",
+        }:
+            raise ValueError("Evidence citations require representation snippets")
         return self
 
 
@@ -245,6 +259,7 @@ __all__ = [
     "RAGCitationBranch",
     "RAGCitationBranchName",
     "RAGCitationModality",
+    "RAGCitationSnippetKind",
     "RAGCitationsData",
     "RAGCompleteData",
     "RAGCompletionStatus",

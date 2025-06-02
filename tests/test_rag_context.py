@@ -54,6 +54,8 @@ def test_dense_context_preserves_asset_lineage_in_citation() -> None:
     )
 
     assert selection.items[0].citation.asset_refs == ["assets/figure.png"]
+    assert selection.items[0].citation.snippet == "图表说明"
+    assert selection.items[0].citation.snippet_kind == "source"
 
 
 def test_context_suppresses_exact_duplicate_source_block_text() -> None:

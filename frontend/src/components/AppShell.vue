@@ -64,6 +64,21 @@ const uiStore = useUiStore();
             class="nav-label"
           >知识库</span>
         </RouterLink>
+        <RouterLink
+          to="/chat"
+          class="nav-item"
+          active-class="is-active"
+          title="AI 问答"
+        >
+          <span
+            class="nav-icon"
+            aria-hidden="true"
+          >✦</span>
+          <span
+            v-if="!uiStore.sidebarCollapsed"
+            class="nav-label"
+          >AI 问答</span>
+        </RouterLink>
       </nav>
     </aside>
 
