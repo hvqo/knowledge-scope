@@ -42,6 +42,7 @@ from .schemas import (
     QueryExecutionResult,
     QueryLifecycleState,
     QueryTruncationReason,
+    ScalarValue,
 )
 
 if TYPE_CHECKING:
@@ -170,6 +171,9 @@ class ChatBIResult(_AgentModel):
     execution_status: QueryLifecycleState
     redacted_sql: StrictStr | None = Field(default=None, max_length=100_000)
     columns: list[ColumnMetadata] = Field(default_factory=list)
+    # Result rows are available to the product API projection but stay out of
+    # the existing audit/MCP serialization contract.
+    rows: list[list[ScalarValue]] = Field(default_factory=list, exclude=True)
     row_count: StrictInt = Field(ge=0)
     truncated: StrictBool = False
     truncation_reason: QueryTruncationReason | None = None
@@ -230,7 +234,7 @@ class ChatBIResult(_AgentModel):
                 raise ValueError("eligibility decision does not match execution status")
             if self.sql_attempts != 0 or self.repair_attempts != 0:
                 raise ValueError("eligibility terminal results cannot attempt SQL")
-            if self.redacted_sql is not None or self.columns or self.row_count:
+            if self.redacted_sql is not None or self.columns or self.rows or self.row_count:
                 raise ValueError("eligibility terminal results cannot contain SQL results")
             if self.truncated or self.truncation_reason is not None:
                 raise ValueError("eligibility terminal results cannot contain truncation metadata")
@@ -261,6 +265,8 @@ class ChatBIResult(_AgentModel):
                 and self.error_category is None
             ):
                 raise ValueError("failed execution results require an error category")
+            if self.execution_status is not QueryLifecycleState.SUCCEEDED and self.rows:
+                raise ValueError("failed execution results cannot contain rows")
         if self.repair_attempts > self.sql_attempts:
             raise ValueError("repair attempts cannot exceed SQL attempts")
         return self
@@ -500,6 +506,7 @@ class ChatBIAgentService:
             execution_status=status,
             redacted_sql=ChatBIAgentService._redacted_sql(candidate),
             columns=execution.columns if execution is not None else [],
+            rows=execution.rows if execution is not None else [],
             row_count=execution.row_count if execution is not None else 0,
             truncated=execution.truncated if execution is not None else False,
             truncation_reason=execution.truncation_reason if execution is not None else None,

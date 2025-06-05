@@ -14,7 +14,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from knowledge_scope import __version__
+from knowledge_scope.chatbi.agent import ChatBIAgentLimits, ChatBIAgentService
 from knowledge_scope.chatbi.api import router as chatbi_router
+from knowledge_scope.chatbi.credentials import EnvironmentCredentialResolver
+from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
+from knowledge_scope.chatbi.eligibility import ChatBIEligibilityService
+from knowledge_scope.chatbi.execution import PostgresExecutionAdapter, SQLExecutionService
+from knowledge_scope.chatbi.nl2sql import NL2SQLService
+from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.graph.neo4j import Neo4jGraphStore
 from knowledge_scope.graph.retrieval import GraphRetrievalConfig
 from knowledge_scope.graph.retrieval_service import GraphRetrievalService
@@ -52,12 +59,13 @@ PROJECT_STATUS: Final = "foundation"
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Initialize the default RAG graph and dispose owned clients on shutdown."""
     provider = None
+    gateway: LLMGateway | None = None
     try:
         if application.state.representation_store is None:
             application.state.representation_store = QdrantRepresentationStore(
                 application.state.settings
             )
-        if application.state.rag_service is None:
+        if application.state.rag_service is None or application.state.chatbi_agent_service is None:
             settings: Settings = application.state.settings
             if application.state.sparse_store is None:
                 application.state.sparse_store = SparseIndexStore(
@@ -77,6 +85,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 DatabaseUsageRecorder(application.state.db_session_factory),
                 settings,
             )
+        if application.state.rag_service is None:
+            settings = application.state.settings
+            if gateway is None:  # pragma: no cover - provider is created above.
+                raise RuntimeError("LLM gateway is not initialized")
             retrieval = DenseRetrievalService(
                 application.state.vector_store,
                 application.state.embedding_model,
@@ -127,6 +139,38 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 settings,
                 unified_retrieval=unified_retrieval,
             )
+        if application.state.chatbi_agent_service is None:
+            settings = application.state.settings
+            if gateway is None:  # pragma: no cover - provider is created above.
+                raise RuntimeError("LLM gateway is not initialized")
+            schema_discovery = create_postgres_schema_discovery_service(
+                connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+                statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+            )
+            nl2sql = NL2SQLService(
+                gateway,
+                schema_discovery=schema_discovery,
+                data_source_provider=DatabaseDataSourceProvider(
+                    application.state.db_session_factory
+                ),
+                max_tokens=settings.chatbi_nl2sql_max_tokens,
+            )
+            eligibility = ChatBIEligibilityService(nl2sql, gateway)
+            execution = SQLExecutionService(
+                nl2sql,
+                EnvironmentCredentialResolver(),
+                PostgresExecutionAdapter(
+                    connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+                    statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+                ),
+            )
+            application.state.chatbi_agent_service = ChatBIAgentService(
+                nl2sql,
+                execution,
+                gateway,
+                limits=ChatBIAgentLimits.from_settings(settings),
+                eligibility_service=eligibility,
+            )
         yield
     finally:
         if provider is not None:
@@ -150,6 +194,7 @@ def create_app(
     graph_store: Neo4jGraphStore | None = None,
     representation_store: QdrantRepresentationStore | None = None,
     sparse_store: SparseIndexStore | None = None,
+    chatbi_agent_service: ChatBIAgentService | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -171,6 +216,7 @@ def create_app(
     application.state.graph_store = graph_store or Neo4jGraphStore(runtime_settings)
     application.state.representation_store = representation_store
     application.state.sparse_store = sparse_store
+    application.state.chatbi_agent_service = chatbi_agent_service
     application.state.llm_provider = None
     application.add_middleware(
         CORSMiddleware,
