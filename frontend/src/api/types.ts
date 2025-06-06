@@ -49,7 +49,7 @@ export interface Document {
   media_type: "application/pdf";
   size_bytes: number;
   sha256: string;
-  status: "uploaded";
+  status: "uploaded" | "registered";
   created_at: string;
   updated_at: string;
 }

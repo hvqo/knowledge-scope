@@ -194,7 +194,7 @@ function formatDate(value: string): string {
 }
 
 function statusLabel(documentStatus: Document["status"]): string {
-  return documentStatus === "uploaded" ? "已上传" : documentStatus;
+  return documentStatus === "uploaded" ? "已上传" : "已登记";
 }
 </script>
 
