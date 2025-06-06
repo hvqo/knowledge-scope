@@ -20,6 +20,7 @@ from pydantic import (
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from knowledge_scope.reports.models import Report
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import get_session
 
@@ -343,6 +344,14 @@ async def delete_data_source(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     record = await _get_data_source(session, datasource_id)
+    report_id = await session.scalar(
+        select(Report.id).where(Report.datasource_id == record.id).limit(1)
+    )
+    if report_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="数据源仍被报告引用, 请先删除报告",
+        )
     await session.delete(record)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

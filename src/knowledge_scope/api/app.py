@@ -29,6 +29,7 @@ from knowledge_scope.llm.gateway import LLMGateway
 from knowledge_scope.llm.providers import create_llm_provider
 from knowledge_scope.llm.usage import DatabaseUsageRecorder
 from knowledge_scope.rag.service import RAGService
+from knowledge_scope.reports.api import router as reports_router
 from knowledge_scope.retrieval.embedding import QwenEmbeddingModel
 from knowledge_scope.retrieval.qdrant import QdrantVectorStore
 from knowledge_scope.retrieval.representation_index import (
@@ -289,6 +290,7 @@ def create_app(
     application.include_router(retrieval_router, prefix=API_PREFIX)
     application.include_router(rag_router, prefix=API_PREFIX)
     application.include_router(chatbi_router, prefix=API_PREFIX)
+    application.include_router(reports_router, prefix=API_PREFIX)
     return application
 
 

@@ -4,6 +4,7 @@ import {
   ApiError,
   askChatBI,
   getUserFacingError,
+  insertReportSource,
   streamRagQuery,
   uploadDocument,
 } from "./client";
@@ -241,5 +242,42 @@ describe("askChatBI", () => {
     await expect(askChatBI("datasource-1", "问题")).rejects.toThrow(
       "rows do not match the column contract",
     );
+  });
+});
+
+describe("insertReportSource", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("uses the atomic source-and-content insertion endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ id: "source-1" }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const payload = {
+      source: {
+        kind: "chatbi_result" as const,
+        title: "地区客户数",
+        datasource_id: "datasource-1",
+        datasource_name: "业务数据",
+        question: "统计数量",
+        columns: [],
+        rows: [],
+        row_count: 0,
+        truncated: false,
+        truncation_reason: null,
+      },
+      content_append: "【地区客户数】",
+    };
+
+    await insertReportSource("report-1", "section-1", payload);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      "/reports/report-1/sections/section-1/sources/insert",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(payload);
   });
 });
