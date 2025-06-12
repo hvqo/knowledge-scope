@@ -30,7 +30,7 @@ from knowledge_scope.chatbi import (
 from knowledge_scope.chatbi.credentials import ResolvedDatabaseCredentials
 from knowledge_scope.chatbi.discovery import SchemaDiscoveryService
 from knowledge_scope.chatbi.errors import ChatBIError, ChatBIErrorCategory
-from knowledge_scope.chatbi.execution import redact_sql_literals
+from knowledge_scope.chatbi.execution import _decimal_text, redact_sql_literals
 from knowledge_scope.chatbi.nl2sql_models import ValidatedSQL
 from knowledge_scope.chatbi.postgres_schema import PostgresSchemaInspector
 from knowledge_scope.chatbi.schema_models import build_semantic_schema_context
@@ -512,7 +512,7 @@ async def test_postgres_adapter_enforces_readonly_search_path_and_normalizes_val
     values: Mapping[str, object] = {
         "text_value": "华东",
         "integer_value": 3,
-        "decimal_value": Decimal("12.30"),
+        "decimal_value": Decimal("12.300000000000000"),
         "uuid_value": UUID("11111111-1111-4111-8111-111111111111"),
         "date_value": date(2026, 1, 1),
         "time_value": time(8, 30),
@@ -536,7 +536,7 @@ async def test_postgres_adapter_enforces_readonly_search_path_and_normalizes_val
 
     assert result.state is QueryLifecycleState.SUCCEEDED
     assert result.row_count == 1
-    assert result.rows[0][2] == "12.30"
+    assert result.rows[0][2] == "12.3"
     assert result.rows[0][3] == "11111111-1111-4111-8111-111111111111"
     assert result.rows[0][4:7] == ["2026-01-01", "08:30:00", "2026-01-01T08:30:00+00:00"]
     assert result.rows[0][7] == {"ok": True, "items": [1, None]}
@@ -545,6 +545,21 @@ async def test_postgres_adapter_enforces_readonly_search_path_and_normalizes_val
     assert connection.queries[1] == "SET LOCAL statement_timeout = 30000"
     assert connection.prepared_query == validated.normalized_sql
     assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("120.250000000000000"), "120.25"),
+        (
+            Decimal("12345678901234567890.123456789012345000"),
+            "12345678901234567890.123456789012345",
+        ),
+        (Decimal("-0.0000"), "0"),
+    ],
+)
+def test_decimal_text_removes_only_insignificant_zeroes(value: Decimal, expected: str) -> None:
+    assert _decimal_text(value) == expected
 
 
 @pytest.mark.anyio

@@ -89,7 +89,7 @@ describe("ChatView", () => {
         'event: answer_delta\ndata: {"text":"回答 "}\n\n',
         'event: answer_delta\ndata: {"text":"[C1]"}\n\n',
         `event: citations\ndata: ${JSON.stringify({ prompt_version: "rag-qa-v1", items: [citation] })}\n\n`,
-        'event: complete\ndata: {"status":"completed","prompt_version":"rag-qa-v1","retrieval_mode":"dense","latency_ms":4}\n\n',
+        'event: complete\ndata: {"status":"completed","prompt_version":"rag-qa-v1","retrieval_mode":"unified","latency_ms":4}\n\n',
       ]);
     });
 
@@ -119,7 +119,7 @@ describe("ChatView", () => {
     expect(JSON.parse(String(postCall?.[1]?.body))).toMatchObject({
       query: "产品有哪些说明？",
       knowledge_base_id: "kb-1",
-      retrieval_mode: "dense",
+      retrieval_mode: "unified",
     });
   });
 });

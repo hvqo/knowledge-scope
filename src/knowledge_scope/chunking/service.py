@@ -42,6 +42,7 @@ from .models import (
 
 CHUNKING_DIRECTORY_NAME = "chunking"
 PARSING_DIRECTORY_NAME = "parsing"
+CHUNKS_ARTIFACT_FILENAME = "chunks.json"
 _JOIN_SEPARATOR = "\n\n"
 _SENTENCE_BOUNDARIES = frozenset(
     {"\u3002", "\uff01", "\uff1f", "!", "?", "\uff1b", ";", "\uff1a", ":", "\n"}
@@ -768,6 +769,16 @@ def _artifact_root(settings: Settings) -> Path:
     return root
 
 
+def chunk_artifact_path(settings: Settings, document_id: UUID) -> Path:
+    """Return the persisted chunk artifact path for one document without creating it."""
+    return (
+        Path(settings.data_dir).resolve()
+        / CHUNKING_DIRECTORY_NAME
+        / str(document_id)
+        / CHUNKS_ARTIFACT_FILENAME
+    )
+
+
 def _promote_staging(staging_dir: Path, final_dir: Path) -> None:
     backup_dir: Path | None = None
     try:
@@ -818,7 +829,7 @@ def chunk_document_by_id(
         root = _artifact_root(settings)
         final_dir = root / str(document_id)
         staging_dir = Path(tempfile.mkdtemp(prefix=f".{document_id}-", dir=root))
-        (staging_dir / "chunks.json").write_text(
+        (staging_dir / CHUNKS_ARTIFACT_FILENAME).write_text(
             chunked.model_dump_json(indent=2) + "\n", encoding="utf-8"
         )
         manifest = {
@@ -857,8 +868,10 @@ def chunk_document_by_id(
 
 __all__ = [
     "CHUNKING_DIRECTORY_NAME",
+    "CHUNKS_ARTIFACT_FILENAME",
     "ChunkingError",
     "ChunkingResult",
+    "chunk_artifact_path",
     "chunk_document",
     "chunk_document_by_id",
     "summarize_chunked_document",

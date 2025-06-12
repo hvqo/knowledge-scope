@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   askChatBI,
+  documentFileUrl,
   getUserFacingError,
   insertReportSource,
   streamRagQuery,
@@ -282,5 +283,16 @@ describe("insertReportSource", () => {
     );
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(payload);
+  });
+});
+
+describe("documentFileUrl", () => {
+  it("encodes identifiers and only appends a page fragment when requested", () => {
+    expect(documentFileUrl("kb 1", "doc/1")).toBe(
+      "/api/v1/knowledge-bases/kb%201/documents/doc%2F1/file",
+    );
+    expect(documentFileUrl("kb-1", "doc-1", 7)).toBe(
+      "/api/v1/knowledge-bases/kb-1/documents/doc-1/file#page=7",
+    );
   });
 });

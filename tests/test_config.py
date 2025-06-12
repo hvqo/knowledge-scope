@@ -51,7 +51,7 @@ def test_settings_have_safe_defaults() -> None:
     assert settings.rag_candidate_limit == 10
     assert settings.rag_rerank_limit == 5
     assert settings.rag_context_budget_chars == 6_000
-    assert settings.rag_max_tokens == 512
+    assert settings.rag_max_tokens == 1_024
     assert settings.chatbi_max_rows == 1_000
     assert settings.chatbi_max_result_bytes == 4_000_000
     assert settings.chatbi_max_cell_bytes == 1_000_000
