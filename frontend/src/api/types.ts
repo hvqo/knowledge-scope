@@ -387,3 +387,76 @@ export type RAGStreamEvent =
   | { event: "citations"; data: RAGCitationsData }
   | { event: "complete"; data: RAGCompleteData }
   | { event: "error"; data: { category: string; message: string } };
+
+export type GraphNeighborDirection = "forward" | "reverse" | "canonical_bridge";
+
+export interface GraphNode {
+  entity_id: string;
+  canonical_name: string;
+  entity_type: string;
+  aliases: string[];
+  document_id: string;
+  canonical_entity_ids: string[];
+  evidence_count: number;
+  degree: number;
+}
+
+export type GraphEdgeKind = "relation" | "canonical_bridge";
+
+export interface GraphEdge {
+  relation_id: string;
+  source_entity_id: string;
+  target_entity_id: string;
+  relation_type: string;
+  kind: GraphEdgeKind;
+  document_id: string | null;
+}
+
+export interface GraphEntityTypeOption {
+  entity_type: string;
+  entity_count: number;
+}
+
+export interface GraphOverview {
+  knowledge_base_id: string;
+  entity_count: number;
+  relation_count: number;
+  entity_types: GraphEntityTypeOption[];
+  truncated: boolean;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface GraphEvidenceItem {
+  chunk_id: string;
+  document_id: string;
+  page_start: number;
+  page_end: number;
+  section_path: string[];
+}
+
+export interface GraphCanonicalEntity {
+  canonical_entity_id: string;
+  canonical_name: string;
+  entity_type: string;
+}
+
+export interface GraphNeighborItem {
+  entity_id: string;
+  canonical_name: string;
+  entity_type: string;
+  document_id: string;
+  direction: GraphNeighborDirection;
+  relation_id: string | null;
+  relation_type: string | null;
+  page_start: number | null;
+  page_end: number | null;
+  shared_canonical_name: string | null;
+}
+
+export interface GraphEntityDetail {
+  entity: GraphNode;
+  canonical_entities: GraphCanonicalEntity[];
+  evidence: GraphEvidenceItem[];
+  neighbors: GraphNeighborItem[];
+}

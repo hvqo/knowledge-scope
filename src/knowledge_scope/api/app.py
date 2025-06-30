@@ -22,6 +22,7 @@ from knowledge_scope.chatbi.eligibility import ChatBIEligibilityService
 from knowledge_scope.chatbi.execution import PostgresExecutionAdapter, SQLExecutionService
 from knowledge_scope.chatbi.nl2sql import NL2SQLService
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
+from knowledge_scope.graph.api import router as graph_router
 from knowledge_scope.graph.neo4j import Neo4jGraphStore
 from knowledge_scope.graph.retrieval import GraphRetrievalConfig
 from knowledge_scope.graph.retrieval_service import GraphRetrievalService
@@ -292,6 +293,7 @@ def create_app(
     application.include_router(router)
     application.include_router(knowledge_bases_router, prefix=API_PREFIX)
     application.include_router(documents_router, prefix=API_PREFIX)
+    application.include_router(graph_router, prefix=API_PREFIX)
     application.include_router(retrieval_router, prefix=API_PREFIX)
     application.include_router(rag_router, prefix=API_PREFIX)
     application.include_router(chatbi_router, prefix=API_PREFIX)

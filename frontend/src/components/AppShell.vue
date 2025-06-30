@@ -65,6 +65,21 @@ const uiStore = useUiStore();
           >知识库</span>
         </RouterLink>
         <RouterLink
+          to="/knowledge-graph"
+          class="nav-item"
+          active-class="is-active"
+          title="知识图谱"
+        >
+          <span
+            class="nav-icon"
+            aria-hidden="true"
+          >◎</span>
+          <span
+            v-if="!uiStore.sidebarCollapsed"
+            class="nav-label"
+          >知识图谱</span>
+        </RouterLink>
+        <RouterLink
           to="/chat"
           class="nav-item"
           active-class="is-active"

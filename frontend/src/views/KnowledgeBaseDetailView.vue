@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { computed, ref } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   ElButton,
   ElDropdown,
@@ -273,6 +273,16 @@ function statusLabel(documentStatus: Document["status"]): string {
           </div>
         </div>
         <div class="detail-meta">
+          <RouterLink
+            class="graph-link"
+            :to="{ name: 'knowledge-graph', query: { kb: knowledgeBase.id } }"
+          >
+            <span
+              class="graph-link-icon"
+              aria-hidden="true"
+            >◎</span>
+            查看知识图谱
+          </RouterLink>
           <span>更新于 {{ formatDate(knowledgeBase.updated_at) }}</span>
         </div>
       </header>
@@ -578,6 +588,28 @@ h1 {
   padding-left: 64px;
   color: var(--ks-muted);
   font-size: 12px;
+}
+
+.graph-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  color: var(--ks-accent-strong);
+  font-size: 12px;
+  font-weight: 620;
+  background: var(--ks-accent-soft);
+  border-radius: var(--ks-radius-sm);
+  transition: background-color var(--ks-duration-fast) var(--ks-ease-out);
+}
+
+.graph-link:hover {
+  background: #d8e8e2;
+}
+
+.graph-link-icon {
+  font-size: 13px;
+  line-height: 1;
 }
 
 .documents-surface {

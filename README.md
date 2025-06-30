@@ -194,6 +194,7 @@ KnowledgeScope/
 | 结构感知分块 | [CanonicalDocument → Chunk](docs/architecture/canonical-document-chunking.md) |
 | RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
 | 知识图谱检索 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
+| 知识图谱可视化 | [Knowledge Graph View](docs/architecture/knowledge-graph-view.md) |
 | 统一候选池 | [Unified Retrieval](docs/architecture/unified-retrieval.md) |
 | 多模态 Evidence | [Multimodal Evidence](docs/architecture/multimodal-evidence.md) |
 | ChatBI schema discovery | [Schema Discovery](docs/architecture/chatbi-schema-discovery.md) |
