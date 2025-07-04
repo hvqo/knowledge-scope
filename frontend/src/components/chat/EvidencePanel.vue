@@ -6,6 +6,10 @@ defineProps<{
   citations: RAGCitation[];
   selectedMarker: string | null;
   documentTitles: Record<string, string>;
+  /** Set when a follow-up question was rewritten before retrieval. */
+  rewrittenQuery?: string | null;
+  /** True when the fast lookup was upgraded to full retrieval. */
+  escalated?: boolean;
 }>();
 
 const emit = defineEmits<{ selectCitation: [marker: string] }>();
@@ -25,6 +29,19 @@ const emit = defineEmits<{ selectCitation: [marker: string] }>();
         {{ citations.length }}
       </span>
     </div>
+
+    <p
+      v-if="rewrittenQuery"
+      class="evidence-rewrite"
+    >
+      追问已按「{{ rewrittenQuery }}」检索
+    </p>
+    <p
+      v-if="escalated"
+      class="evidence-rewrite"
+    >
+      快速检索得到的证据较弱，已自动扩展为多路检索
+    </p>
 
     <div
       v-if="citations.length === 0"
@@ -86,6 +103,16 @@ h2 {
   color: var(--ks-ink);
   font-size: 20px;
   letter-spacing: -0.04em;
+}
+
+.evidence-rewrite {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  color: var(--ks-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  background: var(--ks-surface-subtle);
+  border-radius: var(--ks-radius-sm);
 }
 
 .evidence-count {

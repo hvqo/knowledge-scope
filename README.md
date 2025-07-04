@@ -193,6 +193,7 @@ KnowledgeScope/
 | 规范化文档模型 | [CanonicalDocument](docs/architecture/canonical-document-model.md) |
 | 结构感知分块 | [CanonicalDocument → Chunk](docs/architecture/canonical-document-chunking.md) |
 | RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
+| 对话工作区（持久化） | [Chat Workspace](docs/architecture/chat-workspace.md) |
 | 知识图谱检索 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
 | 知识图谱可视化 | [Knowledge Graph View](docs/architecture/knowledge-graph-view.md) |
 | 统一候选池 | [Unified Retrieval](docs/architecture/unified-retrieval.md) |
@@ -218,3 +219,17 @@ KnowledgeScope/
 
 详细实现背景、协议限制和历史记录分别保存在 `docs/architecture/`、`docs/benchmarks/`
 和 [Project History](docs/development/project-history.md) 中。
+
+## 检索缓存（可选）
+
+检索上下文默认缓存在进程内（命中 TTL 300 秒、未命中 60 秒、最多 256 条），重复提问可以直接复用命中的上下文：检索耗时从秒级降到毫秒级。
+回答本身不缓存。多 worker 或容器部署时可以换成共享的 Redis：
+
+```bash
+docker compose up -d redis
+uv sync --group cache
+export KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=redis
+export KNOWLEDGE_SCOPE_RAG_CACHE_URL=redis://127.0.0.1:6379/0
+```
+
+Redis 不可用或未安装客户端时，服务会自动退回进程内缓存并继续工作；`KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=off` 可以完全关闭。

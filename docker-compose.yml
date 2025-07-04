@@ -1,0 +1,34 @@
+# Optional shared retrieval cache.
+#
+# The application runs without this file: the default cache backend is
+# process-local memory.  Start Redis when several workers (or several
+# containers) should share cached retrieval context:
+#
+#   docker compose up -d redis
+#   export KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=redis
+#   export KNOWLEDGE_SCOPE_RAG_CACHE_URL=redis://127.0.0.1:6379/0
+#   uv sync --group cache
+#
+# Only retrieval context is cached; generated answers are never stored.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: knowledgescope-cache
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped

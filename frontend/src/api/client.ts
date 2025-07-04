@@ -6,10 +6,19 @@ import type {
   KnowledgeBaseUpdateRequest,
   MetaResponse,
   Document,
+  ChatConversation,
+  ChatConversationDetail,
+  ChatConversationListResponse,
+  ChatMemory,
+  ChatProject,
+  ChatMessageRecord,
+  ChatMessageRole,
+  ChatMessageStatus,
   DocumentChunkListResponse,
   DocumentListResponse,
   GraphEntityDetail,
   GraphOverview,
+  RAGRequestedRetrievalMode,
   ChatBIAnalysisResult,
   ChatBIDataSourceListResponse,
   ChatBIResultScalar,
@@ -276,6 +285,159 @@ export function fetchGraphEntityDetail(
   return request<GraphEntityDetail>(`${base}?${searchParams.toString()}`);
 }
 
+export interface ChatConversationListParams {
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchChatConversations({
+  limit = 50,
+  offset = 0,
+}: ChatConversationListParams = {}): Promise<ChatConversationListResponse> {
+  const searchParams = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  return request<ChatConversationListResponse>(
+    `/v1/chat/conversations?${searchParams.toString()}`,
+  );
+}
+
+export interface ChatConversationCreatePayload {
+  title?: string;
+  knowledge_base_id?: string | null;
+}
+
+export function createChatConversation(
+  payload: ChatConversationCreatePayload = {},
+): Promise<ChatConversation> {
+  return request<ChatConversation>("/v1/chat/conversations", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchChatConversation(conversationId: string): Promise<ChatConversationDetail> {
+  return request<ChatConversationDetail>(
+    `/v1/chat/conversations/${encodeURIComponent(conversationId)}`,
+  );
+}
+
+export interface ChatConversationUpdatePayload {
+  title?: string;
+  knowledge_base_id?: string | null;
+  project_id?: string | null;
+}
+
+export function updateChatConversation(
+  conversationId: string,
+  payload: ChatConversationUpdatePayload,
+): Promise<ChatConversation> {
+  return request<ChatConversation>(
+    `/v1/chat/conversations/${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function fetchChatProjects(): Promise<ChatProject[]> {
+  const response = await request<{ items: ChatProject[]; total: number }>(
+    "/v1/chat/projects?limit=100&offset=0",
+  );
+  return response.items;
+}
+
+export function createChatProject(payload: {
+  title: string;
+  description?: string | null;
+}): Promise<ChatProject> {
+  return request<ChatProject>("/v1/chat/projects", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateChatProject(
+  projectId: string,
+  payload: { title?: string; description?: string | null },
+): Promise<ChatProject> {
+  return request<ChatProject>(`/v1/chat/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteChatProject(projectId: string): Promise<void> {
+  return requestNoContent(`/v1/chat/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function fetchChatMemories(knowledgeBaseId: string): Promise<ChatMemory[]> {
+  const searchParams = new URLSearchParams({
+    knowledge_base_id: knowledgeBaseId,
+    limit: "50",
+    offset: "0",
+  });
+  const response = await request<{ items: ChatMemory[]; total: number }>(
+    `/v1/chat/memories?${searchParams.toString()}`,
+  );
+  return response.items;
+}
+
+export function createChatMemory(payload: {
+  knowledge_base_id: string;
+  content: string;
+}): Promise<ChatMemory> {
+  return request<ChatMemory>("/v1/chat/memories", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteChatMemory(memoryId: string): Promise<void> {
+  return requestNoContent(`/v1/chat/memories/${encodeURIComponent(memoryId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function extractChatMemories(conversationId: string): Promise<ChatMemory[]> {
+  const searchParams = new URLSearchParams({ conversation_id: conversationId });
+  const response = await request<ChatMemory[]>(
+    `/v1/chat/memories/extract?${searchParams.toString()}`,
+    { method: "POST" },
+  );
+  return response;
+}
+
+export function deleteChatConversation(conversationId: string): Promise<void> {
+  return requestNoContent(`/v1/chat/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+}
+
+export interface ChatMessageAppendPayload {
+  role: ChatMessageRole;
+  content: string;
+  status?: ChatMessageStatus;
+  citations?: RAGCitation[];
+}
+
+export function appendChatMessage(
+  conversationId: string,
+  payload: ChatMessageAppendPayload,
+): Promise<ChatMessageRecord> {
+  return request<ChatMessageRecord>(
+    `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
 export interface DocumentListParams {
   limit?: number;
   offset?: number;
@@ -369,10 +531,16 @@ export function fetchChatBIDataSources({
   );
 }
 
+export interface RAGHistoryTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface RAGQueryRequest {
   query: string;
   knowledge_base_id: string;
-  retrieval_mode?: "dense" | "unified";
+  retrieval_mode?: RAGRequestedRetrievalMode;
+  history?: RAGHistoryTurn[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -879,6 +1047,10 @@ function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent
       provider: nullableString(parsed.provider, "provider"),
       model: nullableString(parsed.model, "model"),
       retrieval_mode: retrievalMode,
+      rewritten_query: nullableString(parsed.rewritten_query, "rewritten_query"),
+      retrieval_cached: nullableBoolean(parsed.retrieval_cached, "retrieval_cached"),
+      retrieval_escalated: nullableBoolean(parsed.retrieval_escalated, "retrieval_escalated"),
+      rewrite_latency_ms: nullableFiniteNumber(parsed.rewrite_latency_ms, "rewrite_latency_ms"),
       retrieval_degraded: nullableBoolean(parsed.retrieval_degraded, "retrieval_degraded"),
       retrieval_branch_statuses: isRecord(parsed.retrieval_branch_statuses)
         ? Object.fromEntries(
@@ -919,7 +1091,7 @@ export async function* streamRagQuery(
   const response = await fetch(`${API_BASE_URL}/v1/rag/query`, {
     method: "POST",
     headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, retrieval_mode: payload.retrieval_mode ?? "unified" }),
+    body: JSON.stringify({ ...payload, retrieval_mode: payload.retrieval_mode ?? "auto" }),
     signal,
   });
   if (!response.ok) {

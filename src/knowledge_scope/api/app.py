@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from knowledge_scope import __version__
+from knowledge_scope.chat.api import router as chat_router
+from knowledge_scope.chat.workspace_api import router as chat_workspace_router
 from knowledge_scope.chatbi.agent import ChatBIAgentLimits, ChatBIAgentService
 from knowledge_scope.chatbi.api import router as chatbi_router
 from knowledge_scope.chatbi.credentials import EnvironmentCredentialResolver
@@ -29,6 +31,8 @@ from knowledge_scope.graph.retrieval_service import GraphRetrievalService
 from knowledge_scope.llm.gateway import LLMGateway
 from knowledge_scope.llm.providers import create_llm_provider
 from knowledge_scope.llm.usage import DatabaseUsageRecorder
+from knowledge_scope.rag.cache import create_retrieval_cache
+from knowledge_scope.rag.rewrite import QueryRewriteService
 from knowledge_scope.rag.service import RAGService
 from knowledge_scope.reports.api import router as reports_router
 from knowledge_scope.retrieval.embedding import QwenEmbeddingModel
@@ -142,6 +146,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 gateway,
                 settings,
                 unified_retrieval=unified_retrieval,
+                cache=create_retrieval_cache(settings),
+                rewrite=QueryRewriteService(gateway, settings),
             )
         if application.state.chatbi_agent_service is None:
             settings = application.state.settings
@@ -295,6 +301,8 @@ def create_app(
     application.include_router(documents_router, prefix=API_PREFIX)
     application.include_router(graph_router, prefix=API_PREFIX)
     application.include_router(retrieval_router, prefix=API_PREFIX)
+    application.include_router(chat_router, prefix=API_PREFIX)
+    application.include_router(chat_workspace_router, prefix=API_PREFIX)
     application.include_router(rag_router, prefix=API_PREFIX)
     application.include_router(chatbi_router, prefix=API_PREFIX)
     application.include_router(reports_router, prefix=API_PREFIX)
