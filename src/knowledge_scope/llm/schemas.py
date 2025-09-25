@@ -7,10 +7,12 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
 
 LLMMessageRole = Literal["system", "user"]
-LLMReasoningMode = Literal["enabled", "disabled"]
+# Provider-neutral reasoning controls.  Adapters translate these semantic
+# values to the provider-specific request shape at their HTTP boundary.
+LLMReasoningMode = Literal["enabled", "disabled", "low", "high"]
 LLMTaskType = Literal[
     "rag_answer",
     "graph_extraction",
@@ -33,6 +35,18 @@ LLMResponseParseOutcome = Literal[
     "malformed_provider_response",
 ]
 LLMTokenLimitStatus = Literal["confirmed", "suspected", "not_reached", "unknown"]
+StructuredOutputBoundaryStage = Literal[
+    "provider_content_missing",
+    "json_decode_failed",
+    "top_level_shape_invalid",
+    "top_level_schema_invalid",
+    "required_top_level_field_missing",
+    "result_contract_schema_invalid",
+    "sql_field_invalid",
+    "result_contract_semantic_validation_failed",
+    "sql_contract_consistency_failed",
+]
+StructuredOutputBoundaryStatus = Literal["passed", "failed", "not_attempted"]
 
 LLM_TASK_TYPES: tuple[LLMTaskType, ...] = (
     "rag_answer",
@@ -92,6 +106,44 @@ class LLMRequest(_StrictModel):
         return _non_empty(value) if value is not None else None
 
 
+class StructuredOutputBoundaryDiagnostic(_StrictModel):
+    """Safe structural metadata for one rejected structured response.
+
+    This model deliberately contains no response text, SQL, model input values,
+    or provider-specific error messages.  It is attached only after the
+    provider result has crossed the normalized gateway boundary.
+    """
+
+    logical_stage: Literal["generation", "repair_generation"]
+    stage: StructuredOutputBoundaryStage
+    field_paths: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=16)
+    error_codes: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=16)
+    top_level_keys: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=32)
+    result_contract_keys: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=32)
+    sql_key_present: StrictBool = False
+    sql_is_string: StrictBool = False
+    sql_length: StrictInt | None = Field(default=None, ge=0, le=100_000)
+
+
+class StructuredOutputBoundaryObservation(_StrictModel):
+    """Safe stage-by-stage observation for a completed NL2SQL provider call."""
+
+    logical_stage: Literal["generation", "repair_generation"]
+    json_decode_status: StructuredOutputBoundaryStatus
+    top_level_shape_status: StructuredOutputBoundaryStatus
+    top_level_keys: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=32)
+    result_contract_keys: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=32)
+    result_contract_schema_status: StructuredOutputBoundaryStatus
+    sql_key_present: StrictBool = False
+    sql_is_string: StrictBool = False
+    sql_length: StrictInt | None = Field(default=None, ge=0, le=100_000)
+    sql_field_status: StructuredOutputBoundaryStatus
+    semantic_contract_validation_status: StructuredOutputBoundaryStatus
+    sql_contract_consistency_status: StructuredOutputBoundaryStatus
+    a5_3_validation_status: StructuredOutputBoundaryStatus
+    diagnostic: StructuredOutputBoundaryDiagnostic | None = None
+
+
 class LLMResult(_StrictModel):
     """Provider-independent result for a completed call."""
 
@@ -104,6 +156,7 @@ class LLMResult(_StrictModel):
     finish_reason: str | None = None
     provider_attempts: int = Field(default=1, ge=1)
     provider_invocation_id: UUID | None = Field(default=None, exclude=True)
+    structured_output_observation: StructuredOutputBoundaryObservation | None = None
 
 
 class LLMStreamEvent(_StrictModel):

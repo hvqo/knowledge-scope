@@ -10,7 +10,7 @@ PostgreSQL schema discovery、NL2SQL 校验和只读执行服务，不建立第�
 question
   -> registered datasource lookup
   -> trusted schema discovery
-  -> NL2SQL LLM call
+  -> NL2SQL LLM call（a5.3-v3：SQL-only）
   -> SQLCandidate（不可信）
   -> fresh datasource-bound AST / policy validation
   -> read-only PostgreSQL execution
@@ -24,6 +24,11 @@ question
 对象或 caller-owned `SchemaSnapshot` 跳过这条路径。A5.4 的执行服务是唯一的实际 SQL 执行
 入口。
 
+生产 ChatBI 默认不要求模型生成 `ResultContract`。`a5.3-v4` 的
+ResultContract + SQL 结构、解析器、语义诊断和一致性工具仍保留为显式的评测/诊断能力；
+只有调用方明确启用诊断配置时才使用它们。正常 NL2SQL 初次生成和有界修复都使用
+`a5.3-v3` 的 SQL-only 响应，因此契约诊断失败不会阻断正常 SQL 生成。
+
 ## 有界循环
 
 Agent 不是无界 ReAct 循环。默认设置如下，均可通过 `Settings` 调整且有上限：
@@ -34,6 +39,12 @@ Agent 不是无界 ReAct 循环。默认设置如下，均可通过 `Settings` �
 - `chatbi_agent_max_llm_calls=3`：SQL 生成和结果分析的网关调用总数；
 - `chatbi_nl2sql_max_tokens=1024`：初次生成和有界修复共用的输出预算；
 - `chatbi_analysis_max_tokens=1024`：结果分析的输出预算。
+
+当前保留配置中，NL2SQL 初次生成和有界修复显式使用 provider-independent 的
+`reasoning="disabled"`，DeepSeek 适配器在请求边界映射为
+`thinking: {"type":"disabled"}`。结果分析仍显式关闭 reasoning，预算保持独立，不受
+NL2SQL 实验配置影响。Settings 仍允许通过环境变量有意覆盖预算；provider 评测 provenance
+记录实际解析后的配置。
 
 只有 malformed model output、SQL parse error、unknown table 和 unknown column 会触发一次
 有界修复。修复提示中的上一候选和受控错误信息以 JSON 数据传入。安全策略拒绝、执行错误、
