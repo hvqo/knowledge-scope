@@ -8,7 +8,9 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
+import knowledge_scope.evaluation.chatbi_evaluation_v2_provider as provider_module
 from knowledge_scope.chatbi import (
     ChatBIAgentService,
     ChatBIResult,
@@ -94,6 +96,12 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     select_v2_provider_cases,
     select_v2_provider_contract_diagnostic_cases,
     select_v2_provider_diagnostic_cases,
+)
+from knowledge_scope.evaluation.semantic_evidence import (
+    SEMANTIC_EVIDENCE_VERSION,
+    SemanticEvidenceRecord,
+    build_unavailable_semantic_evidence,
+    evidence_digest_for,
 )
 from knowledge_scope.llm import LLMProviderInvocation, LLMRequest, LLMResult
 from knowledge_scope.llm.usage import (
@@ -338,7 +346,15 @@ def test_contract_only_prompt_is_schema_data_and_contains_no_sql_generation_cont
 
 @pytest.mark.parametrize(
     "artifact_name",
-    ("chatbi-eval-v2-dev-run-6.json", "chatbi-eval-v2-dev-run-11.json"),
+    (
+        "chatbi-eval-v2-dev.json",
+        "chatbi-eval-v2-dev-run-6.json",
+        "chatbi-eval-v2-dev-run-7.json",
+        "chatbi-eval-v2-dev-run-8.json",
+        "chatbi-eval-v2-dev-run-9.json",
+        "chatbi-eval-v2-dev-run-10.json",
+        "chatbi-eval-v2-dev-run-11.json",
+    ),
 )
 def test_historical_provider_artifacts_without_contract_diagnostics_remain_readable(
     artifact_name: str,
@@ -351,6 +367,63 @@ def test_historical_provider_artifacts_without_contract_diagnostics_remain_reada
 
     assert len(run.records) == 50
     assert all(record.result_contract_diagnostics == [] for record in run.records)
+
+
+def test_full_v2_semantic_evidence_artifact_round_trips_through_real_reader() -> None:
+    artifact = DEFAULT_PROVIDER_OUTPUT_V2
+    if not artifact.is_file():
+        pytest.skip("historical provider artifact is not present in the local runtime")
+
+    legacy = V2ProviderRun.model_validate_json(artifact.read_text(encoding="utf-8"))
+    payload = legacy.model_dump(mode="json")
+    payload["artifact_schema_version"] = "a5.7g2-provider-run-v2"
+    payload["provenance"]["semantic_evidence_version"] = SEMANTIC_EVIDENCE_VERSION
+    datasource_id = legacy.datasource_id
+    for record in payload["records"]:
+        evidence = build_unavailable_semantic_evidence(
+            case_id=record["case_id"],
+            split=record["split"],
+            datasource_id=datasource_id,
+            dataset_fingerprint=legacy.dataset_fingerprint,
+            fixture_fingerprint=legacy.fixture_fingerprint,
+            schema_fingerprint=legacy.fixture_schema_fingerprint,
+            prompt_version="a5.3-v3",
+            reasoning_mode="disabled",
+            reason="roundtrip_test",
+        )
+        assert evidence_digest_for(evidence) == evidence.evidence_digest
+        record["semantic_evidence"] = evidence.model_dump(mode="json")
+
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    run = V2ProviderRun.model_validate_json(serialized)
+    reloaded = V2ProviderRun.model_validate_json(run.model_dump_json())
+
+    assert reloaded.artifact_schema_version == "a5.7g2-provider-run-v2"
+    assert reloaded.provenance.semantic_evidence_version == SEMANTIC_EVIDENCE_VERSION
+    assert all(record.semantic_evidence is not None for record in reloaded.records)
+    assert all(
+        evidence_digest_for(record.semantic_evidence) == record.semantic_evidence.evidence_digest
+        for record in reloaded.records
+        if record.semantic_evidence is not None
+    )
+
+
+def test_serialized_v2_semantic_evidence_rejects_unknown_fields() -> None:
+    evidence = build_unavailable_semantic_evidence(
+        case_id="unknown-field",
+        split="dev",
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        prompt_version="a5.3-v3",
+        reasoning_mode="disabled",
+    )
+    payload = evidence.model_dump(mode="json")
+    payload["unknown_field"] = "must reject"
+
+    with pytest.raises(ValidationError):
+        SemanticEvidenceRecord.model_validate(payload)
 
 
 def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
@@ -705,6 +778,54 @@ async def test_v2_runner_updates_durable_and_local_invocation_metadata() -> None
     )
     assert durable_recorder.records[0].response_parse_outcome == ("structured_output_parse_error")
     assert durable_recorder.records[0].error_category == "structured_output_parse_error"
+
+
+@pytest.mark.anyio
+async def test_v2_evidence_capture_failure_does_not_replace_authoritative_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_recorder = InMemoryProviderInvocationRecorder()
+    case = select_v2_provider_cases(
+        load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2), V2ProviderSplit.DEV.value
+    )[0]
+    expected = ChatBIResult(
+        query_id=uuid4(),
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        execution_status=QueryLifecycleState.SUCCEEDED,
+        row_count=1,
+        sql_attempts=1,
+        repair_attempts=0,
+        usage=ChatBIUsageSummary(llm_calls=1, provider_attempts=1),
+    )
+
+    class _Agent:
+        async def ask(self, *_args: object, **_kwargs: object) -> ChatBIResult:
+            return expected
+
+    def _fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("collector-only failure")
+
+    monkeypatch.setattr(provider_module, "capture_semantic_evidence", _fail)
+    runner = _V2AgentRunner(
+        _Agent(),
+        _TimingState(),
+        CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        QueryPolicy(),
+        10_000,
+        local_recorder,
+        local_recorder,
+        evidence_dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        evidence_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        evidence_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        evidence_synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+    )
+
+    observation = await runner.run(case)
+
+    assert observation.result.model_dump(mode="json") == expected.model_dump(mode="json")
+    assert observation.semantic_evidence is not None
+    assert observation.semantic_evidence.evidence_status.value == "unavailable"
+    assert "evidence_capture_failed" in observation.semantic_evidence.unavailable_reasons
 
 
 @pytest.mark.anyio
