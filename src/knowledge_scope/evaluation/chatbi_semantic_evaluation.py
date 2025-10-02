@@ -24,6 +24,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 from sqlglot import exp, parse_one
@@ -42,12 +43,20 @@ from knowledge_scope.evaluation.chatbi_schema_fingerprint import (
 )
 
 SEMANTIC_POLICY_VERSION = "a5.7f2-semantic-policy-v1"
+SEMANTIC_POLICY_G3_VERSION = "a5.7g3-semantic-policy-v1"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SEMANTIC_POLICY_PATH = _REPOSITORY_ROOT / "docs/benchmarks/a5-7-semantic-policy-v1.json"
+DEFAULT_G3_SEMANTIC_POLICY_PATH = (
+    _REPOSITORY_ROOT / "docs/benchmarks/a5-7g3-semantic-policy-v1.json"
+)
 
 
 class SemanticEvaluationError(ValueError):
     """Raised when evaluation-only semantic policy input is invalid."""
+
+
+class SemanticPolicyDuplicateKeyError(SemanticEvaluationError):
+    """Raised when a JSON policy artifact contains an ambiguous object key."""
 
 
 class SemanticRowGrain(StrEnum):
@@ -55,6 +64,104 @@ class SemanticRowGrain(StrEnum):
     DETAIL = "detail"
     ENTITY = "entity"
     GROUPED = "grouped"
+    PAIR = "pair"
+
+
+class SemanticField(StrEnum):
+    """Closed vocabulary for the reviewed DEV semantic policy."""
+
+    CUSTOMER_ID = "customer_id"
+    CUSTOMER_NAME = "customer_name"
+    SALE_ID = "sale_id"
+    REGION_NAME = "region_name"
+    REGION_CODE = "region_code"
+    MARKET = "market"
+    AMOUNT = "amount"
+    SOLD_ON = "sold_on"
+    COUNT_SALE_ID = "aggregate:count:sale_id"
+    COUNT_CUSTOMER_ID = "aggregate:count:customer_id"
+    COUNT_DISTINCT_CUSTOMER_ID = "aggregate:count:distinct:customer_id"
+    SUM_AMOUNT = "aggregate:sum:amount"
+    AVG_AMOUNT = "aggregate:avg:amount"
+    MAX_AMOUNT = "aggregate:max:amount"
+    MIN_AMOUNT = "aggregate:min:amount"
+    MIN_SOLD_ON = "aggregate:min:sold_on"
+    MAX_SOLD_ON = "aggregate:max:sold_on"
+    AMOUNT_MINUS_OVERALL_AVERAGE = "derived:amount_minus_overall_average"
+    REGION_SALES_SHARE = "derived:region_sales_share"
+
+
+SEMANTIC_FIELD_VOCABULARY = frozenset(field.value for field in SemanticField)
+_SEMANTIC_IDENTITY_VOCABULARY = frozenset(
+    {
+        SemanticField.CUSTOMER_ID.value,
+        SemanticField.SALE_ID.value,
+        SemanticField.REGION_CODE.value,
+        SemanticField.REGION_NAME.value,
+    }
+)
+
+
+class SemanticPolicyAuthoringConfidence(StrEnum):
+    """Audit metadata; it never changes executable semantic policy."""
+
+    EXPLICIT = "explicit"
+    SCHEMA_REQUIRED = "schema_required"
+    PRODUCT_RULE_DERIVED = "product_rule_derived"
+    AMBIGUOUS = "ambiguous"
+
+
+G3_DEV_POSITIVE_CASE_IDS = frozenset(
+    {
+        "simple-01",
+        "simple-02",
+        "simple-03",
+        "simple-04",
+        "aggregation-01",
+        "aggregation-02",
+        "aggregation-03",
+        "aggregation-04",
+        "aggregation-05",
+        "aggregation-06",
+        "group-by-01",
+        "group-by-02",
+        "group-by-03",
+        "group-by-04",
+        "group-by-05",
+        "top-k-01",
+        "top-k-02",
+        "top-k-03",
+        "top-k-04",
+        "predicate-01",
+        "predicate-02",
+        "predicate-03",
+        "predicate-04",
+        "join-01",
+        "join-02",
+        "join-03",
+        "join-04",
+        "join-05",
+        "join-06",
+        "multi-join-01",
+        "multi-join-02",
+        "multi-join-03",
+        "multi-join-04",
+        "date-01",
+        "date-02",
+        "date-03",
+        "null-01",
+        "null-02",
+        "null-03",
+        "empty-01",
+        "empty-02",
+        "derived-01",
+        "derived-02",
+        "derived-03",
+        "cte-set-01",
+        "cte-set-02",
+        "cte-set-03",
+    }
+)
 
 
 class OutputShapeStatus(StrEnum):
@@ -233,6 +340,79 @@ class SemanticCasePolicy(_EvaluationModel):
         return frozenset(_normalize_field_identity(field) for field in self.identity_fields)
 
 
+_RATIONALE_UNSAFE = re.compile(
+    r"(?:```|;|--|/\*|\b(?:select|from|where|join|group\s+by|order\s+by|union|with)\b|"
+    r"\b(?:candidate|expected_sql|redacted_sql|provider|model|proof|unassessable|"
+    r"execution\s+accuracy|run\s*#)\b)",
+    re.IGNORECASE,
+)
+
+
+class SemanticCasePolicyV3(_EvaluationModel):
+    """Explicit DEV policy with a closed semantic-field vocabulary.
+
+    ``authoring_confidence`` and ``human_rationale`` are review metadata only.
+    ``to_executable_policy`` intentionally drops them before the evaluator sees
+    the semantic contract.
+    """
+
+    row_grain: SemanticRowGrain
+    required_fields: tuple[SemanticField, ...] = Field(default=(), max_length=64)
+    optional_fields: tuple[SemanticField, ...] = Field(default=(), max_length=64)
+    identity_fields: tuple[SemanticField, ...] = Field(default=(), max_length=32)
+    semantic_order_required: StrictBool = False
+    allow_safe_extra_fields: StrictBool = False
+    authoring_confidence: SemanticPolicyAuthoringConfidence
+    human_rationale: StrictStr = Field(min_length=1, max_length=512)
+
+    @field_validator("human_rationale")
+    @classmethod
+    def validate_human_rationale(cls, value: str) -> str:
+        if _RATIONALE_UNSAFE.search(value):
+            raise ValueError("human rationale contains execution or provider output text")
+        return value
+
+    @model_validator(mode="after")
+    def validate_field_sets(self) -> SemanticCasePolicyV3:
+        required = tuple(field.value for field in self.required_fields)
+        optional = tuple(field.value for field in self.optional_fields)
+        identity = tuple(field.value for field in self.identity_fields)
+        if len(set(required)) != len(required):
+            raise ValueError("semantic policy required fields contain duplicates")
+        if len(set(optional)) != len(optional):
+            raise ValueError("semantic policy optional fields contain duplicates")
+        if len(set(identity)) != len(identity):
+            raise ValueError("semantic policy identity fields contain duplicates")
+        if set(required) & set(optional):
+            raise ValueError("semantic policy required and optional fields overlap")
+        if set(identity) - _SEMANTIC_IDENTITY_VOCABULARY:
+            raise ValueError("semantic policy identity fields are not stable identifiers")
+        if self.row_grain is SemanticRowGrain.SCALAR and identity:
+            raise ValueError("scalar semantic policy cannot declare row identity fields")
+        return self
+
+    def normalized_required_fields(self) -> frozenset[str]:
+        return frozenset(field.value for field in self.required_fields)
+
+    def normalized_optional_fields(self) -> frozenset[str]:
+        return frozenset(field.value for field in self.optional_fields)
+
+    def normalized_identity_fields(self) -> frozenset[str]:
+        return frozenset(field.value for field in self.identity_fields)
+
+    def to_executable_policy(self) -> SemanticCasePolicy:
+        """Drop authoring metadata before semantic evaluation."""
+
+        return SemanticCasePolicy(
+            row_grain=self.row_grain,
+            required_fields=tuple(field.value for field in self.required_fields),
+            optional_fields=tuple(field.value for field in self.optional_fields),
+            identity_fields=tuple(field.value for field in self.identity_fields),
+            semantic_order_required=self.semantic_order_required,
+            allow_safe_extra_fields=self.allow_safe_extra_fields,
+        )
+
+
 class SemanticPolicyArtifact(_EvaluationModel):
     """Versioned, repository-safe sidecar for semantic review metadata."""
 
@@ -272,6 +452,59 @@ class SemanticPolicyArtifact(_EvaluationModel):
     def schema(self) -> SemanticSchemaMetadata:
         """Return the aliased trusted schema contract without shadow warnings."""
 
+        return self.schema_metadata
+
+
+class SemanticPolicyArtifactV3(_EvaluationModel):
+    """Frozen A5.7g3 DEV-only policy artifact.
+
+    The exact case-set check is deliberately independent of candidate SQL,
+    provider artifacts, or result rows.  TEST cases cannot enter this artifact.
+    """
+
+    schema_version: Literal["a5.7g3-semantic-policy-v1"] = SEMANTIC_POLICY_G3_VERSION
+    provenance: StrictStr = Field(min_length=1, max_length=500)
+    dataset_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_version: Literal["chatbi-demo-v2"] = "chatbi-demo-v2"
+    fixture_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    model_config = ConfigDict(
+        extra="forbid",
+        allow_inf_nan=False,
+        frozen=True,
+        populate_by_name=True,
+    )
+    schema_metadata: SemanticSchemaMetadata = Field(alias="schema")
+    defaults: SemanticCasePolicyV3
+    cases: dict[StrictStr, SemanticCasePolicyV3] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_schema_binding_and_fingerprint(self) -> SemanticPolicyArtifactV3:
+        if semantic_schema_metadata_fingerprint(self.schema_metadata) != (
+            self.schema_metadata.schema_metadata_fingerprint
+        ):
+            raise ValueError("semantic schema metadata fingerprint does not match metadata")
+        if self.schema_metadata.fixture_version != self.fixture_version:
+            raise ValueError("semantic policy fixture version does not match schema metadata")
+        if self.schema_metadata.fixture_fingerprint != self.fixture_fingerprint:
+            raise ValueError("semantic policy fixture fingerprint does not match schema metadata")
+        if self.schema_metadata.fixture_schema_fingerprint != self.fixture_schema_fingerprint:
+            raise ValueError(
+                "semantic policy fixture schema fingerprint does not match schema metadata"
+            )
+        if frozenset(self.cases) != G3_DEV_POSITIVE_CASE_IDS:
+            raise ValueError("A5.7g3 policy must contain exactly the 47 positive DEV cases")
+        if self.defaults.allow_safe_extra_fields:
+            raise ValueError("A5.7g3 default policy cannot allow safe extra fields")
+        if any(case.allow_safe_extra_fields for case in self.cases.values()):
+            raise ValueError("A5.7g3 DEV policies cannot allow safe extra fields")
+        if semantic_policy_v3_fingerprint(self) != self.policy_fingerprint:
+            raise ValueError("semantic policy fingerprint does not match artifact")
+        return self
+
+    @property
+    def schema(self) -> SemanticSchemaMetadata:
         return self.schema_metadata
 
 
@@ -336,7 +569,9 @@ class SemanticRunReport(_EvaluationModel):
     fixture_version: Literal["chatbi-demo-v2"] = "chatbi-demo-v2"
     fixture_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
-    policy_version: Literal["a5.7f2-semantic-policy-v1"] = SEMANTIC_POLICY_VERSION
+    policy_version: Literal["a5.7f2-semantic-policy-v1", "a5.7g3-semantic-policy-v1"] = (
+        SEMANTIC_POLICY_VERSION
+    )
     positive_case_count: StrictInt = Field(ge=0)
     aggregate: SemanticRunAggregate
     cases: dict[StrictStr, SemanticComparison]
@@ -350,6 +585,30 @@ def _normalize_field_identity(value: str) -> str:
 
 def _normalize_relation_identity(value: str) -> str:
     return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def semantic_field_is_supported(value: str) -> bool:
+    """Return whether ``value`` is one of the reviewed semantic identifiers."""
+
+    return value in SEMANTIC_FIELD_VOCABULARY
+
+
+def semantic_policy_v3_fingerprint(policy: SemanticPolicyArtifactV3) -> str:
+    """Hash the complete immutable A5.7g3 contract deterministically."""
+
+    payload = policy.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"policy_fingerprint"},
+    )
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _semantic_schema_fingerprint_payload(schema: SemanticSchemaMetadata) -> dict[str, object]:
@@ -464,6 +723,23 @@ def _ensure_policy_integrity(policy: SemanticPolicyArtifact) -> None:
         raise SemanticEvaluationError("semantic policy fixture fingerprint mismatch")
     if policy.schema.fixture_schema_fingerprint != policy.fixture_schema_fingerprint:
         raise SemanticEvaluationError("semantic policy fixture schema fingerprint mismatch")
+
+
+def _ensure_versioned_policy_integrity(
+    policy: SemanticPolicyArtifact | SemanticPolicyArtifactV3,
+) -> None:
+    if isinstance(policy, SemanticPolicyArtifactV3):
+        if semantic_policy_v3_fingerprint(policy) != policy.policy_fingerprint:
+            raise SemanticEvaluationError("semantic policy fingerprint does not match artifact")
+        _ensure_schema_metadata_integrity(policy.schema)
+        if policy.schema.fixture_version != policy.fixture_version:
+            raise SemanticEvaluationError("semantic policy fixture version mismatch")
+        if policy.schema.fixture_fingerprint != policy.fixture_fingerprint:
+            raise SemanticEvaluationError("semantic policy fixture fingerprint mismatch")
+        if policy.schema.fixture_schema_fingerprint != policy.fixture_schema_fingerprint:
+            raise SemanticEvaluationError("semantic policy fixture schema fingerprint mismatch")
+        return
+    _ensure_policy_integrity(policy)
 
 
 def _schema_relation(
@@ -1821,6 +2097,12 @@ def _actual_shape_matches_policy(
     if policy.row_grain is SemanticRowGrain.ENTITY:
         # Entity results may be implemented as an explicit GROUP BY.
         return actual_shape in {SemanticRowGrain.ENTITY, SemanticRowGrain.GROUPED}
+    if policy.row_grain is SemanticRowGrain.PAIR:
+        # Pair is an authoring contract for one relationship between two
+        # identities.  SQL lineage may expose that relationship as detail rows
+        # or as a grouped customer/region result; no new equivalence theorem
+        # is implied by accepting either structural shape.
+        return actual_shape in {SemanticRowGrain.DETAIL, SemanticRowGrain.GROUPED}
     return actual_shape is policy.row_grain
 
 
@@ -1916,18 +2198,81 @@ def build_default_semantic_policy(
     )
 
 
-def load_semantic_policy(path: Path = DEFAULT_SEMANTIC_POLICY_PATH) -> SemanticPolicyArtifact:
+def _reject_duplicate_json_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Build JSON objects without allowing later keys to overwrite earlier keys."""
+
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SemanticPolicyDuplicateKeyError(
+                "duplicate JSON object key in semantic policy artifact"
+            )
+        result[key] = value
+    return result
+
+
+def _load_semantic_policy_payload(path: Path) -> dict[str, object]:
+    """Parse a policy artifact with duplicate-key rejection at every object level."""
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return SemanticPolicyArtifact.model_validate(payload)
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object_keys,
+        )
+    except SemanticPolicyDuplicateKeyError:
+        raise
     except (OSError, json.JSONDecodeError) as error:
         raise SemanticEvaluationError(f"invalid semantic policy artifact: {path}") from error
+    if not isinstance(payload, dict):
+        raise SemanticEvaluationError(f"invalid semantic policy artifact: {path}")
+    return payload
+
+
+def load_semantic_policy(path: Path = DEFAULT_SEMANTIC_POLICY_PATH) -> SemanticPolicyArtifact:
+    try:
+        payload = _load_semantic_policy_payload(path)
+        return SemanticPolicyArtifact.model_validate(payload)
     except ValidationError as error:
         if "semantic schema metadata fingerprint" in str(error):
             raise SemanticEvaluationError(
                 "semantic schema metadata fingerprint mismatch"
             ) from error
         raise SemanticEvaluationError(f"invalid semantic policy artifact: {path}") from error
+
+
+def load_semantic_policy_v3(
+    path: Path = DEFAULT_G3_SEMANTIC_POLICY_PATH,
+) -> SemanticPolicyArtifactV3:
+    """Load the explicit DEV-only A5.7g3 policy with strict JSON object parsing."""
+
+    try:
+        payload = _load_semantic_policy_payload(path)
+        return SemanticPolicyArtifactV3.model_validate(payload)
+    except ValidationError as error:
+        if "semantic schema metadata fingerprint" in str(error):
+            raise SemanticEvaluationError(
+                "semantic schema metadata fingerprint mismatch"
+            ) from error
+        raise SemanticEvaluationError(f"invalid semantic policy artifact: {path}") from error
+
+
+def load_versioned_semantic_policy(
+    path: Path,
+) -> SemanticPolicyArtifact | SemanticPolicyArtifactV3:
+    """Load either immutable policy generation without silently migrating it."""
+
+    payload = _load_semantic_policy_payload(path)
+    version = payload.get("schema_version") if isinstance(payload, dict) else None
+    try:
+        if version == SEMANTIC_POLICY_VERSION:
+            return SemanticPolicyArtifact.model_validate(payload)
+        if version == SEMANTIC_POLICY_G3_VERSION:
+            return SemanticPolicyArtifactV3.model_validate(payload)
+    except ValidationError as error:
+        raise SemanticEvaluationError(f"invalid semantic policy artifact: {path}") from error
+    raise SemanticEvaluationError(f"unsupported semantic policy version: {version!r}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -1944,13 +2289,17 @@ def _sha256_file(path: Path) -> str:
 
 
 def policy_for_case(
-    artifact: SemanticPolicyArtifact,
+    artifact: SemanticPolicyArtifact | SemanticPolicyArtifactV3,
     *,
     case_id: str,
     question: str,
     expected: ExpectedQueryResult,
     expected_sql: str | None,
 ) -> SemanticCasePolicy:
+    if isinstance(artifact, SemanticPolicyArtifactV3):
+        _ensure_versioned_policy_integrity(artifact)
+        explicit_v3 = artifact.cases.get(case_id)
+        return (explicit_v3 or artifact.defaults).to_executable_policy()
     _ensure_policy_integrity(artifact)
     explicit = artifact.cases.get(case_id)
     # The sidecar is the review contract.  Runtime-derived policies would
@@ -3296,8 +3645,8 @@ def evaluate_provider_artifact(
     )
 
     dataset = load_chatbi_evaluation_dataset_v2(dataset_path)
-    policy_artifact = load_semantic_policy(policy_path)
-    _ensure_policy_integrity(policy_artifact)
+    policy_artifact = load_versioned_semantic_policy(policy_path)
+    _ensure_versioned_policy_integrity(policy_artifact)
     if policy_artifact.dataset_fingerprint != dataset.fingerprint:
         raise SemanticEvaluationError("semantic policy is bound to another frozen dataset")
     fixture_path = _REPOSITORY_ROOT / "tests/fixtures/chatbi_demo_v2.sql"
@@ -3424,6 +3773,7 @@ def evaluate_provider_artifact(
         fixture_version=policy_artifact.fixture_version,
         fixture_fingerprint=policy_artifact.fixture_fingerprint,
         fixture_schema_fingerprint=policy_artifact.fixture_schema_fingerprint,
+        policy_version=policy_artifact.schema_version,
         positive_case_count=len(positives),
         aggregate=aggregate,
         cases=comparisons,
@@ -3431,16 +3781,24 @@ def evaluate_provider_artifact(
 
 
 __all__ = [
+    "DEFAULT_G3_SEMANTIC_POLICY_PATH",
     "DEFAULT_SEMANTIC_POLICY_PATH",
+    "G3_DEV_POSITIVE_CASE_IDS",
+    "SEMANTIC_POLICY_G3_VERSION",
     "SEMANTIC_POLICY_VERSION",
     "OutputShapeCompliance",
     "OutputShapeStatus",
     "SemanticCasePolicy",
+    "SemanticCasePolicyV3",
     "SemanticCheckConstraint",
     "SemanticComparison",
     "SemanticEvaluationError",
+    "SemanticField",
     "SemanticForeignKey",
     "SemanticPolicyArtifact",
+    "SemanticPolicyArtifactV3",
+    "SemanticPolicyAuthoringConfidence",
+    "SemanticPolicyDuplicateKeyError",
     "SemanticProof",
     "SemanticProofStatus",
     "SemanticRelationMetadata",
@@ -3453,7 +3811,11 @@ __all__ = [
     "compare_semantic_result",
     "evaluate_provider_artifact",
     "load_semantic_policy",
+    "load_semantic_policy_v3",
+    "load_versioned_semantic_policy",
     "policy_for_case",
     "projected_field_identities",
+    "semantic_field_is_supported",
+    "semantic_policy_v3_fingerprint",
     "semantic_schema_metadata_fingerprint",
 ]
