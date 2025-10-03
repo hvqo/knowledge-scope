@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -15,9 +16,11 @@ from knowledge_scope.chatbi import (
     ChatBIAgentService,
     ChatBIResult,
     ChatBIUsageSummary,
+    ColumnMetadata,
     EnvironmentCredentialResolver,
     NL2SQLService,
     PostgresExecutionAdapter,
+    QueryExecutionResult,
     QueryLifecycleState,
     QueryPolicy,
     SQLExecutionService,
@@ -25,7 +28,12 @@ from knowledge_scope.chatbi import (
 from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
 from knowledge_scope.chatbi.errors import ChatBIErrorCategory
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
-from knowledge_scope.chatbi.nl2sql import LLMUsageMetadata, NL2SQLGenerationError
+from knowledge_scope.chatbi.nl2sql import (
+    LLMUsageMetadata,
+    NL2SQLGenerationError,
+    _RegisteredValidation,
+)
+from knowledge_scope.chatbi.nl2sql_models import ValidatedSQL
 from knowledge_scope.chatbi.policy import SQLDialect
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.chatbi.result_contract import (
@@ -48,6 +56,7 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
     EvaluationRuntimeConfiguration,
     EvaluationStageState,
     RepairOutcome,
+    _TimedValidation,
     build_result_contract_diagnostic,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
@@ -61,6 +70,8 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     CHATBI_EVALUATION_V2_DATABASE_NAME,
     CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME,
     CHATBI_EVALUATION_V2_DATASOURCE_ID,
+    CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION,
+    CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3,
     CHATBI_EVALUATION_V2_SCHEMA,
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
@@ -69,10 +80,13 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     EXPECTED_FIXTURE_DATA_FINGERPRINT_V2,
     EXPECTED_FIXTURE_FINGERPRINT_V2,
     EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+    EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT,
+    EXPECTED_SEMANTIC_POLICY_G3_VERSION,
     V2ProviderBenchmarkError,
     V2ProviderCaseRecord,
     V2ProviderPreflightReport,
     V2ProviderRun,
+    V2ProviderRunProvenance,
     V2ProviderSplit,
     _authoritative_record_matches,
     _build_v2_aggregate,
@@ -93,6 +107,8 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     _V2AgentRunner,
     build_v2_contract_only_messages,
     evaluate_v2_provider_cases,
+    load_frozen_semantic_policy_provenance,
+    load_v2_provider_run,
     select_v2_provider_cases,
     select_v2_provider_contract_diagnostic_cases,
     select_v2_provider_diagnostic_cases,
@@ -101,6 +117,7 @@ from knowledge_scope.evaluation.semantic_evidence import (
     SEMANTIC_EVIDENCE_VERSION,
     SemanticEvidenceRecord,
     build_unavailable_semantic_evidence,
+    capture_semantic_evidence,
     evidence_digest_for,
 )
 from knowledge_scope.llm import LLMProviderInvocation, LLMRequest, LLMResult
@@ -354,6 +371,7 @@ def test_contract_only_prompt_is_schema_data_and_contains_no_sql_generation_cont
         "chatbi-eval-v2-dev-run-9.json",
         "chatbi-eval-v2-dev-run-10.json",
         "chatbi-eval-v2-dev-run-11.json",
+        "chatbi-eval-v2-dev-run-12.json",
     ),
 )
 def test_historical_provider_artifacts_without_contract_diagnostics_remain_readable(
@@ -363,7 +381,7 @@ def test_historical_provider_artifacts_without_contract_diagnostics_remain_reada
     if not artifact.is_file():
         pytest.skip("historical provider artifact is not present in the local runtime")
 
-    run = V2ProviderRun.model_validate_json(artifact.read_text(encoding="utf-8"))
+    run = load_v2_provider_run(artifact)
 
     assert len(run.records) == 50
     assert all(record.result_contract_diagnostics == [] for record in run.records)
@@ -450,6 +468,133 @@ def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
     )
     assert diagnostic_configuration.nl2sql_prompt_version == "a5.3-v4"
     assert diagnostic_configuration.nl2sql_result_contract_enabled is True
+
+
+def _test_validated_sql() -> ValidatedSQL:
+    return ValidatedSQL._from_validator(
+        validation_version="test-validation-v1",
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        dialect=SQLDialect.POSTGRESQL,
+        provider="fake",
+        model="fake-model",
+        prompt_version="a5.3-v3",
+        original_sql="SELECT 1",
+        normalized_sql="SELECT 1",
+        referenced_schemas=(CHATBI_EVALUATION_V2_SCHEMA,),
+        referenced_relations=(),
+        schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        policy_fingerprint="a" * 64,
+        limit_bounded=True,
+        effective_limit=1,
+        limit_source="test",
+    )
+
+
+@pytest.mark.anyio
+async def test_timed_validation_unwraps_registered_authoritative_validated_sql() -> None:
+    validated = _test_validated_sql()
+    registered = _RegisteredValidation(
+        data_source=SimpleNamespace(),
+        request=SimpleNamespace(),
+        validated=validated,
+    )
+
+    class _Validation:
+        async def _validate_registered_candidate(self, *_args: object, **_kwargs: object):
+            return registered
+
+    timing = _TimingState()
+    result = await _TimedValidation(_Validation(), timing)._validate_registered_candidate()
+
+    assert result is registered
+    assert timing.validated_sql is validated
+    assert timing.stages.validation == "passed"
+    assert timing.validation_ms >= 0
+
+
+@pytest.mark.anyio
+async def test_timed_validation_rejection_does_not_fabricate_validated_sql() -> None:
+    class _Validation:
+        async def _validate_registered_candidate(self, *_args: object, **_kwargs: object):
+            raise ValueError("rejected")
+
+    timing = _TimingState()
+    with pytest.raises(ValueError, match="rejected"):
+        await _TimedValidation(_Validation(), timing)._validate_registered_candidate()
+
+    assert timing.validated_sql is None
+    assert timing.stages.validation == "failed"
+
+
+@pytest.mark.anyio
+async def test_wrapped_authoritative_validation_produces_available_semantic_evidence() -> None:
+    validated = _test_validated_sql()
+    registered = _RegisteredValidation(
+        data_source=SimpleNamespace(),
+        request=SimpleNamespace(),
+        validated=validated,
+    )
+
+    class _Validation:
+        async def _validate_registered_candidate(self, *_args: object, **_kwargs: object):
+            return registered
+
+    timing = _TimingState()
+    await _TimedValidation(_Validation(), timing)._validate_registered_candidate()
+    now = datetime.now(UTC)
+    invocation = LLMProviderInvocation(
+        case_id="wrapper-case",
+        logical_stage="generation",
+        attempt_index=1,
+        provider="fake",
+        model="fake-model",
+        started_at=now,
+        completed_at=now,
+        duration_ms=1,
+        outcome="success",
+        input_tokens=1,
+        output_tokens=1,
+        llm_result_returned=True,
+    )
+    result = ChatBIResult(
+        query_id=uuid4(),
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        execution_status=QueryLifecycleState.SUCCEEDED,
+        redacted_sql="SELECT 1",
+        row_count=1,
+        sql_attempts=1,
+        repair_attempts=0,
+        usage=ChatBIUsageSummary(llm_calls=1, provider_attempts=1),
+    )
+    execution = QueryExecutionResult(
+        query_id=result.query_id,
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        state=QueryLifecycleState.SUCCEEDED,
+        columns=[ColumnMetadata(name="one", data_type="integer", nullable=False, ordinal=1)],
+        rows=[[1]],
+        row_count=1,
+        max_rows=1,
+        duration_ms=1,
+    )
+
+    evidence = capture_semantic_evidence(
+        case_id="wrapper-case",
+        split="dev",
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        validated_sql=timing.validated_sql,
+        execution_result=execution,
+        chatbi_result=result,
+        provider_invocations=[invocation],
+        prompt_version="a5.3-v3",
+        reasoning_mode="disabled",
+    )
+
+    assert evidence.evidence_status.value == "available"
+    assert "validated_sql_unavailable" not in evidence.unavailable_reasons
 
 
 def test_v2_provenance_uses_resolved_budgets() -> None:
@@ -601,6 +746,141 @@ def _provider_case_record(
         provider_invocations=provider_invocations or [],
         trace_events=["sql_executed"] if positive else [],
     )
+
+
+def _minimal_v3_provider_run() -> V2ProviderRun:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    records = []
+    for index in range(50):
+        case_id = f"v3-case-{index:03d}"
+        evidence = build_unavailable_semantic_evidence(
+            case_id=case_id,
+            split="dev",
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+            fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+            schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+            prompt_version="a5.3-v3",
+            reasoning_mode="disabled",
+            reason="test_artifact",
+        )
+        records.append(
+            _provider_case_record(case_id=case_id).model_copy(
+                update={"semantic_evidence": evidence}
+            )
+        )
+    settings = Settings(_env_file=None)
+    policy = _v2_query_policy(settings)
+    provenance = V2ProviderRunProvenance(
+        dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
+        fixture_sha256=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        fixture_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        fixture_data_fingerprint=EXPECTED_FIXTURE_DATA_FINGERPRINT_V2,
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        case_count=50,
+        git_revision="a" * 40,
+        git_dirty=False,
+        provider="fake",
+        model="fake-model",
+        temperature=0.0,
+        response_format="json_object",
+        configuration=_v2_configuration(settings, policy, max_chars=24_000),
+        started_at=now,
+        completed_at=now,
+        semantic_evidence_version=SEMANTIC_EVIDENCE_VERSION,
+        semantic_policy_version=EXPECTED_SEMANTIC_POLICY_G3_VERSION,
+        semantic_policy_fingerprint=EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT,
+    )
+    return V2ProviderRun(
+        artifact_schema_version=CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3,
+        run_id=uuid4(),
+        started_at=now,
+        completed_at=now,
+        dataset_fingerprint=EXPECTED_DATASET_FINGERPRINT_V2,
+        fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
+        fixture_schema_fingerprint=EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2,
+        datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+        case_count=50,
+        records=records,
+        aggregates=_build_v2_aggregate(records),
+        provenance=provenance,
+    )
+
+
+def test_frozen_semantic_policy_provenance_is_loaded_and_exact() -> None:
+    assert load_frozen_semantic_policy_provenance() == (
+        EXPECTED_SEMANTIC_POLICY_G3_VERSION,
+        EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT,
+    )
+
+
+def test_v3_provider_artifact_round_trips_policy_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "provider-v3.json"
+    run = _minimal_v3_provider_run()
+    path.write_text(run.model_dump_json(), encoding="utf-8")
+
+    reloaded = load_v2_provider_run(path)
+
+    assert reloaded.artifact_schema_version == CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3
+    assert reloaded.provenance.semantic_policy_version == EXPECTED_SEMANTIC_POLICY_G3_VERSION
+    assert (
+        reloaded.provenance.semantic_policy_fingerprint == EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT
+    )
+    assert reloaded.model_dump(mode="json") == run.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    (
+        ("semantic_policy_version", None),
+        ("semantic_policy_fingerprint", None),
+        ("semantic_policy_version", "a5.7f2-semantic-policy-v1"),
+        ("semantic_policy_fingerprint", "0" * 64),
+        ("semantic_policy_fingerprint", "not-a-fingerprint"),
+    ),
+)
+def test_v3_provider_artifact_rejects_missing_or_mismatched_policy_provenance(
+    field: str,
+    value: object,
+) -> None:
+    payload = _minimal_v3_provider_run().model_dump(mode="json")
+    payload["provenance"][field] = value
+
+    with pytest.raises(ValidationError):
+        V2ProviderRun.model_validate(payload)
+
+
+def test_v2_provider_artifact_does_not_require_g3_policy_provenance() -> None:
+    payload = _minimal_v3_provider_run().model_dump(mode="json")
+    payload["artifact_schema_version"] = CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION
+    payload["provenance"].pop("semantic_policy_version")
+    payload["provenance"].pop("semantic_policy_fingerprint")
+
+    historical = V2ProviderRun.model_validate(payload)
+
+    assert historical.artifact_schema_version == CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION
+    assert historical.provenance.semantic_policy_version is None
+    assert historical.provenance.semantic_policy_fingerprint is None
+
+
+def test_v3_provider_loader_validates_against_the_loaded_policy_file(tmp_path: Path) -> None:
+    path = tmp_path / "provider-v3.json"
+    path.write_text(_minimal_v3_provider_run().model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(V2ProviderBenchmarkError):
+        load_v2_provider_run(
+            path,
+            policy_path=Path("docs/benchmarks/a5-7-semantic-policy-v1.json"),
+        )
+
+
+def test_unknown_future_provider_artifact_version_is_rejected() -> None:
+    payload = _minimal_v3_provider_run().model_dump(mode="json")
+    payload["artifact_schema_version"] = "a5.7future-provider-run-v4"
+
+    with pytest.raises(ValidationError):
+        V2ProviderRun.model_validate(payload)
 
 
 def test_v2_usage_aggregate_separates_attempts_from_completed_results() -> None:

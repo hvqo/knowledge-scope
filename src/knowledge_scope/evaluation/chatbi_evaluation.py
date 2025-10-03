@@ -60,7 +60,11 @@ from knowledge_scope.chatbi.execution import (
     SQLExecutionOutcome,
     SQLExecutionService,
 )
-from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE, NL2SQLService
+from knowledge_scope.chatbi.nl2sql import (
+    NL2SQL_REASONING_MODE,
+    NL2SQLService,
+    _RegisteredValidation,
+)
 from knowledge_scope.chatbi.nl2sql_models import (
     NL2SQL_PROMPT_VERSION,
     ResultContract,
@@ -1838,7 +1842,14 @@ class _TimedValidation:
         started = perf_counter()
         try:
             result = await self._inner._validate_registered_candidate(*args, **kwargs)
-            if isinstance(result, ValidatedSQL):
+            if isinstance(result, _RegisteredValidation):
+                # The execution path returns the complete trusted registration
+                # envelope.  The evidence sidecar must observe the exact
+                # nested validation result rather than reconstructing it.
+                self._timing.validated_sql = result.validated
+            elif isinstance(result, ValidatedSQL):
+                # Keep compatibility with the small direct-validation seam
+                # used by older evaluation doubles.
                 self._timing.validated_sql = result
             self._timing.stages = self._timing.stages.model_copy(update={"validation": "passed"})
             return result

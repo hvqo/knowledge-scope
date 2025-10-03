@@ -129,6 +129,12 @@ from knowledge_scope.evaluation.chatbi_schema_fingerprint import (
     canonical_schema_payload,
     schema_fingerprint,
 )
+from knowledge_scope.evaluation.chatbi_semantic_evaluation import (
+    DEFAULT_G3_SEMANTIC_POLICY_PATH,
+    SEMANTIC_POLICY_G3_VERSION,
+    SemanticEvaluationError,
+    load_semantic_policy_v3,
+)
 from knowledge_scope.evaluation.semantic_evidence import (
     SEMANTIC_EVIDENCE_VERSION,
     SYNTHETIC_EXACT_MODE,
@@ -157,6 +163,7 @@ from knowledge_scope.shared.database import create_database_engine, create_sessi
 
 CHATBI_EVALUATION_V2_PROVIDER_VERSION = "a5.7b"
 CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION = "a5.7g2-provider-run-v2"
+CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3 = "a5.7h2-provider-run-v3"
 CHATBI_EVALUATION_V2_LEGACY_PROVIDER_RUN_SCHEMA_VERSION = "a5.7b-provider-run-v1"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION = "a5.7e2a"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_SCHEMA_VERSION = "a5.7e2a-provider-diagnostic-v1"
@@ -193,11 +200,36 @@ EXPECTED_FIXTURE_DATA_FINGERPRINT_V2 = (
 EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2 = (
     "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071"
 )
+EXPECTED_SEMANTIC_POLICY_G3_VERSION = SEMANTIC_POLICY_G3_VERSION
+EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT = (
+    "7da8b8c4b843dd1cdb50bc56cb2f826a02b625d1c797084f3000dbdb8cdf70ee"
+)
 _LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class V2ProviderBenchmarkError(ChatBIEvaluationError):
     """Raised when v2 provider preflight or benchmark execution is invalid."""
+
+
+def load_frozen_semantic_policy_provenance(
+    path: Path = DEFAULT_G3_SEMANTIC_POLICY_PATH,
+) -> tuple[str, str]:
+    """Load and verify the exact policy contract used by a fresh provider run."""
+    try:
+        policy = load_semantic_policy_v3(path)
+    except SemanticEvaluationError as error:
+        raise V2ProviderBenchmarkError(
+            "the frozen A5.7g3 semantic policy could not be loaded"
+        ) from error
+    if policy.schema_version != EXPECTED_SEMANTIC_POLICY_G3_VERSION:
+        raise V2ProviderBenchmarkError(
+            "the loaded semantic policy version is not the frozen g3 version"
+        )
+    if policy.policy_fingerprint != EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT:
+        raise V2ProviderBenchmarkError(
+            "the loaded semantic policy fingerprint is not the frozen g3 fingerprint"
+        )
+    return policy.schema_version, policy.policy_fingerprint
 
 
 class V2ProviderSplit(StrEnum):
@@ -230,6 +262,13 @@ class V2ProviderPreflightReport(_EvaluationModel):
     git_revision: StrictStr = Field(pattern=r"^[0-9a-f]{40}$")
     git_dirty: StrictBool
     provider_calls: Literal[0] = 0
+    semantic_policy_version: Literal["a5.7g3-semantic-policy-v1"] = (
+        EXPECTED_SEMANTIC_POLICY_G3_VERSION
+    )
+    semantic_policy_fingerprint: StrictStr = Field(
+        default=EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class V2ProviderCaseRecord(_EvaluationModel):
@@ -461,6 +500,11 @@ class V2ProviderRunProvenance(_EvaluationModel):
     started_at: datetime
     completed_at: datetime
     semantic_evidence_version: Literal["a5.7g2-semantic-evidence-v1"] | None = None
+    semantic_policy_version: Literal["a5.7g3-semantic-policy-v1"] | None = None
+    semantic_policy_fingerprint: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("fixture_path")
     @classmethod
@@ -474,9 +518,11 @@ class V2ProviderRun(_EvaluationModel):
     """Repository-safe artifact contract for exactly the frozen DEV split."""
 
     run_id: UUID
-    artifact_schema_version: Literal["a5.7b-provider-run-v1", "a5.7g2-provider-run-v2"] = (
-        CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION
-    )
+    artifact_schema_version: Literal[
+        "a5.7b-provider-run-v1",
+        "a5.7g2-provider-run-v2",
+        "a5.7h2-provider-run-v3",
+    ] = CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3
     started_at: datetime
     completed_at: datetime
     benchmark_version: Literal["a5.7b"] = CHATBI_EVALUATION_V2_PROVIDER_VERSION
@@ -515,16 +561,38 @@ class V2ProviderRun(_EvaluationModel):
         if self.aggregates.case_count != self.case_count:
             raise ValueError("run and aggregate case counts must match")
         evidence_records = [record.semantic_evidence for record in self.records]
-        if self.artifact_schema_version == CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION:
+        if self.artifact_schema_version in {
+            CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION,
+            CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3,
+        }:
             if any(record is None for record in evidence_records):
                 raise ValueError("g2 provider artifacts require evidence for every case")
             if self.provenance.semantic_evidence_version != SEMANTIC_EVIDENCE_VERSION:
                 raise ValueError("g2 provider provenance must declare the evidence version")
+            if self.artifact_schema_version == CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION:
+                if (
+                    self.provenance.semantic_policy_version is not None
+                    or self.provenance.semantic_policy_fingerprint is not None
+                ):
+                    raise ValueError("g2 provider artifacts cannot contain g3 policy provenance")
+            else:
+                if self.provenance.semantic_policy_version != EXPECTED_SEMANTIC_POLICY_G3_VERSION:
+                    raise ValueError("g3 provider provenance must declare the policy version")
+                if (
+                    self.provenance.semantic_policy_fingerprint
+                    != EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT
+                ):
+                    raise ValueError("g3 provider provenance must declare the policy fingerprint")
         elif (
             self.artifact_schema_version == CHATBI_EVALUATION_V2_LEGACY_PROVIDER_RUN_SCHEMA_VERSION
         ):
             if any(record is not None for record in evidence_records):
                 raise ValueError("legacy provider artifacts cannot contain semantic evidence")
+            if (
+                self.provenance.semantic_policy_version is not None
+                or self.provenance.semantic_policy_fingerprint is not None
+            ):
+                raise ValueError("legacy provider artifacts cannot contain g3 policy provenance")
         else:
             raise ValueError("unsupported v2 provider artifact schema")
         for record, evidence in zip(self.records, evidence_records, strict=True):
@@ -541,6 +609,39 @@ class V2ProviderRun(_EvaluationModel):
                     schema_fingerprint=self.fixture_schema_fingerprint,
                 )
         return self
+
+
+def validate_v2_provider_run_policy_provenance(
+    run: V2ProviderRun,
+    *,
+    policy_path: Path = DEFAULT_G3_SEMANTIC_POLICY_PATH,
+) -> None:
+    """Validate v3 provenance against the policy file actually loaded for diagnostics."""
+    if run.artifact_schema_version != CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3:
+        return
+    policy_version, policy_fingerprint = load_frozen_semantic_policy_provenance(policy_path)
+    if run.provenance.semantic_policy_version != policy_version:
+        raise V2ProviderBenchmarkError(
+            "provider artifact semantic policy version does not match the loaded policy"
+        )
+    if run.provenance.semantic_policy_fingerprint != policy_fingerprint:
+        raise V2ProviderBenchmarkError(
+            "provider artifact semantic policy fingerprint does not match the loaded policy"
+        )
+
+
+def load_v2_provider_run(
+    path: Path,
+    *,
+    policy_path: Path = DEFAULT_G3_SEMANTIC_POLICY_PATH,
+) -> V2ProviderRun:
+    """Read a provider artifact without migrating historical v1/v2 contracts."""
+    try:
+        run = V2ProviderRun.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValidationError) as error:
+        raise V2ProviderBenchmarkError("could not read v2 provider benchmark output") from error
+    validate_v2_provider_run_policy_provenance(run, policy_path=policy_path)
+    return run
 
 
 def _safe_rate(numerator: int, denominator: int) -> float | None:
@@ -2112,6 +2213,8 @@ class _V2PreflightContext:
     discovered_schema: SchemaDiscoveryResult | None
     git_revision: str
     git_dirty: bool
+    semantic_policy_version: str
+    semantic_policy_fingerprint: str
 
 
 async def _prepare_v2_preflight(
@@ -2127,6 +2230,7 @@ async def _prepare_v2_preflight(
 ) -> _V2PreflightContext:
     # Capture the repository state before any validation/bootstrap step can
     # create directories or other local artifacts.
+    semantic_policy_version, semantic_policy_fingerprint = load_frozen_semantic_policy_provenance()
     revision = current_git_revision()
     if revision is None:
         raise V2ProviderBenchmarkError("could not determine the current Git revision")
@@ -2200,6 +2304,8 @@ async def _prepare_v2_preflight(
         discovered_schema=discovered_schema,
         git_revision=revision,
         git_dirty=dirty,
+        semantic_policy_version=semantic_policy_version,
+        semantic_policy_fingerprint=semantic_policy_fingerprint,
     )
 
 
@@ -2243,6 +2349,8 @@ async def preflight_v2_provider_benchmark(
             datasource_created=context.bootstrap.datasource_created,
             git_revision=context.git_revision,
             git_dirty=context.git_dirty,
+            semantic_policy_version=context.semantic_policy_version,
+            semantic_policy_fingerprint=context.semantic_policy_fingerprint,
         )
     finally:
         if not environment_was_present:
@@ -3356,6 +3464,8 @@ async def run_v2_provider_benchmark(
             temperature=0.0,
             response_format="json_object",
             semantic_evidence_version=SEMANTIC_EVIDENCE_VERSION,
+            semantic_policy_version=context.semantic_policy_version,
+            semantic_policy_fingerprint=context.semantic_policy_fingerprint,
             configuration=_v2_configuration(
                 settings,
                 policy,
@@ -3374,6 +3484,7 @@ async def run_v2_provider_benchmark(
             records=records,
             aggregates=_build_v2_aggregate(records),
             provenance=provenance,
+            artifact_schema_version=CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3,
         )
         if output_path is not None:
             write_v2_provider_run(output_path, run)
@@ -3681,6 +3792,7 @@ __all__ = [
     "CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME",
     "CHATBI_EVALUATION_V2_DATASOURCE_ID",
     "CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION",
+    "CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION_V3",
     "CHATBI_EVALUATION_V2_PROVIDER_VERSION",
     "DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2",
     "DEFAULT_PROVIDER_CONTRACT_ONLY_OUTPUT_V2",
@@ -3690,6 +3802,8 @@ __all__ = [
     "EXPECTED_FIXTURE_DATA_FINGERPRINT_V2",
     "EXPECTED_FIXTURE_FINGERPRINT_V2",
     "EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2",
+    "EXPECTED_SEMANTIC_POLICY_G3_FINGERPRINT",
+    "EXPECTED_SEMANTIC_POLICY_G3_VERSION",
     "V2ProviderAggregate",
     "V2ProviderBenchmarkError",
     "V2ProviderCaseRecord",
@@ -3712,6 +3826,8 @@ __all__ = [
     "evaluate_v2_provider_cases",
     "evaluate_v2_provider_contract_diagnostic_cases",
     "evaluate_v2_provider_diagnostic_cases",
+    "load_frozen_semantic_policy_provenance",
+    "load_v2_provider_run",
     "preflight_v2_provider_benchmark",
     "run_v2_provider_benchmark",
     "run_v2_provider_contract_diagnostic",
@@ -3720,6 +3836,7 @@ __all__ = [
     "select_v2_provider_cases",
     "select_v2_provider_contract_diagnostic_cases",
     "select_v2_provider_diagnostic_cases",
+    "validate_v2_provider_run_policy_provenance",
     "write_v2_provider_contract_diagnostic_run",
     "write_v2_provider_contract_only_run",
     "write_v2_provider_diagnostic_run",
