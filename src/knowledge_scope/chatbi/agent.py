@@ -30,6 +30,7 @@ from knowledge_scope.llm.schemas import (
 )
 from knowledge_scope.shared.config import DEFAULT_CHATBI_ANALYSIS_MAX_TOKENS
 
+from .eligibility import EligibilityAssessment
 from .errors import ChatBIError, ChatBIErrorCategory, StructuredOutputError
 from .execution import SQLExecutionOutcome, SQLExecutionService, redact_sql_literals
 from .nl2sql import LLMUsageMetadata, NL2SQLGenerationError, NL2SQLService
@@ -37,6 +38,7 @@ from .nl2sql_models import NL2SQLInput, ResultContract, SQLCandidate
 from .policy import QueryPolicy
 from .schemas import (
     ColumnMetadata,
+    QueryEligibilityDecision,
     QueryExecutionResult,
     QueryLifecycleState,
     QueryTruncationReason,
@@ -60,6 +62,11 @@ _REPAIRABLE_CATEGORIES: Final = frozenset(
 )
 
 ChatBITraceName = Literal[
+    "eligibility_check_started",
+    "eligibility_eligible",
+    "eligibility_clarify",
+    "eligibility_refuse",
+    "eligibility_unavailable",
     "schema_prepared",
     "sql_generated",
     "validation_rejected",
@@ -119,6 +126,7 @@ class ChatBIUsageSummary(_AgentModel):
     model: StrictStr | None = Field(default=None, min_length=1, max_length=255)
     input_tokens: StrictInt | None = Field(default=None, ge=0)
     output_tokens: StrictInt | None = Field(default=None, ge=0)
+    task_type_counts: dict[StrictStr, StrictInt] = Field(default_factory=dict)
 
 
 class ChatBITraceEvent(_AgentModel):
@@ -171,6 +179,7 @@ class ChatBIResult(_AgentModel):
     warnings: list[StrictStr] = Field(default_factory=list)
     error_category: ChatBIErrorCategory | None = None
     error_message: StrictStr | None = Field(default=None, max_length=2_000)
+    eligibility: QueryEligibilityDecision | None = None
     analysis_parse_outcome: (
         Literal["parsed", "structured_output_parse_error", "structured_output_schema_error"] | None
     ) = None
@@ -187,6 +196,9 @@ class ChatBIResult(_AgentModel):
                 QueryLifecycleState.REJECTED,
                 QueryLifecycleState.FAILED,
                 QueryLifecycleState.CANCELLED,
+                QueryLifecycleState.CLARIFY,
+                QueryLifecycleState.REFUSE,
+                QueryLifecycleState.ELIGIBILITY_UNAVAILABLE,
             }
         )
 
@@ -202,13 +214,53 @@ class ChatBIResult(_AgentModel):
             raise ValueError("an error message requires an error category")
         if self.error_category is not None and self.error_message is None:
             raise ValueError("an error category requires an error message")
-        if self.execution_status is not QueryLifecycleState.SUCCEEDED and self.answer is not None:
-            raise ValueError("failed execution results cannot contain an answer")
-        if (
-            self.execution_status is not QueryLifecycleState.SUCCEEDED
-            and self.error_category is None
-        ):
-            raise ValueError("failed execution results require an error category")
+        if self.execution_status in {
+            QueryLifecycleState.CLARIFY,
+            QueryLifecycleState.REFUSE,
+            QueryLifecycleState.ELIGIBILITY_UNAVAILABLE,
+        }:
+            if self.eligibility is None:
+                raise ValueError("eligibility terminal results require a decision")
+            expected_decision = (
+                "unavailable"
+                if self.execution_status is QueryLifecycleState.ELIGIBILITY_UNAVAILABLE
+                else self.execution_status.value
+            )
+            if self.eligibility.decision != expected_decision:
+                raise ValueError("eligibility decision does not match execution status")
+            if self.sql_attempts != 0 or self.repair_attempts != 0:
+                raise ValueError("eligibility terminal results cannot attempt SQL")
+            if self.redacted_sql is not None or self.columns or self.row_count:
+                raise ValueError("eligibility terminal results cannot contain SQL results")
+            if self.truncated or self.truncation_reason is not None:
+                raise ValueError("eligibility terminal results cannot contain truncation metadata")
+            if self.execution_status in {
+                QueryLifecycleState.CLARIFY,
+                QueryLifecycleState.REFUSE,
+            }:
+                if self.answer != self.eligibility.user_message:
+                    raise ValueError(
+                        "user-level eligibility results must expose their safe message"
+                    )
+                if self.error_category is not None or self.error_message is not None:
+                    raise ValueError(
+                        "clarification/refusal results cannot contain technical errors"
+                    )
+            elif self.error_category is not ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE:
+                raise ValueError("unavailable eligibility results require the eligibility error")
+        else:
+            if self.eligibility is not None:
+                raise ValueError("ordinary execution results cannot contain eligibility decisions")
+            if (
+                self.execution_status is not QueryLifecycleState.SUCCEEDED
+                and self.answer is not None
+            ):
+                raise ValueError("failed execution results cannot contain an answer")
+            if (
+                self.execution_status is not QueryLifecycleState.SUCCEEDED
+                and self.error_category is None
+            ):
+                raise ValueError("failed execution results require an error category")
         if self.repair_attempts > self.sql_attempts:
             raise ValueError("repair attempts cannot exceed SQL attempts")
         return self
@@ -239,6 +291,20 @@ class CandidateGenerationService(Protocol):
         previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         """Generate an untrusted candidate from a fresh trusted schema snapshot."""
+
+
+class QueryEligibilityServiceProtocol(Protocol):
+    """Pre-generation product-capability gate for a registered datasource."""
+
+    async def assess_for_registered_data_source(
+        self,
+        datasource_id: UUID,
+        query: NL2SQLInput,
+        *,
+        policy: QueryPolicy,
+        max_chars: int,
+    ) -> EligibilityAssessment:
+        """Assess eligibility after trusted schema discovery."""
 
 
 class QueryExecutionServiceProtocol(Protocol):
@@ -366,6 +432,7 @@ class ChatBIAgentService:
         analysis_gateway: AnalysisGateway,
         *,
         limits: ChatBIAgentLimits | None = None,
+        eligibility_service: QueryEligibilityServiceProtocol | None = None,
     ) -> None:
         if not callable(getattr(analysis_gateway, "complete", None)):
             raise TypeError("analysis_gateway must provide an async complete method")
@@ -373,6 +440,7 @@ class ChatBIAgentService:
         self._execution_service = execution_service
         self._analysis_gateway = analysis_gateway
         self._limits = limits or ChatBIAgentLimits()
+        self._eligibility_service = eligibility_service
 
     @staticmethod
     def _redacted_sql(candidate: SQLCandidate | None) -> str | None:
@@ -394,6 +462,8 @@ class ChatBIAgentService:
         usage: ChatBIUsageSummary,
         warnings: Sequence[str],
         trace: Sequence[ChatBITraceEvent],
+        eligibility: QueryEligibilityDecision | None = None,
+        eligibility_status: QueryLifecycleState | None = None,
         structured_output_observations: Sequence[StructuredOutputBoundaryObservation] = (),
         analysis_parse_outcome: Literal[
             "parsed", "structured_output_parse_error", "structured_output_schema_error"
@@ -401,7 +471,13 @@ class ChatBIAgentService:
         | None = None,
     ) -> ChatBIResult:
         execution = outcome.result if outcome is not None else None
-        status = execution.state if execution is not None else QueryLifecycleState.FAILED
+        status = (
+            eligibility_status
+            if eligibility_status is not None
+            else execution.state
+            if execution is not None
+            else QueryLifecycleState.FAILED
+        )
         result_error_category = execution.error_category if execution is not None else None
         result_error_message = execution.error_message if execution is not None else None
         error_category = error.category if error is not None else result_error_category
@@ -433,6 +509,7 @@ class ChatBIAgentService:
             warnings=final_warnings,
             error_category=error_category,
             error_message=error_message,
+            eligibility=eligibility,
             analysis_parse_outcome=analysis_parse_outcome,
             structured_output_observations=list(structured_output_observations),
             trace=list(trace),
@@ -481,6 +558,7 @@ class ChatBIAgentService:
         input_tokens_seen = False
         output_tokens_seen = False
         provider_attempts = 0
+        task_type_counts: dict[str, int] = {}
         generation_observations: list[StructuredOutputBoundaryObservation] = []
         active_generation_observation_index: int | None = None
 
@@ -492,9 +570,19 @@ class ChatBIAgentService:
                 model=selected_model,
                 input_tokens=input_tokens if input_tokens_seen else None,
                 output_tokens=output_tokens if output_tokens_seen else None,
+                task_type_counts=dict(sorted(task_type_counts.items())),
             )
 
-        def add_usage(result: LLMResult | LLMUsageMetadata) -> None:
+        def record_llm_call(task_type: str) -> None:
+            nonlocal llm_calls
+            llm_calls += 1
+            task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+
+        def add_usage(
+            result: LLMResult | LLMUsageMetadata,
+            *,
+            task_type: str,
+        ) -> None:
             nonlocal provider, selected_model, provider_attempts, input_tokens, output_tokens
             nonlocal input_tokens_seen, output_tokens_seen
             if not isinstance(result, (LLMResult, LLMUsageMetadata)):
@@ -571,6 +659,110 @@ class ChatBIAgentService:
                 structured_output_observations=generation_observations,
             )
 
+        if self._eligibility_service is not None:
+            if not reserve_step():
+                return limit_result()
+            add_trace("eligibility_check_started")
+            try:
+                assessment = await self._eligibility_service.assess_for_registered_data_source(
+                    datasource_id,
+                    query,
+                    policy=policy,
+                    max_chars=max_chars,
+                )
+            except asyncio.CancelledError:
+                add_trace(
+                    "eligibility_unavailable",
+                    error_category=ChatBIErrorCategory.EXECUTION_CANCELLED,
+                )
+                raise
+            except ChatBIError as error:
+                add_trace(
+                    "eligibility_unavailable",
+                    error_category=error.category,
+                )
+                return self._build_result(
+                    query_id=query_id,
+                    datasource_id=datasource_id,
+                    candidate=None,
+                    outcome=None,
+                    answer=None,
+                    error=error,
+                    sql_attempts=0,
+                    repair_attempts=0,
+                    usage=usage_summary(),
+                    warnings=warnings,
+                    trace=trace,
+                    structured_output_observations=generation_observations,
+                )
+            except Exception:
+                error = ChatBIError(
+                    ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE,
+                    "ChatBI eligibility check failed",
+                )
+                add_trace(
+                    "eligibility_unavailable",
+                    error_category=error.category,
+                )
+                return self._build_result(
+                    query_id=query_id,
+                    datasource_id=datasource_id,
+                    candidate=None,
+                    outcome=None,
+                    answer=None,
+                    error=error,
+                    sql_attempts=0,
+                    repair_attempts=0,
+                    usage=usage_summary(),
+                    warnings=warnings,
+                    trace=trace,
+                    structured_output_observations=generation_observations,
+                )
+
+            if assessment.llm_call_made:
+                record_llm_call("chatbi_eligibility")
+            if assessment.usage is not None:
+                add_usage(assessment.usage, task_type="chatbi_eligibility")
+            decision = assessment.decision
+            if decision.decision == "eligible":
+                add_trace("eligibility_eligible")
+            else:
+                trace_event = {
+                    "clarify": "eligibility_clarify",
+                    "refuse": "eligibility_refuse",
+                    "unavailable": "eligibility_unavailable",
+                }[decision.decision]
+                add_trace(trace_event)  # type: ignore[arg-type]
+                status = (
+                    QueryLifecycleState.ELIGIBILITY_UNAVAILABLE
+                    if decision.decision == "unavailable"
+                    else QueryLifecycleState(decision.decision)
+                )
+                error = (
+                    ChatBIError(
+                        ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE,
+                        decision.user_message,
+                    )
+                    if decision.decision == "unavailable"
+                    else None
+                )
+                return self._build_result(
+                    query_id=query_id,
+                    datasource_id=datasource_id,
+                    candidate=None,
+                    outcome=None,
+                    answer=None if decision.decision == "unavailable" else decision.user_message,
+                    error=error,
+                    sql_attempts=0,
+                    repair_attempts=0,
+                    usage=usage_summary(),
+                    warnings=warnings,
+                    trace=trace,
+                    eligibility=decision,
+                    eligibility_status=status,
+                    structured_output_observations=generation_observations,
+                )
+
         while True:
             if (
                 sql_attempts >= self._limits.max_sql_attempts
@@ -582,7 +774,7 @@ class ChatBIAgentService:
 
             outcome = None
             sql_attempts += 1
-            llm_calls += 1
+            record_llm_call("nl2sql")
             active_generation_observation_index = None
             try:
                 (
@@ -600,7 +792,7 @@ class ChatBIAgentService:
                         previous_contract=repair_contract,
                     )
                 )
-                add_usage(generation_result)
+                add_usage(generation_result, task_type="nl2sql")
                 add_generation_observation(generation_result.structured_output_observation)
                 candidate = generated
                 repair_sql = None
@@ -617,7 +809,7 @@ class ChatBIAgentService:
                 raise
             except ChatBIError as error:
                 if isinstance(error, NL2SQLGenerationError):
-                    add_usage(error.usage)
+                    add_usage(error.usage, task_type="nl2sql")
                     add_generation_observation(error.boundary_observation)
                 add_trace("generation_failed", attempt=sql_attempts, error_category=error.category)
                 if (
@@ -817,7 +1009,7 @@ class ChatBIAgentService:
 
         if not reserve_step() or llm_calls >= self._limits.max_llm_calls:
             return limit_result()
-        llm_calls += 1
+        record_llm_call("chatbi_analysis")
         add_trace("analysis_requested")
         analysis_parse_outcome: (
             Literal["parsed", "structured_output_parse_error", "structured_output_schema_error"]
@@ -844,16 +1036,16 @@ class ChatBIAgentService:
                     ChatBIErrorCategory.ANALYSIS_FAILED,
                     "LLM returned an invalid normalized result",
                 )
-            add_usage(analysis_result)
+            add_usage(analysis_result, task_type="chatbi_analysis")
             analysis = _parse_analysis_payload(analysis_result.text)
             analysis_parse_outcome = "parsed"
         except asyncio.CancelledError:
             add_trace("analysis_failed", error_category=ChatBIErrorCategory.EXECUTION_CANCELLED)
             raise
         except LLMError as error:
-            usage = LLMUsageMetadata.from_error(error)
+            usage = LLMUsageMetadata.from_error(error, task_type="chatbi_analysis")
             if usage is not None:
-                add_usage(usage)
+                add_usage(usage, task_type="chatbi_analysis")
             application_error = ChatBIError(
                 ChatBIErrorCategory.ANALYSIS_FAILED,
                 "ChatBI result analysis failed",
@@ -962,6 +1154,7 @@ __all__ = [
     "ChatBITraceEvent",
     "ChatBITraceName",
     "ChatBIUsageSummary",
+    "QueryEligibilityServiceProtocol",
     "QueryExecutionServiceProtocol",
     "build_chatbi_analysis_messages",
 ]

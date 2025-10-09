@@ -37,6 +37,7 @@ class ChatBIErrorCategory(StrEnum):
     EXECUTION_CANCELLED = "execution_cancelled"
     ANALYSIS_FAILED = "analysis_failed"
     AGENT_LIMIT_EXCEEDED = "agent_limit_exceeded"
+    ELIGIBILITY_UNAVAILABLE = "eligibility_unavailable"
 
 
 class ChatBIError(RuntimeError):

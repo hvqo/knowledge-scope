@@ -18,6 +18,7 @@ from knowledge_scope import __version__
 from knowledge_scope.chatbi import (
     ChatBIAgentLimits,
     ChatBIAgentService,
+    ChatBIEligibilityService,
     ChatBIError,
     ChatBIErrorCategory,
     EnvironmentCredentialResolver,
@@ -1426,13 +1427,29 @@ async def _generate_chatbi_sql_async(
             data_source_provider=DatabaseDataSourceProvider(session_factory),
             max_tokens=args.max_tokens or settings.chatbi_nl2sql_max_tokens,
         )
+        query = NL2SQLInput(
+            datasource_id=args.datasource_id,
+            question=args.question,
+            model=args.model,
+        )
+        eligibility = ChatBIEligibilityService(service, gateway)
+        assessment = await eligibility.assess_for_registered_data_source(
+            args.datasource_id,
+            query,
+            policy=policy,
+            max_chars=args.max_chars or settings.chatbi_schema_context_max_chars,
+        )
+        if assessment.decision.decision != "eligible":
+            output: dict[str, object] = {
+                "execution_status": assessment.decision.decision,
+                "eligibility": assessment.decision.model_dump(mode="json"),
+            }
+            if assessment.decision.decision == "unavailable":
+                output["error_category"] = ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE.value
+            return output
         result = await service.generate_for_registered_data_source(
             args.datasource_id,
-            NL2SQLInput(
-                datasource_id=args.datasource_id,
-                question=args.question,
-                model=args.model,
-            ),
+            query,
             policy=policy,
             max_chars=args.max_chars or settings.chatbi_schema_context_max_chars,
         )
@@ -1464,6 +1481,15 @@ def _run_chatbi_nl2sql(args: argparse.Namespace) -> int:
         print("chatbi_nl2sql_status: interrupted", file=sys.stderr)
         return 130
 
+    outcome = output.get("execution_status")
+    if outcome in {"clarify", "refuse"}:
+        print(f"chatbi_nl2sql_status: {outcome}")
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    if outcome == "unavailable":
+        print("chatbi_nl2sql_status: eligibility_unavailable", file=sys.stderr)
+        print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
     print("chatbi_nl2sql_status: complete")
     print(json.dumps(_redact_sql_display(output), ensure_ascii=False, indent=2))
     return 0
@@ -1568,6 +1594,7 @@ async def _ask_chatbi_async(
             data_source_provider=DatabaseDataSourceProvider(session_factory),
             max_tokens=settings.chatbi_nl2sql_max_tokens,
         )
+        eligibility = ChatBIEligibilityService(generation, gateway)
         execution = SQLExecutionService(
             generation,
             EnvironmentCredentialResolver(),
@@ -1581,6 +1608,7 @@ async def _ask_chatbi_async(
             execution,
             gateway,
             limits=ChatBIAgentLimits.from_settings(settings),
+            eligibility_service=eligibility,
         ).ask(
             args.datasource_id,
             args.question,
@@ -1616,7 +1644,16 @@ def _run_chatbi_ask(args: argparse.Namespace) -> int:
         print("chatbi_ask_status: interrupted", file=sys.stderr)
         return 130
 
-    success = output.get("execution_status") == "succeeded" and output.get("error_category") is None
+    outcome = output.get("execution_status")
+    if outcome in {"clarify", "refuse"} and output.get("error_category") is None:
+        print(f"chatbi_ask_status: {outcome}")
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    if outcome == "eligibility_unavailable":
+        print("chatbi_ask_status: eligibility_unavailable", file=sys.stderr)
+        print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    success = outcome == "succeeded" and output.get("error_category") is None
     if not success:
         print("chatbi_ask_status: failed", file=sys.stderr)
         print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)

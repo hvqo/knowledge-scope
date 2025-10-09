@@ -22,9 +22,10 @@ LLMTaskType = Literal[
     "entity_linking",
     "nl2sql",
     "chatbi_analysis",
+    "chatbi_eligibility",
 ]
 
-LLMLogicalStage = Literal["generation", "repair_generation", "analysis", "other"]
+LLMLogicalStage = Literal["generation", "repair_generation", "analysis", "eligibility", "other"]
 LLMInvocationOutcome = Literal["success", "failure", "cancelled"]
 LLMInvocationStatusClass = Literal["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"]
 LLMResponseParseOutcome = Literal[
@@ -57,6 +58,7 @@ LLM_TASK_TYPES: tuple[LLMTaskType, ...] = (
     "entity_linking",
     "nl2sql",
     "chatbi_analysis",
+    "chatbi_eligibility",
 )
 
 

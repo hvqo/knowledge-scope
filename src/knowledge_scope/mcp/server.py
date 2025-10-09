@@ -18,6 +18,7 @@ from knowledge_scope import __version__
 from knowledge_scope.chatbi import (
     ChatBIAgentLimits,
     ChatBIAgentService,
+    ChatBIEligibilityService,
     ChatBIError,
     ChatBIErrorCategory,
     ChatBIResult,
@@ -254,6 +255,7 @@ class ProductionMCPApplication:
             data_source_provider=self._data_source_provider,
             max_tokens=settings.chatbi_nl2sql_max_tokens,
         )
+        eligibility = ChatBIEligibilityService(generation, gateway)
         execution = SQLExecutionService(
             generation,
             EnvironmentCredentialResolver(),
@@ -267,6 +269,7 @@ class ProductionMCPApplication:
             execution,
             gateway,  # type: ignore[arg-type]
             limits=ChatBIAgentLimits.from_settings(settings),
+            eligibility_service=eligibility,
         )
         self._policy = default_query_policy(settings)
         self._max_chars = settings.chatbi_schema_context_max_chars
@@ -369,6 +372,7 @@ _SAFE_ERROR_MESSAGES: dict[ChatBIErrorCategory, str] = {
     ChatBIErrorCategory.EXECUTION_CANCELLED: "query execution was cancelled",
     ChatBIErrorCategory.ANALYSIS_FAILED: "result analysis failed",
     ChatBIErrorCategory.AGENT_LIMIT_EXCEEDED: "ChatBI request reached its configured bound",
+    ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE: "request eligibility could not be determined",
 }
 
 
@@ -516,7 +520,11 @@ def _schema_payload(result: SchemaDiscoveryResult) -> MCPSchemaPayload:
 
 
 def _chatbi_result_error(result: ChatBIResult) -> MCPToolError | None:
-    if result.execution_status is QueryLifecycleState.SUCCEEDED:
+    if result.execution_status in {
+        QueryLifecycleState.SUCCEEDED,
+        QueryLifecycleState.CLARIFY,
+        QueryLifecycleState.REFUSE,
+    }:
         return None
     category = result.error_category or ChatBIErrorCategory.EXECUTION_FAILED
     return _chatbi_error(ChatBIError(category, result.error_message or "ChatBI request failed"))
