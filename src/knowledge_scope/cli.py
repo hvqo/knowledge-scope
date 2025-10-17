@@ -69,6 +69,12 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
 from knowledge_scope.evaluation.chatbi_evaluation import (
     DEFAULT_OUTPUT as DEFAULT_CHATBI_EVAL_OUTPUT,
 )
+from knowledge_scope.evaluation.chatbi_evaluation_v2_gated import (
+    DEFAULT_GATED_PROVIDER_OUTPUT_V2,
+    GatedEvaluationPreflightError,
+    preflight_gated_provider_benchmark,
+    run_gated_v2_provider_benchmark,
+)
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
@@ -381,6 +387,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--contract-only-probe",
         action="store_true",
         help="run the fixed eleven-DEV ResultContract-only planning probe",
+    )
+    chatbi_eval_v2_gated_provider = chatbi_actions.add_parser(
+        "eval-v2-gated-provider",
+        help="run the eligibility-gated production Agent evaluation",
+    )
+    chatbi_eval_v2_gated_provider.add_argument(
+        "--split",
+        choices=("dev", "test"),
+        required=True,
+        help="only the frozen DEV split is enabled; TEST is rejected",
+    )
+    chatbi_eval_v2_gated_provider.add_argument(
+        "--preflight",
+        action="store_true",
+        help="run gated provider-free checks without constructing or calling a provider",
+    )
+    chatbi_eval_v2_gated_provider.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_V2)
+    chatbi_eval_v2_gated_provider.add_argument(
+        "--fixture", type=Path, default=DEFAULT_FIXTURE_PATH_V2
+    )
+    chatbi_eval_v2_gated_provider.add_argument(
+        "--output", type=Path, default=DEFAULT_GATED_PROVIDER_OUTPUT_V2
     )
     mcp = subparsers.add_parser(
         "mcp",
@@ -1817,6 +1845,57 @@ def _run_chatbi_eval_v2_provider(args: argparse.Namespace) -> int:
         return 130
 
     print("chatbi_eval_v2_provider_status: complete")
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _run_chatbi_eval_v2_gated_provider_async(
+    args: argparse.Namespace,
+    settings: Settings,
+) -> dict[str, object]:
+    """Run the explicit eligibility-gated production Agent evaluation."""
+    if args.preflight:
+        report = await preflight_gated_provider_benchmark(
+            settings,
+            split=args.split,
+            dataset_path=args.dataset,
+            fixture_path=args.fixture,
+            output_path=args.output,
+        )
+    else:
+        report = await run_gated_v2_provider_benchmark(
+            settings,
+            split=args.split,
+            dataset_path=args.dataset,
+            fixture_path=args.fixture,
+            output_path=args.output,
+        )
+    return report.model_dump(mode="json")
+
+
+def _run_chatbi_eval_v2_gated_provider(args: argparse.Namespace) -> int:
+    """Run the provider-backed eligibility-gated evaluation without secrets in output."""
+    try:
+        settings = get_settings()
+        output = asyncio.run(_run_chatbi_eval_v2_gated_provider_async(args, settings))
+    except GatedEvaluationPreflightError as error:
+        print("chatbi_eval_v2_gated_provider_status: failed", file=sys.stderr)
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (ChatBIEvaluationError, ChatBIError) as error:
+        print("chatbi_eval_v2_gated_provider_status: failed", file=sys.stderr)
+        message = error.safe_message if isinstance(error, ChatBIError) else str(error)
+        print(f"error: {message}", file=sys.stderr)
+        return 1
+    except (LLMError, ValidationError, ValueError, OSError):
+        print("chatbi_eval_v2_gated_provider_status: failed", file=sys.stderr)
+        print("error: eligibility-gated ChatBI evaluation failed", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("chatbi_eval_v2_gated_provider_status: interrupted", file=sys.stderr)
+        return 130
+
+    print("chatbi_eval_v2_gated_provider_status: complete")
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 
@@ -3280,6 +3359,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_chatbi_eval(args)
     if args.command == "chatbi" and args.chatbi_action == "eval-v2-provider":
         return _run_chatbi_eval_v2_provider(args)
+    if args.command == "chatbi" and args.chatbi_action == "eval-v2-gated-provider":
+        return _run_chatbi_eval_v2_gated_provider(args)
     if args.command == "mcp" and args.mcp_action == "serve":
         return _run_mcp_serve()
     if args.command == "llm-smoke-test":
