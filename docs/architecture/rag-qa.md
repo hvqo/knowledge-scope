@@ -14,6 +14,7 @@ KnowledgeScope 当前提供一个最小的 RAG QA 编排：
 - 字符预算只约束选中 chunk 文本的字符数，不包含 system/user prompt、marker 和协议包装，也不使用 tokenizer；它是近似的工程上限，不是精确的 LLM token context budget。当前没有 source block 的字符/token offset，因此无法可靠地自动消除所有近似重复内容。
 - 每个选中的 context item 都生成确定性的请求内 marker（`C1`、`C2`……）。marker 和 document、page、chunk 或 Evidence、source block、section 元数据由应用生成并在最终 SSE citation event 中返回；模型输出中的未知、重复或格式错误 marker 不会被解析为 citation metadata，应用只信任自己的 citation event。
 - `unified` 模式下，chunk 候选仍引用真实 `chunk_id`；image、table、formula 等 Evidence 候选引用真实 `evidence_id` 和 `representation_ids`，不伪造 `chunk_id`。representation 文本只是送入模型的可检索上下文载体，权威 citation lineage 仍来自当前 Evidence/Representation 状态；Unified branch 的 rank、score、Graph seed/path 会在 citation provenance 中保留。
+- F1 前端工作区使用 `/chat` 路由和本节 SSE 接口：会话列表、当前知识库选择、增量回答和证据面板都在浏览器会话内维护。后端当前不保存对话历史；刷新页面或关闭标签页后，会话内容不会恢复。citation 中的 `snippet` 仅用于来源卡片展示：`source` 表示文本 chunk 的原始片段，`representation` 表示可检索表示，后者不替代权威 Evidence。
 - prompt 版本为 `rag-qa-v1`，要求回答只依据给定资料、证据不足时明确说明、不得编造，并只能引用上下文中的应用 marker。
 
 ## SSE API
@@ -55,7 +56,7 @@ KNOWLEDGE_SCOPE_RAG_CONTEXT_BUDGET_CHARS=6000
 KNOWLEDGE_SCOPE_RAG_MAX_TOKENS=512
 ```
 
-默认 provider 仍需要按 [A2.6 LLM gateway 说明](llm-gateway.md) 配置 `KNOWLEDGE_SCOPE_LLM_API_KEY`。正常测试使用 fake retrieval/reranker/gateway，不需要 GPU、网络或 API key；当前没有前端聊天页面、答案质量 benchmark 或 GraphRAG。
+默认 provider 仍需要按 [A2.6 LLM gateway 说明](llm-gateway.md) 配置 `KNOWLEDGE_SCOPE_LLM_API_KEY`。正常测试使用 fake retrieval/reranker/gateway，不需要 GPU、网络或 API key；前端工作区不包含答案质量 benchmark 或 GraphRAG 功能。
 
 真实运行还需要安装已有的本地模型依赖：
 

@@ -66,11 +66,21 @@ def _citation_for_dense(item: RerankedChunk, marker: str) -> RAGCitation:
         source_block_ids=list(payload.source_block_ids),
         section_path=list(payload.section_path),
         section_title=payload.section_path[-1] if payload.section_path else None,
+        snippet=payload.text.strip()[:1_000] or None,
+        snippet_kind="source" if payload.text.strip() else None,
         asset_refs=list(payload.asset_refs),
     )
 
 
 def _citation_for_unified(item: UnifiedCandidate, marker: str) -> RAGCitation:
+    if item.candidate_kind == "chunk":
+        source_text = item.source_text.strip() if item.source_text else ""
+        snippet = source_text[:1_000] or None
+        snippet_kind = "source" if snippet is not None else None
+    else:
+        representation_text = item.rerank_text.strip()
+        snippet = representation_text[:1_000] or None
+        snippet_kind = "representation" if snippet is not None else None
     common = {
         "marker": marker,
         "document_id": item.document_id,
@@ -83,6 +93,8 @@ def _citation_for_unified(item: UnifiedCandidate, marker: str) -> RAGCitation:
         "asset_refs": list(item.asset_refs),
         "final_rank": item.final_rank,
         "final_reranker_score": item.final_reranker_score,
+        "snippet": snippet,
+        "snippet_kind": snippet_kind,
         "branch_provenance": [
             {
                 "branch": contribution.branch,
