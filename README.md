@@ -59,6 +59,9 @@ text、image、table、formula 都可以作为 Evidence 来源，并拥有多个
 
 已注册的数据源也可以通过 `knowledgescope chatbi ask <datasource_id> <question>` 完成有界的 SQL 生成、只读执行和结果分析。
 
+Web 端的数据分析工作区复用同一条注册数据源、Eligibility、SQL 校验、只读执行和结果分析链路，
+以表格展示真实结果，并在数据形状合适时提供确定性图表。
+
 本地 MCP 客户端可以通过 stdio 调用 `chatbi_ask` 和 `chatbi_schema`，复用相同的注册数据源、Schema Discovery 与只读 ChatBI 流程。
 
 ## 系统架构
@@ -183,6 +186,7 @@ KnowledgeScope/
 | ChatBI schema discovery | [Schema Discovery](docs/architecture/chatbi-schema-discovery.md) |
 | ChatBI SQL execution | [SQL Execution](docs/architecture/chatbi-sql-execution.md) |
 | ChatBI agent loop | [ChatBI Agent](docs/architecture/chatbi-agent.md) |
+| ChatBI 数据分析工作区 | [Analysis Workspace](docs/architecture/chatbi-analysis-workspace.md) |
 | 本地 MCP 服务 | [MCP 服务](docs/architecture/mcp-server.md) |
 | 检索评测 | [Retrieval Evaluation](docs/benchmarks/a4-5-retrieval-evaluation.md) |
 | 开发记录 | [Project History](docs/development/project-history.md) |
