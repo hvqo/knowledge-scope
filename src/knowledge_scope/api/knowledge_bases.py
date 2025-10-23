@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_scope.documents.models import Document
 from knowledge_scope.knowledge_bases.models import KnowledgeBase
+from knowledge_scope.reports.models import Report
 from knowledge_scope.shared.database import get_session
 
 from .schemas import (
@@ -110,6 +111,14 @@ async def delete_knowledge_base(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="知识库中仍有文档, 请先删除文档",
+        )
+    report_id = await session.scalar(
+        select(Report.id).where(Report.knowledge_base_id == knowledge_base.id).limit(1)
+    )
+    if report_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="知识库仍被报告引用, 请先删除报告",
         )
     await session.delete(knowledge_base)
     await session.commit()

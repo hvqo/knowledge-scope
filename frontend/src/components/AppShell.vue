@@ -94,6 +94,21 @@ const uiStore = useUiStore();
             class="nav-label"
           >数据分析</span>
         </RouterLink>
+        <RouterLink
+          to="/reports"
+          class="nav-item"
+          active-class="is-active"
+          title="报告创作"
+        >
+          <span
+            class="nav-icon"
+            aria-hidden="true"
+          >✎</span>
+          <span
+            v-if="!uiStore.sidebarCollapsed"
+            class="nav-label"
+          >报告创作</span>
+        </RouterLink>
       </nav>
     </aside>
 
