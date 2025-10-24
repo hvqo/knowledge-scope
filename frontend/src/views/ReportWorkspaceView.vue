@@ -8,10 +8,14 @@ import {
   createReportSection,
   deleteReportSection,
   deleteReportSource,
+  downloadReportExport,
+  editReportSection,
   fetchChatBIDataSources,
   fetchDocuments,
   fetchKnowledgeBases,
   fetchReport,
+  generateReportOutline,
+  generateReportSection,
   getUserFacingError,
   insertReportSource,
   streamRagQuery,
@@ -23,10 +27,14 @@ import type {
   Document,
   RAGCitation,
   ReportChartSpec,
+  ReportAIDraftResponse,
+  ReportAIOutlineItem,
+  ReportAIOutlineResponse,
   ReportRagSourceCreateRequest,
   ReportSection,
 } from "../api/types";
 import ReportEditor from "../components/report/ReportEditor.vue";
+import ReportAIPanel from "../components/report/ReportAIPanel.vue";
 import ReportOutline from "../components/report/ReportOutline.vue";
 import ReportPreview from "../components/report/ReportPreview.vue";
 import ReportSourcePanel from "../components/report/ReportSourcePanel.vue";
@@ -44,6 +52,16 @@ const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
 const actionError = ref<string | null>(null);
 const sectionBusy = ref(false);
 const sourceBusy = ref(false);
+const aiBusy = ref(false);
+const aiError = ref<string | null>(null);
+const exportBusy = ref<"docx" | "pdf" | null>(null);
+const activeAIController = ref<AbortController | null>(null);
+
+type AIPreview =
+  | { kind: "outline"; value: ReportAIOutlineResponse }
+  | { kind: "draft"; value: ReportAIDraftResponse }
+  | null;
+const aiPreview = ref<AIPreview>(null);
 
 const reportQuery = useQuery({
   queryKey: computed(() => ["report", reportId.value]),
@@ -94,7 +112,9 @@ const isBusy = computed(
     reportQuery.isPending.value ||
     sectionBusy.value ||
     sourceBusy.value ||
-    saveState.value === "saving",
+    saveState.value === "saving" ||
+    aiBusy.value ||
+    exportBusy.value !== null,
 );
 const loadErrorMessage = computed(() =>
   getUserFacingError(reportQuery.error.value, "报告暂时无法加载，请稍后重试。"),
@@ -112,6 +132,7 @@ const activeChatBIController = ref<AbortController | null>(null);
 let ragRun = 0;
 let chatBIRun = 0;
 let workspaceRun = 0;
+let aiRun = 0;
 let isUnmounting = false;
 
 function syncDrafts(): void {
@@ -153,10 +174,50 @@ function clearSourceResults(): void {
   chatBIError.value = null;
 }
 
+interface AIRequestToken {
+  controller: AbortController;
+  reportId: string;
+  run: number;
+}
+
+function cancelAIRequest(): void {
+  aiRun += 1;
+  activeAIController.value?.abort();
+  activeAIController.value = null;
+  aiBusy.value = false;
+}
+
+function beginAIRequest(targetReportId: string): AIRequestToken {
+  aiRun += 1;
+  activeAIController.value?.abort();
+  const controller = new AbortController();
+  activeAIController.value = controller;
+  aiBusy.value = true;
+  aiError.value = null;
+  return { controller, reportId: targetReportId, run: aiRun };
+}
+
+function isCurrentAIRequest(token: AIRequestToken): boolean {
+  return (
+    !isUnmounting &&
+    token.run === aiRun &&
+    token.reportId === reportId.value &&
+    activeAIController.value === token.controller
+  );
+}
+
+function finishAIRequest(token: AIRequestToken): void {
+  if (isCurrentAIRequest(token)) {
+    activeAIController.value = null;
+    aiBusy.value = false;
+  }
+}
+
 watch(reportId, (nextId, previousId) => {
   if (previousId !== undefined && nextId !== previousId) {
     workspaceRun += 1;
     cancelSourceRequests();
+    cancelAIRequest();
     clearSourceResults();
     activeSectionId.value = null;
     preview.value = false;
@@ -166,6 +227,9 @@ watch(reportId, (nextId, previousId) => {
     draftContent.value = "";
     saveState.value = "idle";
     sourceBusy.value = false;
+    aiPreview.value = null;
+    aiError.value = null;
+    exportBusy.value = null;
   }
 });
 
@@ -311,6 +375,201 @@ async function removeSection(): Promise<void> {
     actionError.value = getUserFacingError(error, "无法删除章节，请稍后重试。");
   } finally {
     sectionBusy.value = false;
+  }
+}
+
+function selectedSourceIds(section: ReportSection | null): string[] {
+  return (section?.sources ?? []).slice(0, 12).map((source) => source.id);
+}
+
+function allSourceIds(): string[] {
+  return (report.value?.sections.flatMap((section) => section.sources) ?? [])
+    .slice(0, 12)
+    .map((source) => source.id);
+}
+
+async function generateOutline(instruction: string): Promise<void> {
+  if (report.value === null) {
+    return;
+  }
+  const initialReportId = reportId.value;
+  if (isDirty.value && !(await saveDraft())) {
+    return;
+  }
+  const currentReport = report.value;
+  if (
+    currentReport === null ||
+    currentReport.id !== initialReportId ||
+    reportId.value !== initialReportId ||
+    isUnmounting
+  ) {
+    return;
+  }
+  const token = beginAIRequest(initialReportId);
+  try {
+    const value = await generateReportOutline(initialReportId, {
+      topic: currentReport.title,
+      instruction: instruction || null,
+      source_ids: allSourceIds(),
+    }, token.controller.signal);
+    if (!isCurrentAIRequest(token)) {
+      return;
+    }
+    aiPreview.value = { kind: "outline", value };
+  } catch (error) {
+    if (!isCurrentAIRequest(token) || token.controller.signal.aborted) {
+      return;
+    }
+    aiError.value = getUserFacingError(error, "大纲生成失败，请稍后重试。");
+  } finally {
+    finishAIRequest(token);
+  }
+}
+
+async function generateSectionDraft(instruction: string): Promise<void> {
+  const section = activeSection.value;
+  if (section === null) {
+    return;
+  }
+  const initialReportId = reportId.value;
+  const initialSectionId = section.id;
+  if (isDirty.value && !(await saveDraft())) {
+    return;
+  }
+  const currentSection = activeSection.value;
+  if (
+    currentSection === null ||
+    currentSection.id !== initialSectionId ||
+    reportId.value !== initialReportId ||
+    isUnmounting
+  ) {
+    return;
+  }
+  const token = beginAIRequest(initialReportId);
+  try {
+    const value = await generateReportSection(initialReportId, initialSectionId, {
+      instruction: instruction || null,
+      source_ids: selectedSourceIds(currentSection),
+    }, token.controller.signal);
+    if (!isCurrentAIRequest(token)) {
+      return;
+    }
+    aiPreview.value = { kind: "draft", value };
+  } catch (error) {
+    if (!isCurrentAIRequest(token) || token.controller.signal.aborted) {
+      return;
+    }
+    aiError.value = getUserFacingError(error, "章节生成失败，请稍后重试。");
+  } finally {
+    finishAIRequest(token);
+  }
+}
+
+async function editSectionDraft(
+  operation: "rewrite" | "expand" | "summarize",
+  instruction: string,
+): Promise<void> {
+  const section = activeSection.value;
+  if (section === null) {
+    return;
+  }
+  const initialReportId = reportId.value;
+  const initialSectionId = section.id;
+  if (isDirty.value && !(await saveDraft())) {
+    return;
+  }
+  const currentSection = activeSection.value;
+  if (
+    currentSection === null ||
+    currentSection.id !== initialSectionId ||
+    reportId.value !== initialReportId ||
+    isUnmounting
+  ) {
+    return;
+  }
+  const token = beginAIRequest(initialReportId);
+  try {
+    const value = await editReportSection(initialReportId, initialSectionId, {
+      operation,
+      instruction: instruction || null,
+      source_ids: selectedSourceIds(currentSection),
+    }, token.controller.signal);
+    if (!isCurrentAIRequest(token)) {
+      return;
+    }
+    aiPreview.value = { kind: "draft", value };
+  } catch (error) {
+    if (!isCurrentAIRequest(token) || token.controller.signal.aborted) {
+      return;
+    }
+    aiError.value = getUserFacingError(error, "章节处理失败，请稍后重试。");
+  } finally {
+    finishAIRequest(token);
+  }
+}
+
+async function acceptOutline(items: ReportAIOutlineItem[]): Promise<void> {
+  if (report.value === null || items.length === 0 || sectionBusy.value) {
+    return;
+  }
+  if (
+    report.value.sections.length > 0 &&
+    !window.confirm("确认将预览的大纲追加为报告章节吗？现有章节不会被覆盖。")
+  ) {
+    return;
+  }
+  sectionBusy.value = true;
+  aiError.value = null;
+  try {
+    let lastSectionId: string | null = null;
+    for (const item of items) {
+      const created = await createReportSection(reportId.value, {
+        title: item.title,
+        content: item.summary,
+      });
+      lastSectionId = created.id;
+    }
+    aiPreview.value = null;
+    await reportQuery.refetch();
+    activeSectionId.value = lastSectionId;
+    syncDrafts();
+  } catch (error) {
+    aiError.value = getUserFacingError(error, "大纲保存失败，请稍后重试。");
+  } finally {
+    sectionBusy.value = false;
+  }
+}
+
+function acceptDraft(draft: ReportAIDraftResponse): void {
+  draftContent.value = draft.content;
+  saveState.value = "idle";
+  aiError.value = null;
+  aiPreview.value = null;
+}
+
+function discardAIPreview(): void {
+  aiPreview.value = null;
+  aiError.value = null;
+}
+
+async function exportReport(format: "docx" | "pdf"): Promise<void> {
+  if (exportBusy.value !== null) {
+    return;
+  }
+  exportBusy.value = format;
+  actionError.value = null;
+  try {
+    const result = await downloadReportExport(reportId.value, format);
+    const url = URL.createObjectURL(result.blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.filename ?? `${draftReportTitle.value || "report"}.${format}`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    actionError.value = getUserFacingError(error, "导出失败，请稍后重试。");
+  } finally {
+    exportBusy.value = null;
   }
 }
 
@@ -589,6 +848,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("beforeunload", handleBeforeUnload);
   workspaceRun += 1;
   cancelSourceRequests();
+  cancelAIRequest();
   clearSourceResults();
 });
 </script>
@@ -610,6 +870,22 @@ onBeforeUnmount(() => {
         <span>{{ reportKnowledgeBaseName ?? "未关联知识库" }}</span>
         <span>·</span>
         <span>{{ reportDatasourceName ?? "未关联数据源" }}</span>
+        <button
+          type="button"
+          class="report-workspace-page__export"
+          :disabled="isBusy"
+          @click="exportReport('docx')"
+        >
+          {{ exportBusy === "docx" ? "导出中…" : "导出 DOCX" }}
+        </button>
+        <button
+          type="button"
+          class="report-workspace-page__export"
+          :disabled="isBusy"
+          @click="exportReport('pdf')"
+        >
+          {{ exportBusy === "pdf" ? "导出中…" : "导出 PDF" }}
+        </button>
       </div>
     </header>
 
@@ -656,6 +932,18 @@ onBeforeUnmount(() => {
         >
           {{ actionError }}
         </div>
+        <ReportAIPanel
+          :preview="aiPreview"
+          :busy="aiBusy"
+          :disabled="isBusy"
+          :error="aiError"
+          @generate-outline="generateOutline"
+          @generate-section="generateSectionDraft"
+          @edit="editSectionDraft"
+          @accept-outline="acceptOutline"
+          @accept-draft="acceptDraft"
+          @discard="discardAIPreview"
+        />
         <ReportPreview
           v-if="preview"
           :report="report"
@@ -751,9 +1039,25 @@ onBeforeUnmount(() => {
 .report-workspace-page__context {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 7px;
   color: var(--ks-muted);
   font-size: 12px;
+}
+
+.report-workspace-page__export {
+  min-height: 30px;
+  padding: 0 9px;
+  color: var(--ks-accent-strong);
+  background: var(--ks-accent-soft);
+  border: 1px solid var(--ks-border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.report-workspace-page__export:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .report-workspace {
