@@ -8,7 +8,7 @@ KnowledgeScope 将 PDF 转换为 parser-independent 的 `CanonicalDocument`，�
 完整来源 lineage 的 chunks、Evidence 和检索表示。系统返回的内容可以追溯到文档、页码、
 source block，以及适用时的原始图片或表格资产。
 
-[快速开始](#快速开始) · [系统架构](#系统架构) · [检索评测](#检索评测)
+[快速开始](#快速开始) · [产品流程](#产品流程) · [系统架构](#系统架构) · [检索评测](#检索评测)
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -63,6 +63,17 @@ Web 端的数据分析工作区复用同一条注册数据源、Eligibility、SQ
 以表格展示真实结果，并在数据形状合适时提供确定性图表。
 
 本地 MCP 客户端可以通过 stdio 调用 `chatbi_ask` 和 `chatbi_schema`，复用相同的注册数据源、Schema Discovery 与只读 ChatBI 流程。
+
+## 产品流程
+
+1. 在知识库中创建空间并上传 PDF，查看文档状态和解析结果。
+2. 在 AI 问答中选择知识库，获取流式回答和可回到原文页码、block 的引用。
+3. 在数据分析中选择已注册且启用的 PostgreSQL 数据源，提交问题并查看有界表格结果。
+4. 在报告创作中关联知识库和数据源，把检索证据或分析结果插入章节，继续编辑正文。
+5. AI 大纲和章节操作先生成可编辑预览；确认后再保存，报告可导出为 DOCX 或 PDF。
+
+问答和数据分析历史默认保存在当前浏览器会话中，报告正文、章节和来源引用才是服务端持久化内容。
+AI 生成内容来自当前报告已保存的来源，不替代人工核对；当前导出不会把原始图片资产嵌入文档。
 
 ## 系统架构
 
@@ -134,6 +145,8 @@ uv run alembic upgrade head
 uv run uvicorn knowledge_scope.api.app:app --reload
 ```
 
+`docker compose up -d` 只启动本地基础设施：PostgreSQL、Qdrant 和 Neo4j；API 与前端仍需按上面的命令和下一节分别启动，当前开发栈不依赖 Redis。
+
 API 默认地址为 `http://127.0.0.1:8000`。`.env` 仅用于本地配置并已被 Git 忽略；请不要
 在其中或其他仓库文件中提交密码、API key 或 token。
 
@@ -187,8 +200,11 @@ KnowledgeScope/
 | ChatBI SQL execution | [SQL Execution](docs/architecture/chatbi-sql-execution.md) |
 | ChatBI agent loop | [ChatBI Agent](docs/architecture/chatbi-agent.md) |
 | ChatBI 数据分析工作区 | [Analysis Workspace](docs/architecture/chatbi-analysis-workspace.md) |
+| 报告创作工作区 | [Report Workspace](docs/architecture/report-workspace.md) |
 | 本地 MCP 服务 | [MCP 服务](docs/architecture/mcp-server.md) |
 | 检索评测 | [Retrieval Evaluation](docs/benchmarks/a4-5-retrieval-evaluation.md) |
+| 本地产品演示 | [Demo Workflow](docs/validation/f4-demo-workflow.md) |
+| 浏览器冒烟清单 | [Browser Smoke](docs/validation/f4-browser-smoke.md) |
 | 开发记录 | [Project History](docs/development/project-history.md) |
 
 ## 路线图

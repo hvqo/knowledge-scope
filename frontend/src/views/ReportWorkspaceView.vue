@@ -56,6 +56,7 @@ const aiBusy = ref(false);
 const aiError = ref<string | null>(null);
 const exportBusy = ref<"docx" | "pdf" | null>(null);
 const activeAIController = ref<AbortController | null>(null);
+const activeExportController = ref<AbortController | null>(null);
 
 type AIPreview =
   | { kind: "outline"; value: ReportAIOutlineResponse }
@@ -133,6 +134,7 @@ let ragRun = 0;
 let chatBIRun = 0;
 let workspaceRun = 0;
 let aiRun = 0;
+let exportRun = 0;
 let isUnmounting = false;
 
 function syncDrafts(): void {
@@ -187,6 +189,13 @@ function cancelAIRequest(): void {
   aiBusy.value = false;
 }
 
+function cancelExportRequest(): void {
+  exportRun += 1;
+  activeExportController.value?.abort();
+  activeExportController.value = null;
+  exportBusy.value = null;
+}
+
 function beginAIRequest(targetReportId: string): AIRequestToken {
   aiRun += 1;
   activeAIController.value?.abort();
@@ -218,6 +227,7 @@ watch(reportId, (nextId, previousId) => {
     workspaceRun += 1;
     cancelSourceRequests();
     cancelAIRequest();
+    cancelExportRequest();
     clearSourceResults();
     activeSectionId.value = null;
     preview.value = false;
@@ -556,10 +566,17 @@ async function exportReport(format: "docx" | "pdf"): Promise<void> {
   if (exportBusy.value !== null) {
     return;
   }
+  const targetReportId = reportId.value;
+  const run = ++exportRun;
+  const controller = new AbortController();
+  activeExportController.value = controller;
   exportBusy.value = format;
   actionError.value = null;
   try {
-    const result = await downloadReportExport(reportId.value, format);
+    const result = await downloadReportExport(targetReportId, format, controller.signal);
+    if (run !== exportRun || isUnmounting || targetReportId !== reportId.value) {
+      return;
+    }
     const url = URL.createObjectURL(result.blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -567,9 +584,15 @@ async function exportReport(format: "docx" | "pdf"): Promise<void> {
     anchor.click();
     URL.revokeObjectURL(url);
   } catch (error) {
+    if (run !== exportRun || isUnmounting || controller.signal.aborted) {
+      return;
+    }
     actionError.value = getUserFacingError(error, "导出失败，请稍后重试。");
   } finally {
-    exportBusy.value = null;
+    if (run === exportRun) {
+      activeExportController.value = null;
+      exportBusy.value = null;
+    }
   }
 }
 
@@ -812,7 +835,7 @@ async function insertChatBI(question: string, chartSpec: ReportChartSpec | null)
 }
 
 async function removeReference(sourceId: string): Promise<void> {
-  if (sourceBusy.value) {
+  if (sourceBusy.value || !window.confirm("确认移除这条报告来源吗？正文内容不会自动删除。")) {
     return;
   }
   const run = workspaceRun;
@@ -849,6 +872,7 @@ onBeforeUnmount(() => {
   workspaceRun += 1;
   cancelSourceRequests();
   cancelAIRequest();
+  cancelExportRequest();
   clearSourceResults();
 });
 </script>
