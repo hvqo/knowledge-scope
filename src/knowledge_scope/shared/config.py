@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
     data_dir: Path = Path("data")
     max_upload_size_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    # Optional local root that holds the original PDFs of registered external corpora.
+    corpus_source_dir: Path | None = None
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     database_url: str = (
         "postgresql+asyncpg://knowledgescope:knowledgescope@127.0.0.1:5433/knowledgescope"
@@ -89,7 +91,7 @@ class Settings(BaseSettings):
     rag_candidate_limit: int = Field(default=10, ge=1, le=100)
     rag_rerank_limit: int = Field(default=5, ge=1, le=100)
     rag_context_budget_chars: int = Field(default=6_000, ge=1)
-    rag_max_tokens: int = Field(default=512, ge=1)
+    rag_max_tokens: int = Field(default=1_024, ge=1)
     graph_retrieval_max_seed_entities: int = Field(default=5, ge=1, le=50)
     graph_retrieval_max_hops: int = Field(default=2, ge=1, le=2)
     graph_retrieval_max_neighbors: int = Field(default=20, ge=1, le=100)
@@ -110,8 +112,8 @@ class Settings(BaseSettings):
     unified_sparse_candidate_limit: int = Field(default=20, ge=1, le=100)
     unified_graph_candidate_limit: int = Field(default=20, ge=1, le=500)
     unified_multimodal_candidate_limit: int = Field(default=20, ge=1, le=100)
-    unified_candidate_pool_limit: int = Field(default=80, ge=1, le=500)
-    unified_result_limit: int = Field(default=20, ge=1, le=500)
+    unified_candidate_pool_limit: int = Field(default=48, ge=1, le=500)
+    unified_result_limit: int = Field(default=8, ge=1, le=500)
     unified_rerank_text_max_chars: int = Field(default=6_000, ge=1, le=20_000)
     unified_failure_mode: Literal["strict", "degraded"] = "degraded"
     chatbi_max_rows: int = Field(default=1_000, ge=1, le=100_000)

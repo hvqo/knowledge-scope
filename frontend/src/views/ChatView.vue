@@ -145,6 +145,12 @@ function streamFailureMessage(category: string): string {
   if (category === "retrieval") {
     return "暂时无法读取当前知识库，请稍后重试。";
   }
+  if (category === "empty_output") {
+    return "模型未返回回答内容，请稍后重试。";
+  }
+  if (category === "truncated_output") {
+    return "回答生成达到长度限制，请稍后重试。";
+  }
   if (category === "request") {
     return "问题格式不正确，请调整后重试。";
   }
@@ -207,7 +213,7 @@ async function sendQuestion(query: string): Promise<void> {
 
   try {
     const stream = streamRagQuery(
-      { query, knowledge_base_id: knowledgeBaseId, retrieval_mode: "dense" },
+      { query, knowledge_base_id: knowledgeBaseId, retrieval_mode: "unified" },
       controller.signal,
     );
     for await (const event of stream) {
@@ -342,7 +348,7 @@ onBeforeUnmount(() => {
             <h2>{{ activeConversation?.title || "新对话" }}</h2>
             <span>基于当前知识库的资料回答</span>
           </div>
-          <span class="retrieval-badge">文本检索</span>
+          <span class="retrieval-badge">联合检索</span>
         </header>
         <ChatMessageList
           ref="messageListRef"

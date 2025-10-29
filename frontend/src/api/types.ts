@@ -61,6 +61,23 @@ export interface DocumentListResponse {
   offset: number;
 }
 
+export interface DocumentChunk {
+  chunk_id: string;
+  ordinal: number;
+  page_start: number;
+  page_end: number;
+  section_path: string[];
+  content_types: string[];
+  asset_refs: string[];
+  text: string;
+}
+
+export interface DocumentChunkListResponse {
+  document_id: string;
+  page_count: number | null;
+  items: DocumentChunk[];
+}
+
 export type ChatBIDataSourceDialect = "postgresql";
 
 export interface ChatBIDataSource {

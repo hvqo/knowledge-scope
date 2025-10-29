@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_scope.documents.models import (
+    DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX,
     DOCUMENT_MEDIA_TYPE_PDF,
     DOCUMENT_SOURCE_REF_MAX_LENGTH,
     DOCUMENT_STATUS_REGISTERED,
@@ -215,7 +216,7 @@ def _safe_source_ref(relative_path: str) -> str:
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
         raise CorpusRegistrationError("corpus source reference must be a safe relative path")
-    source_ref = f"benchmark/a1-5/{path.as_posix()}"
+    source_ref = f"{DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX}{path.as_posix()}"
     if len(source_ref) > DOCUMENT_SOURCE_REF_MAX_LENGTH:
         raise CorpusRegistrationError("corpus source reference is too long")
     return source_ref

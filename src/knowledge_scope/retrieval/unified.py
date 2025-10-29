@@ -127,8 +127,8 @@ class UnifiedRetrievalConfig(BaseModel):
     sparse_candidate_limit: StrictInt = Field(default=20, ge=1, le=100)
     graph_candidate_limit: StrictInt = Field(default=20, ge=1, le=500)
     multimodal_candidate_limit: StrictInt = Field(default=20, ge=1, le=100)
-    candidate_pool_limit: StrictInt = Field(default=80, ge=1, le=500)
-    result_limit: StrictInt = Field(default=20, ge=1, le=500)
+    candidate_pool_limit: StrictInt = Field(default=48, ge=1, le=500)
+    result_limit: StrictInt = Field(default=8, ge=1, le=500)
     rerank_text_max_chars: StrictInt = Field(default=6_000, ge=1, le=20_000)
     failure_mode: UnifiedFailureMode = "degraded"
     reranker_model_id: str = Field(default="BAAI/bge-reranker-v2-m3", min_length=1)
