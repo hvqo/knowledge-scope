@@ -12,7 +12,10 @@ defineProps<{
   escalated?: boolean;
 }>();
 
-const emit = defineEmits<{ selectCitation: [marker: string] }>();
+const emit = defineEmits<{
+  selectCitation: [marker: string];
+  previewCitation: [marker: string];
+}>();
 </script>
 
 <template>
@@ -68,6 +71,7 @@ const emit = defineEmits<{ selectCitation: [marker: string] }>();
         :selected="citation.marker === selectedMarker"
         :document-title="documentTitles[citation.document_id] ?? null"
         @select="emit('selectCitation', citation.marker)"
+        @preview="emit('previewCitation', citation.marker)"
       />
     </div>
   </aside>

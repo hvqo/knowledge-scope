@@ -16,6 +16,7 @@ import type {
   ChatMessageStatus,
   DocumentChunkListResponse,
   DocumentListResponse,
+  EvidenceDetail,
   GraphEntityDetail,
   GraphOverview,
   RAGRequestedRetrievalMode,
@@ -491,6 +492,25 @@ export function documentFileUrl(
 ): string {
   const base = `${API_BASE_URL}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/file`;
   return page === undefined ? base : `${base}#page=${page}`;
+}
+
+export function fetchEvidenceDetail(
+  knowledgeBaseId: string,
+  documentId: string,
+  evidenceId: string,
+): Promise<EvidenceDetail> {
+  return request<EvidenceDetail>(
+    `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/evidence/${encodeURIComponent(evidenceId)}`,
+  );
+}
+
+export function evidenceAssetUrl(
+  knowledgeBaseId: string,
+  documentId: string,
+  evidenceId: string,
+  assetIndex: number,
+): string {
+  return `${API_BASE_URL}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/evidence/${encodeURIComponent(evidenceId)}/assets/${assetIndex}`;
 }
 
 /** Confirm that the source PDF is readable before an iframe would render an error body. */

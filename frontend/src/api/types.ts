@@ -362,6 +362,44 @@ export interface RAGCitation {
   branch_provenance: RAGCitationBranch[];
 }
 
+export type EvidenceRepresentationType =
+  | "text"
+  | "caption"
+  | "context"
+  | "markdown"
+  | "html"
+  | "latex"
+  | "asset_ref"
+  | "visual_embedding_ref";
+
+export interface EvidenceRepresentationRecord {
+  representation_id: string;
+  representation_type: EvidenceRepresentationType;
+  content: string | null;
+  searchable: boolean;
+}
+
+export interface EvidenceAssetRecord {
+  index: number;
+  media_type: "image/jpeg" | "image/png" | "image/webp" | null;
+  size_bytes: number | null;
+  available: boolean;
+}
+
+export interface EvidenceDetail {
+  document_id: string;
+  knowledge_base_id: string;
+  evidence_id: string;
+  modality: RAGCitationModality;
+  page_start: number;
+  page_end: number;
+  source_block_ids: string[];
+  section_path: string[];
+  source_fingerprint: string;
+  representations: EvidenceRepresentationRecord[];
+  assets: EvidenceAssetRecord[];
+}
+
 export interface RAGCompleteData {
   status: RAGCompletionStatus;
   prompt_version: string;
