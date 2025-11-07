@@ -41,6 +41,8 @@ import type {
   RAGCitation,
   RAGCompleteData,
   RAGStreamEvent,
+  VisionAnalysisResult,
+  VisionAnalyzeRequest,
 } from "./types";
 
 const DEFAULT_API_BASE_URL = "/api";
@@ -511,6 +513,14 @@ export function evidenceAssetUrl(
   assetIndex: number,
 ): string {
   return `${API_BASE_URL}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/evidence/${encodeURIComponent(evidenceId)}/assets/${assetIndex}`;
+}
+
+/** Run one explicit vision task against one evidence asset; never sends arbitrary paths. */
+export function analyzeVision(payload: VisionAnalyzeRequest): Promise<VisionAnalysisResult> {
+  return request<VisionAnalysisResult>("/v1/vision/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 /** Confirm that the source PDF is readable before an iframe would render an error body. */
