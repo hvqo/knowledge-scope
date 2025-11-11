@@ -24,7 +24,7 @@ import {
   updateChatProject,
 } from "../api/client";
 import type { RAGHistoryTurn } from "../api/client";
-import type { ChatMessageView, RAGCitation, RAGStreamEvent } from "../api/types";
+import type { ChatMessageView, RAGCitation, RAGStreamEvent, RAGToolStatusData } from "../api/types";
 import MemoryDialog from "../components/chat/MemoryDialog.vue";
 import ChatComposer from "../components/chat/ChatComposer.vue";
 import ChatMessageList from "../components/chat/ChatMessageList.vue";
@@ -45,6 +45,7 @@ const isPreviewOpen = ref(false);
 const rewrittenQuery = ref<string | null>(null);
 const retrievalEscalated = ref(false);
 const isStreaming = ref(false);
+const agentSteps = ref<RAGToolStatusData[]>([]);
 const activeController = ref<AbortController | null>(null);
 let activeRun = 0;
 let isUnmounting = false;
@@ -475,6 +476,27 @@ function streamFailureMessage(category: string): string {
   return "回答生成未完成，请稍后重试。";
 }
 
+const AGENT_TOOL_LABELS: Record<RAGToolStatusData["tool"], string> = {
+  retrieval: "知识库检索",
+  analyze_image: "图片理解",
+  analyze_table: "表格计算",
+};
+
+const AGENT_STATUS_LABELS: Record<RAGToolStatusData["status"], string> = {
+  running: "进行中",
+  completed: "已完成",
+  failed: "未完成",
+  skipped: "已跳过",
+};
+
+function agentToolLabel(tool: RAGToolStatusData["tool"]): string {
+  return AGENT_TOOL_LABELS[tool];
+}
+
+function agentStatusLabel(status: RAGToolStatusData["status"]): string {
+  return AGENT_STATUS_LABELS[status];
+}
+
 function applyStreamEvent(event: RAGStreamEvent): void {
   const current = pendingMessage.value;
   if (current === null) {
@@ -482,6 +504,18 @@ function applyStreamEvent(event: RAGStreamEvent): void {
   }
   if (event.event === "answer_delta") {
     queueAnswerDelta(event.data.text);
+    return;
+  }
+  if (event.event === "tool_status") {
+    const step = event.data;
+    const existingIndex = agentSteps.value.findIndex(
+      (item) => item.step === step.step && item.tool === step.tool,
+    );
+    if (existingIndex >= 0) {
+      agentSteps.value.splice(existingIndex, 1, step);
+    } else {
+      agentSteps.value.push(step);
+    }
     return;
   }
   if (event.event === "citations") {
@@ -561,6 +595,7 @@ async function sendQuestion(question: string): Promise<void> {
   flushPacedText();
   paceBuffer = "";
   isStreaming.value = true;
+  agentSteps.value = [];
   selectedMarker.value = null;
   pendingMessage.value = {
     id: `pending-${run}`,
@@ -581,6 +616,7 @@ async function sendQuestion(question: string): Promise<void> {
         query: question,
         knowledge_base_id: knowledgeBaseId,
         retrieval_mode: chatStore.retrievalMode,
+        answer_mode: chatStore.answerMode,
         history,
       },
       controller.signal,
@@ -813,13 +849,39 @@ onBeforeUnmount(() => {
           先在左侧选择一个知识库，回答只会依据其中的资料生成。
         </div>
 
+        <div
+          v-if="isStreaming && chatStore.answerMode === 'agent' && agentSteps.length > 0"
+          class="agent-progress"
+          role="status"
+          aria-live="polite"
+        >
+          <p class="agent-progress__title">
+            <span aria-hidden="true">✦</span>
+            智能体正在梳理证据
+          </p>
+          <ol class="agent-progress__list">
+            <li
+              v-for="step in agentSteps"
+              :key="`${step.step}-${step.tool}`"
+              class="agent-progress__step"
+              :class="`is-${step.status}`"
+            >
+              <span class="agent-progress__tool">{{ agentToolLabel(step.tool) }}</span>
+              <span class="agent-progress__summary">{{ step.summary }}</span>
+              <span class="agent-progress__state">{{ agentStatusLabel(step.status) }}</span>
+            </li>
+          </ol>
+        </div>
+
         <ChatComposer
           :disabled="isStreaming"
           :can-send="canSend"
           :retrieval-mode="chatStore.retrievalMode"
+          :answer-mode="chatStore.answerMode"
           @send="sendQuestion"
           @stop="stopGeneration"
           @update:retrieval-mode="chatStore.setRetrievalMode"
+          @update:answer-mode="chatStore.setAnswerMode"
         />
       </main>
 
@@ -965,6 +1027,68 @@ onBeforeUnmount(() => {
   padding: 0 24px 10px;
   color: var(--ks-muted);
   font-size: 12px;
+}
+
+.agent-progress {
+  width: min(820px, 100%);
+  margin: 0 auto 6px;
+  padding: 10px 14px;
+  background: var(--ks-surface-subtle);
+  border: 1px solid var(--ks-border);
+  border-radius: var(--ks-radius-md);
+}
+
+.agent-progress__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  color: var(--ks-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-progress__list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-progress__step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--ks-muted);
+  font-size: 11px;
+}
+
+.agent-progress__tool {
+  flex: 0 0 auto;
+  color: var(--ks-ink);
+  font-weight: 650;
+}
+
+.agent-progress__summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-progress__state {
+  flex: 0 0 auto;
+  color: var(--ks-faint);
+}
+
+.agent-progress__step.is-running .agent-progress__state {
+  color: var(--ks-accent);
+}
+
+.agent-progress__step.is-failed .agent-progress__state {
+  color: var(--ks-danger);
 }
 
 .source-drawer {

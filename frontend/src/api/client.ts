@@ -40,7 +40,9 @@ import type {
   ReportUpdateRequest,
   RAGCitation,
   RAGCompleteData,
+  RAGAnswerMode,
   RAGStreamEvent,
+  RAGToolStatusData,
   VisionAnalysisResult,
   VisionAnalyzeRequest,
 } from "./types";
@@ -570,6 +572,7 @@ export interface RAGQueryRequest {
   query: string;
   knowledge_base_id: string;
   retrieval_mode?: RAGRequestedRetrievalMode;
+  answer_mode?: RAGAnswerMode;
   history?: RAGHistoryTurn[];
 }
 
@@ -603,6 +606,10 @@ function nullableFiniteNumber(value: unknown, field: string): number | null {
     return null;
   }
   return requiredFiniteNumber(value, field);
+}
+
+function isFiniteNumberValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function nullableBoolean(value: unknown, field: string): boolean | null {
@@ -1062,6 +1069,28 @@ function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent
       },
     };
   }
+  if (eventName === "tool_status") {
+    const tool = requiredString(parsed.tool, "tool");
+    if (tool !== "retrieval" && tool !== "analyze_image" && tool !== "analyze_table") {
+      throw new Error("RAG tool name is invalid");
+    }
+    const status = requiredString(parsed.status, "status");
+    if (
+      status !== "running" &&
+      status !== "completed" &&
+      status !== "failed" &&
+      status !== "skipped"
+    ) {
+      throw new Error("RAG tool status is invalid");
+    }
+    const data: RAGToolStatusData = {
+      tool,
+      status,
+      summary: requiredString(parsed.summary, "summary"),
+      step: requiredFiniteNumber(parsed.step, "step"),
+    };
+    return { event: "tool_status", data };
+  }
   if (eventName === "complete") {
     const status = requiredString(parsed.status, "status");
     if (status !== "completed" && status !== "insufficient_evidence" && status !== "error") {
@@ -1071,12 +1100,17 @@ function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent
     if (retrievalMode !== "dense" && retrievalMode !== "unified") {
       throw new Error("RAG retrieval mode is invalid");
     }
+    const answerMode = parsed.answer_mode === "agent" ? "agent" : "standard";
     const complete: RAGCompleteData = {
       status,
       prompt_version: requiredString(parsed.prompt_version, "prompt_version"),
       provider: nullableString(parsed.provider, "provider"),
       model: nullableString(parsed.model, "model"),
       retrieval_mode: retrievalMode,
+      answer_mode: answerMode,
+      tool_calls: isFiniteNumberValue(parsed.tool_calls)
+        ? requiredFiniteNumber(parsed.tool_calls, "tool_calls")
+        : 0,
       rewritten_query: nullableString(parsed.rewritten_query, "rewritten_query"),
       retrieval_cached: nullableBoolean(parsed.retrieval_cached, "retrieval_cached"),
       retrieval_escalated: nullableBoolean(parsed.retrieval_escalated, "retrieval_escalated"),

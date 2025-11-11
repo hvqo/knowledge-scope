@@ -457,12 +457,25 @@ export interface VisionAnalyzeRequest {
   question?: string | null;
 }
 
+export type RAGAnswerMode = "standard" | "agent";
+export type RAGToolName = "retrieval" | "analyze_image" | "analyze_table";
+export type RAGToolStatusValue = "running" | "completed" | "failed" | "skipped";
+
+export interface RAGToolStatusData {
+  tool: RAGToolName;
+  status: RAGToolStatusValue;
+  summary: string;
+  step: number;
+}
+
 export interface RAGCompleteData {
   status: RAGCompletionStatus;
   prompt_version: string;
   provider: string | null;
   model: string | null;
   retrieval_mode: RAGRetrievalMode;
+  answer_mode?: RAGAnswerMode;
+  tool_calls?: number;
   rewritten_query: string | null;
   retrieval_cached: boolean | null;
   retrieval_escalated: boolean | null;
@@ -485,6 +498,7 @@ export interface RAGCitationsData {
 export type RAGStreamEvent =
   | { event: "answer_delta"; data: { text: string } }
   | { event: "citations"; data: RAGCitationsData }
+  | { event: "tool_status"; data: RAGToolStatusData }
   | { event: "complete"; data: RAGCompleteData }
   | { event: "error"; data: { category: string; message: string } };
 

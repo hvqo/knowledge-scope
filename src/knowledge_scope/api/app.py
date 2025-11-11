@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from knowledge_scope import __version__
+from knowledge_scope.agent.service import AgentChatService
 from knowledge_scope.chat.api import router as chat_router
 from knowledge_scope.chat.workspace_api import router as chat_workspace_router
 from knowledge_scope.chatbi.agent import ChatBIAgentLimits, ChatBIAgentService
@@ -49,8 +50,10 @@ from knowledge_scope.retrieval.unified import UnifiedRetrievalConfig, UnifiedRet
 from knowledge_scope.shared import build_health_report, get_settings
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import create_database_engine, create_session_factory
+from knowledge_scope.table_analysis.service import TableAnalysisService
 from knowledge_scope.vision.errors import VisionConfigurationError
 from knowledge_scope.vision.provider import VLMProvider, create_vlm_provider
+from knowledge_scope.vision.service import VisionAnalysisService
 
 from .documents import router as documents_router
 from .knowledge_bases import router as knowledge_bases_router
@@ -70,6 +73,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Initialize the default RAG graph and dispose owned clients on shutdown."""
     provider = None
     owned_vlm_provider: VLMProvider | None = None
+    unified_retrieval: UnifiedRetrievalService | None = None
     runtime_settings: Settings = application.state.settings
     if application.state.vlm_provider is None and runtime_settings.vlm_enabled:
         try:
@@ -161,6 +165,25 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 cache=create_retrieval_cache(settings),
                 rewrite=QueryRewriteService(gateway, settings),
             )
+            application.state.unified_retrieval = unified_retrieval
+        if (
+            application.state.agent_service is None
+            and runtime_settings.agent_enabled
+            and unified_retrieval is not None
+        ):
+            if gateway is None:  # pragma: no cover - provider is created above.
+                raise RuntimeError("LLM gateway is not initialized")
+            application.state.agent_service = AgentChatService(
+                runtime_settings,
+                gateway=gateway,
+                unified_retrieval=unified_retrieval,
+                vision_service=VisionAnalysisService(
+                    runtime_settings,
+                    application.state.vlm_provider,
+                ),
+                table_service=TableAnalysisService(runtime_settings),
+                rag_service=application.state.rag_service,
+            )
         if application.state.chatbi_agent_service is None:
             settings = application.state.settings
             if gateway is None:  # pragma: no cover - provider is created above.
@@ -221,6 +244,7 @@ def create_app(
     chatbi_agent_service: ChatBIAgentService | None = None,
     llm_gateway: LLMGateway | None = None,
     vlm_provider: VLMProvider | None = None,
+    agent_service: AgentChatService | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -247,6 +271,8 @@ def create_app(
     application.state.report_generation_service = None
     application.state.llm_provider = None
     application.state.vlm_provider = vlm_provider
+    application.state.agent_service = agent_service
+    application.state.unified_retrieval = None
     application.add_middleware(
         CORSMiddleware,
         allow_origins=runtime_settings.cors_origins,
