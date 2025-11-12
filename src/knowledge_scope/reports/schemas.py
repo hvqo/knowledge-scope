@@ -254,6 +254,27 @@ class ReportSourceInsertCreate(_ReportModel):
         return _trimmed(value, "content_append")
 
 
+class ReportAgentAnswerInsertCreate(_ReportModel):
+    """Insert one agent answer plus its validated Evidence references."""
+
+    content_append: str = Field(
+        min_length=1,
+        max_length=REPORT_SECTION_CONTENT_MAX_LENGTH,
+    )
+    sources: list[ReportRagSourceCreate] = Field(min_length=1, max_length=12)
+
+    @field_validator("content_append")
+    @classmethod
+    def normalize_content_append(cls, value: str) -> str:
+        return _trimmed(value, "content_append")
+
+
+class ReportAgentAnswerInsertResponse(_ReportModel):
+    section: ReportSectionResponse
+    sources: list[ReportSourceReferenceResponse]
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+
+
 class ReportSourceReferenceResponse(_ReportModel):
     id: UUID
     section_id: UUID

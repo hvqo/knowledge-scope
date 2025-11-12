@@ -240,10 +240,15 @@ describe("chat messages", () => {
 
     expect(wrapper.text()).toContain("产品有哪些质量要求？");
     expect(wrapper.text()).toContain("需要满足三点要求");
-    expect(wrapper.findAll(".message-action")).toHaveLength(2);
+    expect(wrapper.findAll(".message-action")).toHaveLength(3);
 
     await wrapper.findAll(".message-action")[1].trigger("click");
     expect(wrapper.emitted("openSources")?.[0]).toEqual([[citation]]);
+
+    await wrapper.findAll(".message-action")[2].trigger("click");
+    expect(wrapper.emitted("insertReport")?.[0]).toEqual([
+      { content: "需要满足三点要求 [C1]", citations: [citation] },
+    ]);
 
     await wrapper.get(".citation-marker").trigger("click");
     expect(wrapper.emitted("selectCitation")?.[0]).toEqual(["C1", [citation]]);

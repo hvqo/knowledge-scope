@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
-import { ElMessage } from "element-plus";
+import { ElDialog, ElMessage, ElOption, ElSelect } from "element-plus";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 
 import {
@@ -18,13 +18,22 @@ import {
   fetchChatProjects,
   fetchDocuments,
   fetchKnowledgeBases,
+  fetchReport,
+  fetchReports,
   getUserFacingError,
+  insertAgentAnswer,
   streamRagQuery,
   updateChatConversation,
   updateChatProject,
 } from "../api/client";
 import type { RAGHistoryTurn } from "../api/client";
-import type { ChatMessageView, RAGCitation, RAGStreamEvent, RAGToolStatusData } from "../api/types";
+import type {
+  ChatMessageView,
+  RAGCitation,
+  RAGStreamEvent,
+  RAGToolStatusData,
+  ReportSourceCreateRequest,
+} from "../api/types";
 import MemoryDialog from "../components/chat/MemoryDialog.vue";
 import ChatComposer from "../components/chat/ChatComposer.vue";
 import ChatMessageList from "../components/chat/ChatMessageList.vue";
@@ -735,6 +744,113 @@ function openLastSources(): void {
   openSources(lastAssistantCitations.value);
 }
 
+interface InsertableAgentAnswer {
+  content: string;
+  citations: RAGCitation[];
+}
+
+const isInsertOpen = ref(false);
+const insertAnswer = ref<InsertableAgentAnswer | null>(null);
+const insertReportId = ref<string | null>(null);
+const insertSectionId = ref<string | null>(null);
+const isInserting = ref(false);
+
+const insertReportsQuery = useQuery({
+  queryKey: ["insert-report-options"],
+  queryFn: () => fetchReports({ limit: 50 }),
+  enabled: computed(() => isInsertOpen.value),
+  staleTime: 15_000,
+});
+
+const insertReportDetailQuery = useQuery({
+  queryKey: computed(() => ["insert-report-detail", insertReportId.value]),
+  queryFn: () => fetchReport(insertReportId.value as string),
+  enabled: computed(() => isInsertOpen.value && insertReportId.value !== null),
+  staleTime: 15_000,
+});
+
+const insertReportOptions = computed(() => insertReportsQuery.data.value?.items ?? []);
+const insertSections = computed(() => insertReportDetailQuery.data.value?.sections ?? []);
+
+watch(insertReportId, () => {
+  insertSectionId.value = null;
+});
+
+function openInsertReport(agentAnswer: InsertableAgentAnswer): void {
+  insertAnswer.value = agentAnswer;
+  insertReportId.value = null;
+  insertSectionId.value = null;
+  isInsertOpen.value = true;
+}
+
+/** Mirror the citation lineage into the existing report source contract. */
+function buildInsertSources(citations: RAGCitation[]): ReportSourceCreateRequest[] {
+  const sources: ReportSourceCreateRequest[] = [];
+  const seen = new Set<string>();
+  for (const citation of citations) {
+    if (
+      citation.knowledge_base_id === null ||
+      (citation.evidence_id === null && citation.chunk_id === null)
+    ) {
+      continue;
+    }
+    const key = citation.evidence_id ?? citation.chunk_id ?? "";
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const pageStart = citation.page_start ?? 1;
+    const snippet = (citation.snippet ?? "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 500);
+    sources.push({
+      kind: "rag_evidence",
+      title: citation.section_title?.trim() || `来源 ${citation.marker}`,
+      knowledge_base_id: citation.knowledge_base_id,
+      document_id: citation.document_id,
+      evidence_id: citation.evidence_id,
+      chunk_id: citation.chunk_id,
+      document_title: documentTitles.value[citation.document_id] ?? citation.document_id,
+      page_start: pageStart,
+      page_end: citation.page_end ?? pageStart,
+      evidence_type: citation.modality ?? "text",
+      snippet: snippet || null,
+      section_path: citation.section_path,
+      source_block_ids: citation.source_block_ids,
+    });
+  }
+  return sources;
+}
+
+async function confirmInsertReport(): Promise<void> {
+  if (
+    insertAnswer.value === null ||
+    insertReportId.value === null ||
+    insertSectionId.value === null
+  ) {
+    return;
+  }
+  isInserting.value = true;
+  try {
+    const response = await insertAgentAnswer(insertReportId.value, insertSectionId.value, {
+      content_append: insertAnswer.value.content,
+      sources: buildInsertSources(insertAnswer.value.citations),
+    });
+    if (response.warnings.length > 0) {
+      ElMessage.warning(response.warnings.join("；"));
+    } else {
+      ElMessage.success("已插入报告并关联来源");
+    }
+    isInsertOpen.value = false;
+  } catch (error) {
+    ElMessage.error(getUserFacingError(error, "插入报告失败，请稍后重试。"));
+  } finally {
+    isInserting.value = false;
+  }
+}
+
 function retryConversations(): void {
   void conversationsQuery.refetch();
 }
@@ -838,6 +954,7 @@ onBeforeUnmount(() => {
           @select-citation="selectCitation"
           @select-prompt="applyPrompt"
           @open-sources="openSources"
+          @insert-report="openInsertReport"
         />
 
         <div
@@ -916,6 +1033,79 @@ onBeforeUnmount(() => {
           previewCitation ? documentTitles[previewCitation.document_id] ?? null : null
         "
       />
+
+      <ElDialog
+        v-model="isInsertOpen"
+        title="插入报告"
+        width="min(560px, 94vw)"
+        destroy-on-close
+      >
+        <div class="insert-report">
+          <p class="insert-report__hint">
+            将当前回答写入已有报告的小节，并关联回答实际引用的证据来源。
+          </p>
+          <label class="insert-report__field">
+            <span>目标报告</span>
+            <ElSelect
+              v-model="insertReportId"
+              class="insert-report__select"
+              placeholder="选择报告"
+              filterable
+              :loading="insertReportsQuery.isPending.value"
+            >
+              <ElOption
+                v-for="report in insertReportOptions"
+                :key="report.id"
+                :label="report.title"
+                :value="report.id"
+              />
+            </ElSelect>
+          </label>
+          <label class="insert-report__field">
+            <span>目标小节</span>
+            <ElSelect
+              v-model="insertSectionId"
+              class="insert-report__select"
+              placeholder="选择小节"
+              :disabled="insertReportId === null"
+              :loading="insertReportDetailQuery.isPending.value"
+            >
+              <ElOption
+                v-for="section in insertSections"
+                :key="section.id"
+                :label="section.title"
+                :value="section.id"
+              />
+            </ElSelect>
+          </label>
+          <p
+            v-if="insertAnswer !== null"
+            class="insert-report__preview"
+          >
+            将插入 {{ insertAnswer.content.length }} 字回答与
+            {{ buildInsertSources(insertAnswer.citations).length }} 条来源。
+          </p>
+        </div>
+        <template #footer>
+          <button
+            type="button"
+            class="insert-report__button is-ghost"
+            @click="isInsertOpen = false"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="insert-report__button"
+            :disabled="
+              insertReportId === null || insertSectionId === null || isInserting
+            "
+            @click="confirmInsertReport"
+          >
+            {{ isInserting ? "插入中…" : "插入报告" }}
+          </button>
+        </template>
+      </ElDialog>
     </div>
   </section>
 </template>
@@ -1158,4 +1348,73 @@ onBeforeUnmount(() => {
     height: calc(100vh - 72px);
   }
 }
+
+.insert-report {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.insert-report__hint {
+  margin: 0;
+  color: var(--ks-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.insert-report__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--ks-text);
+  font-size: 13px;
+}
+
+.insert-report__select {
+  width: 100%;
+}
+
+.insert-report__preview {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--ks-text);
+  background: var(--ks-surface-alt);
+  border: 1px solid var(--ks-border);
+  border-radius: var(--ks-radius-md);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.insert-report__button {
+  padding: 8px 16px;
+  color: #fff;
+  background: var(--ks-accent);
+  border: 1px solid transparent;
+  border-radius: var(--ks-radius-md);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.insert-report__button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.insert-report__button.is-ghost {
+  color: var(--ks-text);
+  background: transparent;
+  border-color: var(--ks-border);
+}
+
+.insert-report__button:focus-visible {
+  outline: 2px solid var(--ks-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .insert-report__button {
+    transition: none;
+  }
+}
+
 </style>

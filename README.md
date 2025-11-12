@@ -44,6 +44,23 @@ text、image、table、formula 都可以作为 Evidence 来源，并拥有多个
 
 前端 AI 问答工作区连接现有 RAG SSE 接口，支持选择知识库、流式回答和可回看的来源卡片。对话暂存于当前浏览器会话，引用保留文档、页码和 source block lineage。
 
+### 多模态智能体问答
+
+「✦ 智能体」模式在标准 RAG 之上增加一个受限的规划循环：DeepSeek Flash 先阅读本轮检索候选，
+最多执行 3 次固定工具调用——`analyze_image`（视觉理解/图表分析/图片型表格提取）、
+`analyze_table`（PDF 表格的确定性统计与跨表对比）、以及内部的知识库检索。
+表格数值只能来自 `TableAnalysisService` 的真实计算结果，前端会展示「知识库检索 / 图片理解 / 表格计算」
+的实时工具进度；最终回答只保留被实际引用或工具实际使用的 Evidence，应用会过滤模型自造的
+`[C999]` 这类无效 citation marker。规划失败、超时或工具不可用时显式降级为标准检索回答，
+并在 complete 事件中保留 `agent_degraded`、真实 `tool_calls` 与工具 trace。
+
+### 分析结果写入报告
+
+智能体回答和标准 RAG 回答都可以通过回答下方的「插入报告」写进已有报告的小节：
+前端把回答正文与真实 citation lineage 一并提交，服务端再次校验知识库、文档和 Evidence 页码/来源块，
+校验通过后追加正文并保存 `rag_evidence` 来源；历史文档缺少解析产物时以 warning 方式保留引用信息，
+不会伪造 Evidence 元数据。当前导出不会把原始图片资产嵌入 DOCX/PDF。
+
 ### 以评测为约束
 
 检索路径提供只读、可复现的离线评测和消融记录。评测使用冻结的标注、索引和数据快照，
@@ -69,7 +86,7 @@ Web 端的数据分析工作区复用同一条注册数据源、Eligibility、SQ
 1. 在知识库中创建空间并上传 PDF，查看文档状态和解析结果。
 2. 在 AI 问答中选择知识库，获取流式回答和可回到原文页码、block 的引用。
 3. 在数据分析中选择已注册且启用的 PostgreSQL 数据源，提交问题并查看有界表格结果。
-4. 在报告创作中关联知识库和数据源，把检索证据或分析结果插入章节，继续编辑正文。
+4. 在报告创作中关联知识库和数据源，把检索证据、智能体回答或分析结果插入章节，继续编辑正文。
 5. AI 大纲和章节操作先生成可编辑预览；确认后再保存，报告可导出为 DOCX 或 PDF。
 
 问答和数据分析历史默认保存在当前浏览器会话中，报告正文、章节和来源引用才是服务端持久化内容。
@@ -193,6 +210,9 @@ KnowledgeScope/
 | 规范化文档模型 | [CanonicalDocument](docs/architecture/canonical-document-model.md) |
 | 结构感知分块 | [CanonicalDocument → Chunk](docs/architecture/canonical-document-chunking.md) |
 | RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
+| 多模态智能体问答 | [Agentic RAG](docs/architecture/agentic-rag.md) |
+| PDF 表格结构化计算 | [Table Analysis](docs/architecture/table-analysis.md) |
+| VLM 视觉理解 | [Vision Analysis](docs/architecture/vision-analysis.md) |
 | 对话工作区（持久化） | [Chat Workspace](docs/architecture/chat-workspace.md) |
 | 知识图谱检索 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
 | 知识图谱可视化 | [Knowledge Graph View](docs/architecture/knowledge-graph-view.md) |
@@ -205,6 +225,7 @@ KnowledgeScope/
 | 报告创作工作区 | [Report Workspace](docs/architecture/report-workspace.md) |
 | 本地 MCP 服务 | [MCP 服务](docs/architecture/mcp-server.md) |
 | 检索评测 | [Retrieval Evaluation](docs/benchmarks/a4-5-retrieval-evaluation.md) |
+| 多模态智能体评测 | [M5 Evaluation](docs/benchmarks/multimodal-agentic-rag-m5-evaluation.md) |
 | 本地产品演示 | [Demo Workflow](docs/validation/f4-demo-workflow.md) |
 | 浏览器冒烟清单 | [Browser Smoke](docs/validation/f4-browser-smoke.md) |
 | 开发记录 | [Project History](docs/development/project-history.md) |
@@ -213,9 +234,9 @@ KnowledgeScope/
 
 路线图列出尚未进入产品表面的工作：
 
-- 面向更复杂任务的 Agent 工具循环；
 - 更完整的 GraphRAG 与跨文档实体链接评测；
-- 视觉 embedding、OCR/LLM caption 规模化生成，以及更严格的多模态质量评测。
+- 视觉 embedding、OCR/LLM caption 规模化生成，以及更严格的多模态质量评测；
+- 多工具并行、更长任务的智能体规划，以及历史资产缺失时的自动回填。
 
 详细实现背景、协议限制和历史记录分别保存在 `docs/architecture/`、`docs/benchmarks/`
 和 [Project History](docs/development/project-history.md) 中。
@@ -233,3 +254,21 @@ export KNOWLEDGE_SCOPE_RAG_CACHE_URL=redis://127.0.0.1:6379/0
 ```
 
 Redis 不可用或未安装客户端时，服务会自动退回进程内缓存并继续工作；`KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=off` 可以完全关闭。
+
+## 多模态智能体配置（可选）
+
+智能体模式默认启用，规划与回答复用现有 DeepSeek 配置；图片理解需要额外配置一个 OpenAI 兼容的
+视觉模型服务（默认关闭）。下面以本地 Ollama `qwen3-vl:8b` 为例：
+
+```bash
+export KNOWLEDGE_SCOPE_AGENT_ENABLED=true
+export KNOWLEDGE_SCOPE_VLM_ENABLED=true
+export KNOWLEDGE_SCOPE_VLM_BASE_URL=http://127.0.0.1:11434/v1
+export KNOWLEDGE_SCOPE_VLM_MODEL=qwen3-vl:8b
+# 思考型模型建议关闭推理并留足输出预算，否则 JSON 可能被截断
+export KNOWLEDGE_SCOPE_VLM_REASONING_EFFORT=none
+export KNOWLEDGE_SCOPE_VLM_MAX_OUTPUT_TOKENS=4096
+```
+
+未启用 VLM 时，标准问答和表格计算仍可用，图片理解会返回受控的 `vlm_not_configured`
+失败状态而不会伪造视觉结论。智能体单轮默认墙钟上限 180 秒（`KNOWLEDGE_SCOPE_AGENT_TIMEOUT_SECONDS`）。
