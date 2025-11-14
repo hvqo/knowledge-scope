@@ -2,174 +2,131 @@
 
 # KnowledgeScope
 
-面向复杂文档的可追溯知识检索与 RAG 系统。
+**面向 PDF 的可追溯多模态 RAG 与智能体问答平台。**
 
-KnowledgeScope 将 PDF 转换为 parser-independent 的 `CanonicalDocument`，再生成带有
-完整来源 lineage 的 chunks、Evidence 和检索表示。系统返回的内容可以追溯到文档、页码、
-source block，以及适用时的原始图片或表格资产。
+KnowledgeScope 把 PDF 解析为解析器无关的 `CanonicalDocument`，在文本、图片、表格和公式之上构建
+带完整来源 lineage 的 chunks 与 Evidence，并提供统一检索、受限工具调用的智能体问答，以及把
+带来源的分析结果写回报告的完整闭环。
 
-[快速开始](#快速开始) · [产品流程](#产品流程) · [系统架构](#系统架构) · [检索评测](#检索评测)
+[快速开始](#快速开始) · [核心能力](#核心能力) · [系统架构](#系统架构) · [评测](#评测) · [文档](#文档)
 
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Vue 3](https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white)](https://vuejs.org/)
+[![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white)](https://vuejs.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Qdrant](https://img.shields.io/badge/Qdrant-Vector%20Store-DC244C)](https://qdrant.tech/)
-[![Neo4j](https://img.shields.io/badge/Neo4j-Graph-4581C3?logo=neo4j&logoColor=white)](https://neo4j.com/)
+[![Neo4j](https://img.shields.io/badge/Neo4j-5-4581C3?logo=neo4j&logoColor=white)](https://neo4j.com/)
+[![MinerU](https://img.shields.io/badge/MinerU-PDF%20Parsing-7C3AED)](https://github.com/opendatalab/MinerU)
+
+## 简介
+
+大多数 RAG 系统只擅长处理"一段文本"。真实业务文档中的图、表、公式和跨页结构，往往才是
+问题的核心；而一句看似流畅的回答，如果无法指回原文的具体页码与来源块，也很难真正用于核验。
+
+KnowledgeScope 围绕两个目标设计：
+
+- **让每个回答可追溯**：回答中的 citation 由应用生成，可回到文档、页码、source block 与
+  Evidence；表格计算结果来自确定性工具，图片结论来自可配置的视觉模型并标注复核提示。
+- **让多模态真正进入业务闭环**：从 PDF 解析、混合检索、智能体工具调用，到把分析结果插入
+  报告并导出 DOCX/PDF，整条链路在同一个系统中完成。
+
+系统保留 FastAPI、Vue、PostgreSQL、Qdrant、Neo4j 与 MinerU 的技术栈，不引入额外的
+Agent 框架；派生索引均可重建，业务数据与检索数据分层存放。
 
 ## 核心能力
 
-### 文档理解
-
-MinerU 解析 PDF，输出与解析器无关的 `CanonicalDocument`。页面、标题、正文、表格、
-公式和图片都保留规范化的页码、block 与资产 lineage；结构化分块产生可重复的 `Chunk`。
-
-### 混合检索
-
-Dense、BM25 Sparse 和 Knowledge Graph 分支分别生成候选。Qdrant、SQLite 和 Neo4j 保存
-各自的派生索引，查询结果保留 `knowledge_base_id`、文档、页面、chunk 和 source block。
-
-### 多模态 Evidence
-
-text、image、table、formula 都可以作为 Evidence 来源，并拥有多个文本化 representation，
-例如表格 Markdown、公式 LaTeX、图片 caption 或附近上下文。representation 只用于搜索，
-权威内容仍来自 Evidence；系统不把图片本身当作文本，也不声称已具备视觉 embedding 检索。
-
-### 证据约束的 RAG
-
-统一候选池交给 BGE final reranker，再组装 RAG context。应用生成确定性的 citation marker，
-每个 citation 都能回到真实的 document/page/block/evidence lineage。
-
-### AI 问答
-
-前端 AI 问答工作区连接现有 RAG SSE 接口，支持选择知识库、流式回答和可回看的来源卡片。对话暂存于当前浏览器会话，引用保留文档、页码和 source block lineage。
-
-### 多模态智能体问答
-
-「✦ 智能体」模式在标准 RAG 之上增加一个受限的规划循环：DeepSeek Flash 先阅读本轮检索候选，
-最多执行 3 次固定工具调用——`analyze_image`（视觉理解/图表分析/图片型表格提取）、
-`analyze_table`（PDF 表格的确定性统计与跨表对比）、以及内部的知识库检索。
-表格数值只能来自 `TableAnalysisService` 的真实计算结果，前端会展示「知识库检索 / 图片理解 / 表格计算」
-的实时工具进度；最终回答只保留被实际引用或工具实际使用的 Evidence，应用会过滤模型自造的
-`[C999]` 这类无效 citation marker。规划失败、超时或工具不可用时显式降级为标准检索回答，
-并在 complete 事件中保留 `agent_degraded`、真实 `tool_calls` 与工具 trace。
-
-### 分析结果写入报告
-
-智能体回答和标准 RAG 回答都可以通过回答下方的「插入报告」写进已有报告的小节：
-前端把回答正文与真实 citation lineage 一并提交，服务端再次校验知识库、文档和 Evidence 页码/来源块，
-校验通过后追加正文并保存 `rag_evidence` 来源；历史文档缺少解析产物时以 warning 方式保留引用信息，
-不会伪造 Evidence 元数据。当前导出不会把原始图片资产嵌入 DOCX/PDF。
-
-### 以评测为约束
-
-检索路径提供只读、可复现的离线评测和消融记录。评测使用冻结的标注、索引和数据快照，
-结果用于比较具体配置，不替代生产环境的质量或延迟承诺。
-
-### ChatBI schema
-
-外部 PostgreSQL 数据源可读取表、视图、字段、主外键与注释，并生成用于后续数据分析的结构化 Schema Context。
-
-### ChatBI SQL
-
-已注册的数据源可以通过 `knowledgescope chatbi execute <datasource_id> <sql>` 执行受策略约束的只读查询，返回有界、JSON-safe 的表格结果和执行审计信息。
-
-已注册的数据源也可以通过 `knowledgescope chatbi ask <datasource_id> <question>` 完成有界的 SQL 生成、只读执行和结果分析。
-
-Web 端的数据分析工作区复用同一条注册数据源、Eligibility、SQL 校验、只读执行和结果分析链路，
-以表格展示真实结果，并在数据形状合适时提供确定性图表。
-
-本地 MCP 客户端可以通过 stdio 调用 `chatbi_ask` 和 `chatbi_schema`，复用相同的注册数据源、Schema Discovery 与只读 ChatBI 流程。
-
-## 产品流程
-
-1. 在知识库中创建空间并上传 PDF，查看文档状态和解析结果。
-2. 在 AI 问答中选择知识库，获取流式回答和可回到原文页码、block 的引用。
-3. 在数据分析中选择已注册且启用的 PostgreSQL 数据源，提交问题并查看有界表格结果。
-4. 在报告创作中关联知识库和数据源，把检索证据、智能体回答或分析结果插入章节，继续编辑正文。
-5. AI 大纲和章节操作先生成可编辑预览；确认后再保存，报告可导出为 DOCX 或 PDF。
-
-问答和数据分析历史默认保存在当前浏览器会话中，报告正文、章节和来源引用才是服务端持久化内容。
-AI 生成内容来自当前报告已保存的来源，不替代人工核对；当前导出不会把原始图片资产嵌入文档。
+| 能力 | 说明 |
+| --- | --- |
+| **文档解析** | MinerU 解析 PDF，输出 `CanonicalDocument`；标题、正文、表格、公式、图片均保留页码、block 与资产 lineage。 |
+| **结构化分块** | 基于规范文档生成可重复的结构感知 chunk，保留章节、页码、来源块与跨 block 关系。 |
+| **多模态 Evidence** | text / image / table / formula 均可作为 Evidence，并拥有 caption、上下文、Markdown、LaTeX 等可搜索表示；权威内容始终回指 Evidence。 |
+| **混合检索** | Dense（Qdrant）、BM25 Sparse（SQLite）、知识图谱（Neo4j）与多模态表示四路候选，经统一候选池与本地 reranker 重排。 |
+| **证据约束 RAG** | 统一上下文组装、确定性 citation marker、流式 SSE 回答；引用保留文档、页码、block 与 Evidence lineage。 |
+| **智能体问答** | 「✦ 智能体」模式在检索候选之上进行受限规划，最多执行 3 次工具调用；可用工具为图片理解/图表分析、PDF 表格确定性统计，知识库检索作为固定前置步骤。 |
+| **视觉理解（可选）** | 通过 OpenAI 兼容协议接入独立 VLM，支持图片描述、图表趋势分析、图片型表格提取；结果始终标注需人工核对。 |
+| **表格计算** | 将 PDF 表格解析为结构化数据，支持筛选、排序、汇总、增长率与跨表/跨文档对比；全部使用确定性规则计算，拒绝不可靠的复杂合并单元格。 |
+| **报告创作** | 标准 RAG 或智能体回答可一键「插入报告」，同时写入真实来源；报告支持编辑、AI 辅助写作与 DOCX/PDF 导出。 |
+| **数据分析** | 已注册的外部 PostgreSQL 数据源可通过受策略约束的只读 SQL 查询与 ChatBI 工作区分析，并支持本地 stdio MCP 调用。 |
+| **知识图谱** | 从文档抽取实体与关系，提供图检索、实体链接与知识图谱可视化。 |
 
 ## 系统架构
 
 ```mermaid
 flowchart LR
-    PDF["PDF"] --> Parsing["MinerU parsing"]
-    Parsing --> Canonical["CanonicalDocument"]
-    Canonical --> Chunks["Chunks"]
-    Canonical --> Evidence["Multimodal Evidence"]
-    Chunks --> Dense["Dense"]
-    Chunks --> Sparse["BM25 Sparse"]
-    Chunks --> Graph["Knowledge Graph"]
-    Evidence --> Multi["Multi-Representation"]
-    Dense --> Pool["Unified Candidate Pool"]
+    PDF["PDF 文档"] --> MinerU["MinerU 解析"]
+    MinerU --> Canonical["CanonicalDocument"]
+    Canonical --> Chunk["结构感知 Chunk"]
+    Canonical --> Evidence["多模态 Evidence"]
+
+    Chunk --> Dense["Dense 检索"]
+    Chunk --> Sparse["BM25 Sparse 检索"]
+    Chunk --> Graph["图谱检索"]
+    Evidence --> Reps["多模态表示索引"]
+
+    Dense --> Pool["统一候选池"]
     Sparse --> Pool
     Graph --> Pool
-    Multi --> Pool
-    Pool --> Reranker["BGE Final Reranker"]
-    Reranker --> RAG["RAG Context + Authoritative Citations"]
+    Reps --> Pool
+    Pool --> Rerank["本地 Reranker 重排"]
+
+    Rerank --> Citations["上下文 + 权威 Citations"]
+    Citations --> RAG["RAG 流式回答"]
+    Citations --> Agent["智能体规划循环"]
+    Agent --> Vision["图片 / 图表理解"]
+    Agent --> Table["表格确定性计算"]
+    RAG --> Report["报告创作"]
+    Agent --> Report
+    Report --> Export["DOCX / PDF 导出"]
+
+    subgraph Storage["存储层"]
+        PG[("PostgreSQL<br/>业务元数据")]
+        QD[("Qdrant<br/>Dense + 多模态向量")]
+        N4[("Neo4j<br/>知识图谱")]
+        SQ[("SQLite<br/>Sparse 索引")]
+    end
+    Chunk --> PG
+    Dense --> QD
+    Reps --> QD
+    Sparse --> SQ
+    Graph --> N4
 ```
 
-所有索引都是可重建的派生状态。PostgreSQL 保存应用元数据，Qdrant 保存向量，Neo4j 保存
-有证据支撑的图数据，SQLite 保存 Sparse index；这些跨存储操作不构成分布式原子事务。
-
-## 系统快照
-
-以下数字描述仓库使用的 corpus/index 快照，不是生产规模上限：
-
-| 对象 | 数量 |
-| --- | ---: |
-| unique documents | 255 |
-| canonical blocks | 46,504 |
-| chunks | 7,524 |
-| searchable multimodal representations | 79,338 |
-
-## 检索评测
-
-最终冻结评测的 test split 包含 36 条 query。指标使用冻结的检索标注语义；延迟是本机
-warm execution 的 query-level mean，不包含答案生成 LLM。
-
-| Retrieval | Hit@1 | Hit@3 | Hit@10 | MRR | Warm mean latency |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dense | 77.78% | 83.33% | 86.11% | 0.8079 | 166 ms |
-| Dense + Sparse | 80.56% | 97.22% | 100.00% | 0.8852 | 451 ms |
-| Dense + Graph | 77.78% | 91.67% | 94.44% | 0.8449 | 2.45 s |
-
-在这套冻结 test set 上，Dense + Sparse 产生了最强的通用检索结果。所有检索分支同时运行
-提高了 Top-10 覆盖，但削弱了早期排序；KnowledgeScope 不把更多检索器视为自动收益。
-
-完整协议、dev/all-108 结果、坏例分析和多模态评测见
-[检索评测报告](docs/benchmarks/a4-5-retrieval-evaluation.md)。
+- PostgreSQL 保存知识库、文档、对话、报告与来源引用等业务元数据；
+- Qdrant 保存 dense chunk 向量与多模态 representation 向量；
+- Neo4j 保存有证据支撑的实体与关系；
+- SQLite 保存 BM25 sparse 索引；
+- 所有向量与图索引都是可重建的派生状态，跨存储操作不构成分布式事务。
 
 ## 快速开始
 
-### 环境
+### 环境要求
 
-- Python 3.12
-- `uv`
-- Node.js 与 `npm`
-- Docker Compose
+- Python 3.12 与 [`uv`](https://docs.astral.sh/uv/)
+- Node.js（建议 20 LTS 或更高）与 `npm`
+- Docker Compose（本地基础设施）
+- MinerU 独立运行时（PDF 解析必需，见 [MinerU 集成](docs/integrations/mineru.md)）
+- 可选：NVIDIA GPU（本地 embedding / reranker 以及 MinerU 解析建议使用 GPU）
 
-### 启动后端
+### 1. 启动基础设施与后端
 
 ```bash
-uv sync
+# 本地 embedding / reranker 需要模型运行时依赖
+uv sync --group embedding-benchmark --group reranker-benchmark
 cp .env.example .env
 docker compose up -d
 uv run alembic upgrade head
 uv run uvicorn knowledge_scope.api.app:app --reload
 ```
 
-`docker compose up -d` 只启动本地基础设施：PostgreSQL、Qdrant 和 Neo4j；API 与前端仍需按上面的命令和下一节分别启动，当前开发栈不依赖 Redis。
+`compose.yaml` 只启动 PostgreSQL、Qdrant 与 Neo4j；API 与前端分别启动。后端默认地址为
+`http://127.0.0.1:8000`。若要使用共享检索缓存，可参考下文「配置」启动 Redis。
 
-API 默认地址为 `http://127.0.0.1:8000`。`.env` 仅用于本地配置并已被 Git 忽略；请不要
-在其中或其他仓库文件中提交密码、API key 或 token。
+`.env` 是本地配置且已被 Git 忽略。请不要提交密码、API Key 或 Token；可参考
+`.env.example` 的注释按需填写。
 
-### 启动前端
+### 2. 启动前端
 
-在另一个终端执行：
+另开一个终端：
 
 ```bash
 cd frontend
@@ -177,31 +134,183 @@ npm install
 npm run dev
 ```
 
-前端默认地址为 `http://localhost:5173`，Vite 会把 `/api` 请求代理到本地后端。
+前端默认地址为 `http://localhost:5173`，Vite 会将 `/api` 请求代理到本地后端。
 
-## 技术栈
+### 3. 导入并处理第一份 PDF
 
-| 组件 | 用途 |
-| --- | --- |
-| Python 3.12 / FastAPI / SQLAlchemy | API、领域模型和 PostgreSQL 访问 |
-| Vue 3 / TypeScript / Vite | Web 界面 |
-| PostgreSQL | 知识库、文档和应用元数据 |
-| Qdrant | Dense 与 representation 向量索引 |
-| Neo4j | 有证据支撑的知识图谱和图检索 |
-| MinerU | PDF 解析适配器 |
-| Qwen3-Embedding / BGE Reranker | Dense embedding 与候选重排 |
+上传 PDF 后，需要依次完成解析、分块、索引与多模态表示构建。以 `document_id` 为例：
 
-## 仓库结构
+```bash
+# 1) MinerU 解析为 CanonicalDocument
+uv run knowledgescope parse-document <document_id>
+
+# 2) 结构感知分块
+uv run knowledgescope chunk-document <document_id>
+
+# 3) 写入 Qdrant dense 索引
+uv run knowledgescope qdrant index-document <document_id>
+
+# 4) 构建多模态表示与 Evidence 索引
+uv run knowledgescope multimodal-index build \
+  --knowledge-base-id <knowledge_base_id> \
+  --canonical-path data/parsing/<document_id>/canonical.json
+```
+
+MinerU 不是本项目 Python 依赖的一部分，需单独安装并确保 `mineru` 命令可用；如使用独立环境，
+可设置 `KNOWLEDGE_SCOPE_MINERU_COMMAND` 指向完整路径。首次运行 embedding / reranker 时
+会从 Hugging Face 下载模型缓存（`Qwen/Qwen3-Embedding-0.6B` 与本地 BGE reranker）。
+
+## 使用指南
+
+1. **知识库**：创建知识库并上传 PDF，查看文档状态与解析结果。
+2. **AI 问答**：选择知识库提问，获得流式回答与可点击来源；可切换「智能 / 深度 / 快速」检索模式。
+3. **智能体模式**：点击输入框下方的「✦ 智能体」，系统会先检索候选来源，再按需调用图片理解
+   或表格计算工具，前端实时展示工具进度；规划失败或工具不可用时显式降级为标准检索回答。
+4. **数据分析**：注册外部 PostgreSQL 数据源，以自然语言生成受策略约束的只读 SQL 并查看结果。
+5. **报告创作**：在报告中选择章节，把检索证据、智能体回答或数据分析结果插入正文，继续编辑并导出。
+
+示例问题：
+
+- 「2023 年越南的 GDP 是多少？不同表格中的数值分别是多少？」
+- 「请分析图 1，说明 2023 年季度销售额的变化趋势和峰值季度。」
+- 「表 1 中越南 2024 年 GDP 比 2023 年增长百分之几？」
+- 「对比表 1 和表 2 中越南、泰国 2024 年的 GDP 差异与相对变化。」
+
+## 配置
+
+配置通过 `KNOWLEDGE_SCOPE_` 前缀的环境变量或 `.env` 注入，完整默认值见 `.env.example`。
+常用配置如下：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `KNOWLEDGE_SCOPE_DATA_DIR` | `data` | 解析产物、Evidence、报告素材等本地数据根目录 |
+| `KNOWLEDGE_SCOPE_DATABASE_URL` | `postgresql+asyncpg://...` | PostgreSQL 连接串 |
+| `KNOWLEDGE_SCOPE_MINERU_COMMAND` | `mineru` | MinerU 可执行文件路径或命令名 |
+| `KNOWLEDGE_SCOPE_LLM_MODEL` | `deepseek-chat` | 文本 LLM 模型；实际部署可切换为 `deepseek-flash` 等 |
+| `KNOWLEDGE_SCOPE_LLM_API_KEY` | 空 | DeepSeek API Key（仅本地 `.env`，不要提交） |
+| `KNOWLEDGE_SCOPE_VLM_ENABLED` | `false` | 是否启用视觉模型适配器 |
+| `KNOWLEDGE_SCOPE_VLM_BASE_URL` | 空 | OpenAI 兼容视觉服务地址 |
+| `KNOWLEDGE_SCOPE_VLM_MODEL` | 空 | 视觉模型名称 |
+| `KNOWLEDGE_SCOPE_AGENT_ENABLED` | `true` | 是否启用智能体问答服务 |
+| `KNOWLEDGE_SCOPE_AGENT_MAX_TOOL_CALLS` | `3` | 单轮工具调用上限 |
+| `KNOWLEDGE_SCOPE_AGENT_TIMEOUT_SECONDS` | `180` | 智能体单轮墙钟上限 |
+| `KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND` | `memory` | `memory` / `redis` / `off` |
+
+### 本地启用视觉模型（可选）
+
+视觉模型使用独立的 OpenAI 兼容适配器，默认关闭。以本地 Ollama `qwen3-vl:8b` 为例：
+
+```bash
+export KNOWLEDGE_SCOPE_VLM_ENABLED=true
+export KNOWLEDGE_SCOPE_VLM_BASE_URL=http://127.0.0.1:11434/v1
+export KNOWLEDGE_SCOPE_VLM_MODEL=qwen3-vl:8b
+# 思考型模型建议关闭推理并留足输出预算，避免 JSON 输出被推理内容占满
+export KNOWLEDGE_SCOPE_VLM_REASONING_EFFORT=none
+export KNOWLEDGE_SCOPE_VLM_MAX_OUTPUT_TOKENS=4096
+```
+
+未启用 VLM 时，标准问答与表格计算仍可用；图片理解会返回受控的 `vlm_not_configured` 状态，
+不会伪造视觉结论。视觉分析结果会附带复核提示，图片型表格提取固定标记为「需人工核对」，
+不作为精确统计数据。
+
+### 共享检索缓存（可选）
+
+默认使用进程内缓存（命中 TTL 300 秒、未命中 60 秒、最多 256 条），只缓存检索上下文，不缓存
+生成的回答。多 worker 或容器部署时可改用 Redis：
+
+```bash
+docker compose -f docker-compose.yml up -d redis
+uv sync --group cache
+export KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=redis
+export KNOWLEDGE_SCOPE_RAG_CACHE_URL=redis://127.0.0.1:6379/0
+```
+
+Redis 不可用时会自动回退到进程内缓存；设置 `KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=off` 可完全关闭。
+
+## 评测
+
+KnowledgeScope 维护可复现的离线评测，用真实模型调用与冻结标注约束质量，而不是只展示演示效果。
+完整协议与坏例分析见对应评测报告。
+
+### 检索评测
+
+冻结 test split（36 条 query，warm execution，不含答案生成 LLM）：
+
+| Retrieval | Hit@1 | Hit@3 | Hit@10 | MRR | Warm mean latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dense | 77.78% | 83.33% | 86.11% | 0.8079 | 166 ms |
+| Dense + Sparse | 80.56% | 97.22% | 100.00% | 0.8852 | 451 ms |
+| Dense + Graph | 77.78% | 91.67% | 94.44% | 0.8449 | 2.45 s |
+
+在这套冻结 test set 上，Dense + Sparse 取得了最好的通用检索结果。系统不认为"更多检索分支"
+必然带来收益，因此评测结论用于配置选择，而不是生产环境质量承诺。详见
+[检索评测报告](docs/benchmarks/a4-5-retrieval-evaluation.md)。
+
+### 多模态智能体评测（严格口径）
+
+30 道真实问题，覆盖普通 RAG、图片/图表理解、图片型表格提取、表格查询、增长率、汇总、跨表/
+跨文档对比、连续追问、无证据与降级场景；使用真实 DeepSeek Flash（规划与回答）与本地
+Ollama `qwen3-vl:8b`（图片理解）。评测数据为 4 份 PDF：3 份由脚本生成，1 份来自本地冻结的
+公开教材语料。
+
+| 指标 | 结果 | 说明 |
+| --- | ---: | --- |
+| Tool Selection Accuracy | 29/30（96.7%） | 是否选择了任务要求的工具 |
+| Tool Execution Success | 16/18（88.9%） | 工具是否实际执行成功 |
+| Parameter Validity | 18/18（100%） | 工具参数是否可观测且符合契约 |
+| Executed Tool Numeric Accuracy | 12/12（100%） | 已成功执行的确定性工具数值是否正确 |
+| Exact Calculation Chain | 12/14（85.7%） | 工具调用 + 数值 + 引用 + 参数全链路 |
+| Citation Structure Validity | 26/27（96.3%） | 发出的引用结构合法且可访问（已引用问题 26/26） |
+| Cited Document Coverage | 26/27（96.3%） | 问题要求的文档是否都被引用 |
+| E2E Success | 26/30（86.7%） | 单题端到端成功 |
+
+平均值/中位数/P95 延迟分别约为 12.6s / 8.3s / 60.0s。已知失败与限制包括：一次检索未命中、
+视觉模型对细粒度最低值的误读、跨语言表头无法直接对比、以及规划器偶发降级；真实检索
+Hit@K 与引用语义支持在严格口径下仍标记为 UNVERIFIED。详见
+[M5 评测报告](docs/benchmarks/multimodal-agentic-rag-m5-evaluation.md)。
+
+## 项目结构
 
 ```text
 KnowledgeScope/
-├── src/knowledge_scope/  后端 package
-├── frontend/             Vue 3 应用
-├── docs/                 架构、集成、评测和验证文档
-├── tests/                pytest 与可选集成测试
-├── alembic/              PostgreSQL migrations
-└── compose.yaml          本地基础设施
+├── src/knowledge_scope/      后端 Python package
+│   ├── parsing/              MinerU 适配、CanonicalDocument
+│   ├── chunking/             结构感知分块
+│   ├── documents/            文档存储与证据素材访问
+│   ├── evidence/             Evidence 生命周期
+│   ├── retrieval/            dense / sparse / graph / multimodal 检索
+│   ├── rag/                  RAG 上下文、路由与 SSE 问答
+│   ├── table_analysis/       PDF 表格结构化与确定性计算
+│   ├── vision/               VLM 适配与视觉分析服务
+│   ├── agent/                受限工具调用的智能体问答
+│   ├── reports/              报告创作、来源插入与导出
+│   ├── chatbi/               外部 PostgreSQL 只读分析
+│   └── mcp/                  本地 stdio MCP 服务
+├── frontend/                 Vue 3 + TypeScript 前端
+├── docs/                     架构、集成、评测与验证文档
+├── tests/                    pytest 单元与集成测试
+├── alembic/                  PostgreSQL migrations
+├── compose.yaml              本地基础设施（PostgreSQL / Qdrant / Neo4j）
+└── docker-compose.yml        可选 Redis 缓存
 ```
+
+## 开发与测试
+
+```bash
+# Python
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+
+# Frontend
+cd frontend
+npm run test
+npm run type-check
+npm run lint
+```
+
+后端测试需要本地 PostgreSQL（测试会创建并销毁独立的临时数据库）；部分集成测试需要可用的
+Qdrant、Neo4j 或模型缓存。提交前请保持 README 描述与实际行为一致，不要提前声明未实现的能力。
 
 ## 文档
 
@@ -209,66 +318,48 @@ KnowledgeScope/
 | --- | --- |
 | 规范化文档模型 | [CanonicalDocument](docs/architecture/canonical-document-model.md) |
 | 结构感知分块 | [CanonicalDocument → Chunk](docs/architecture/canonical-document-chunking.md) |
-| RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
-| 多模态智能体问答 | [Agentic RAG](docs/architecture/agentic-rag.md) |
-| PDF 表格结构化计算 | [Table Analysis](docs/architecture/table-analysis.md) |
-| VLM 视觉理解 | [Vision Analysis](docs/architecture/vision-analysis.md) |
-| 对话工作区（持久化） | [Chat Workspace](docs/architecture/chat-workspace.md) |
-| 知识图谱检索 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
-| 知识图谱可视化 | [Knowledge Graph View](docs/architecture/knowledge-graph-view.md) |
-| 统一候选池 | [Unified Retrieval](docs/architecture/unified-retrieval.md) |
 | 多模态 Evidence | [Multimodal Evidence](docs/architecture/multimodal-evidence.md) |
-| ChatBI schema discovery | [Schema Discovery](docs/architecture/chatbi-schema-discovery.md) |
-| ChatBI SQL execution | [SQL Execution](docs/architecture/chatbi-sql-execution.md) |
-| ChatBI agent loop | [ChatBI Agent](docs/architecture/chatbi-agent.md) |
-| ChatBI 数据分析工作区 | [Analysis Workspace](docs/architecture/chatbi-analysis-workspace.md) |
-| 报告创作工作区 | [Report Workspace](docs/architecture/report-workspace.md) |
-| 本地 MCP 服务 | [MCP 服务](docs/architecture/mcp-server.md) |
-| 检索评测 | [Retrieval Evaluation](docs/benchmarks/a4-5-retrieval-evaluation.md) |
-| 多模态智能体评测 | [M5 Evaluation](docs/benchmarks/multimodal-agentic-rag-m5-evaluation.md) |
-| 本地产品演示 | [Demo Workflow](docs/validation/f4-demo-workflow.md) |
-| 浏览器冒烟清单 | [Browser Smoke](docs/validation/f4-browser-smoke.md) |
-| 开发记录 | [Project History](docs/development/project-history.md) |
+| 统一候选池 | [Unified Retrieval](docs/architecture/unified-retrieval.md) |
+| RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
+| 多模态智能体 | [Agentic RAG](docs/architecture/agentic-rag.md) |
+| PDF 表格计算 | [Table Analysis](docs/architecture/table-analysis.md) |
+| VLM 视觉理解 | [Vision Analysis](docs/architecture/vision-analysis.md) |
+| 报告创作 | [Report Workspace](docs/architecture/report-workspace.md) |
+| 知识图谱 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
+| ChatBI | [Schema Discovery](docs/architecture/chatbi-schema-discovery.md) · [SQL Execution](docs/architecture/chatbi-sql-execution.md) · [Agent](docs/architecture/chatbi-agent.md) |
+| 本地 MCP | [MCP 服务](docs/architecture/mcp-server.md) |
+| MinerU 集成 | [MinerU](docs/integrations/mineru.md) |
+| 检索评测 | [A4.5 Retrieval Evaluation](docs/benchmarks/a4-5-retrieval-evaluation.md) |
+| 智能体评测 | [M5 Evaluation](docs/benchmarks/multimodal-agentic-rag-m5-evaluation.md) |
+| 演示与冒烟 | [Demo Workflow](docs/validation/f4-demo-workflow.md) · [Browser Smoke](docs/validation/f4-browser-smoke.md) |
+
+## 已知限制
+
+- **历史语料资产**：早期导入的语料可能只保留 Evidence 元数据而缺失原始图片/解析产物；
+  引用与页码仍可用，素材预览会受控降级，不应视为视觉模型失败。
+- **视觉模型能力**：本地 `qwen3-vl:8b` 对细粒度数值（尤其图表最低值）不稳定，结果需人工核对；
+  输出预算过小时可能被推理内容截断，系统会返回受控失败而不是编造结论。
+- **表格边界**：无法可靠还原的复杂合并单元格、无结构化内容的图片型表格会返回
+  `not_computable` / `needs_review`，不会被当作精确计算结果。
+- **跨语言表头**：当前 compare 工具按表头名称对齐，英文表头与中文表头无法直接跨表对比。
+- **检索严格指标**：真实 Retrieval Hit@K 与引用语义支持尚未纳入严格自动化评测（标记 UNVERIFIED）。
+- **报告导出**：DOCX/PDF 导出不会嵌入原始图片资产，只保留来源标题、页码与引用说明。
+- **评测规模**：现有评测集较小（30 题），指标用于回归与配置比较，不代表大规模生产质量。
 
 ## 路线图
 
-路线图列出尚未进入产品表面的工作：
-
 - 更完整的 GraphRAG 与跨文档实体链接评测；
-- 视觉 embedding、OCR/LLM caption 规模化生成，以及更严格的多模态质量评测；
-- 多工具并行、更长任务的智能体规划，以及历史资产缺失时的自动回填。
+- 视觉 embedding、图片 caption 规模化生成与更严格的多模态质量评测；
+- 更可靠的多工具并行与长任务规划；
+- 历史资产缺失时的自动回填与素材重建；
+- 更大规模、可复现的业务评测集与公开报告。
 
-详细实现背景、协议限制和历史记录分别保存在 `docs/architecture/`、`docs/benchmarks/`
-和 [Project History](docs/development/project-history.md) 中。
+## 致谢
 
-## 检索缓存（可选）
+KnowledgeScope 建立在以下开源项目与模型之上：MinerU、FastAPI、Vue、Element Plus、
+Qdrant、Neo4j、PostgreSQL、Qwen3-Embedding、BGE Reranker、DeepSeek 与 Ollama。
+感谢这些项目的维护者与社区。
 
-检索上下文默认缓存在进程内（命中 TTL 300 秒、未命中 60 秒、最多 256 条），重复提问可以直接复用命中的上下文：检索耗时从秒级降到毫秒级。
-回答本身不缓存。多 worker 或容器部署时可以换成共享的 Redis：
+## License
 
-```bash
-docker compose up -d redis
-uv sync --group cache
-export KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=redis
-export KNOWLEDGE_SCOPE_RAG_CACHE_URL=redis://127.0.0.1:6379/0
-```
-
-Redis 不可用或未安装客户端时，服务会自动退回进程内缓存并继续工作；`KNOWLEDGE_SCOPE_RAG_CACHE_BACKEND=off` 可以完全关闭。
-
-## 多模态智能体配置（可选）
-
-智能体模式默认启用，规划与回答复用现有 DeepSeek 配置；图片理解需要额外配置一个 OpenAI 兼容的
-视觉模型服务（默认关闭）。下面以本地 Ollama `qwen3-vl:8b` 为例：
-
-```bash
-export KNOWLEDGE_SCOPE_AGENT_ENABLED=true
-export KNOWLEDGE_SCOPE_VLM_ENABLED=true
-export KNOWLEDGE_SCOPE_VLM_BASE_URL=http://127.0.0.1:11434/v1
-export KNOWLEDGE_SCOPE_VLM_MODEL=qwen3-vl:8b
-# 思考型模型建议关闭推理并留足输出预算，否则 JSON 可能被截断
-export KNOWLEDGE_SCOPE_VLM_REASONING_EFFORT=none
-export KNOWLEDGE_SCOPE_VLM_MAX_OUTPUT_TOKENS=4096
-```
-
-未启用 VLM 时，标准问答和表格计算仍可用，图片理解会返回受控的 `vlm_not_configured`
-失败状态而不会伪造视觉结论。智能体单轮默认墙钟上限 180 秒（`KNOWLEDGE_SCOPE_AGENT_TIMEOUT_SECONDS`）。
+本仓库当前未包含开源许可证文件。如需对外分发或用于商业场景，请先补充明确的许可证声明。
