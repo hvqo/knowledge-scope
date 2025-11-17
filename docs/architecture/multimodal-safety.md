@@ -1,0 +1,146 @@
+# 多模态安全加固（P0）
+
+本阶段的目标不是提升图片识别精度，而是阻止**未经核验的视觉数值**被当作已核实结论，进入智能体回答、SSE 流、报告正文或导出文档。视觉模型（VLM）只被视为“不可信的阅读辅助”，不是权威数据源。
+
+## 1. 事实来源契约
+
+应用层为每个结果标注事实状态（`fact_status`），模型自述的置信度不参与判定：
+
+| fact_status | 含义 | 典型来源 |
+| --- | --- | --- |
+| `source_verified` | 来自结构化表格，并由确定性计算工具计算 | `TableAnalysisService` 成功执行后的结果 |
+| `visual_estimate` | 视觉模型从图片中读出的估计值 | `analyze_chart` / `describe_image` |
+| `unverified` | 来自图片型表格的 VLM 抽取，必须人工核对 | `extract_table` 任务 |
+| `not_available` | 没有可用的视觉或结构化来源 | 视觉失败、未配置或未使用视觉工具 |
+
+`VisionAnalysisResult` 增加 `fact_status` 与 `numeric_claims`；`AgentToolOutcome`、`RAGCompleteData`、`RAGCitation`/`RAGVisualSource` 逐层传递同一状态。`status=ok` 仅表示请求与 JSON 结构成功，不代表数字可信。
+
+## 2. 服务端视觉数值输出闸门
+
+- `src/knowledge_scope/vision/safety.py` 根据问题文本做可测试的风险分类：是否要求精确数值/增长率/排名/汇总，是否指向图片类素材；年份、季度标签、引用标记不会被误判为业务数值。
+- 高风险且没有可信结构化结果时，智能体不再调用最终答案模型。应用直接生成确定性回答：说明“无法核验视觉数字”，可选保留去掉数字后的视觉描述，并附上实际分析的图片；`complete.safety_gate` 为 `visual_numeric_withheld` 或 `vision_unavailable`，`finish_reason="safety_gate"`。
+- SSE 保护：模型**从未启动**，因此不会出现“先流式输出 120 万元、后补警告”的泄漏路径；高风险轮次只发送一个确定性的 `answer_delta`，随后是 `citations` 与 `complete`。
+- 当表格确定性计算已成功（`source_verified`）时，闸门不会拦截；即使问题中包含“最低/增长/多少”等词。
+- 视觉失败、未配置、超时或证据缺失时，不会回退到普通 RAG 继续“猜”数字；如需引用文本证据，必须明确说明视觉未完成。
+
+## 3. 自动展示实际使用的图片
+
+- 智能体实际执行 `analyze_image` 时，`complete` 事件携带 `visual_sources`（仅包含本次真实使用的图片 Evidence：知识库、文档、Evidence ID、页码、来源块、资产序号、事实状态）。这些字段全部由服务端从工具执行记录生成，模型不能提供 URL 或 Evidence ID。
+- 前端在回答下方直接渲染“本次分析图片”卡片（`VisualSourcesCard.vue`）：缩略图通过既有 `GET /documents/{id}/evidence/{evidence_id}/assets/{index}` 读取；点击打开原尺寸预览；“打开原文 PDF”跳到对应页。
+- 历史文档缺少解析产物时显示“原图不可用，无法核验”，不会用无关图片占位；视觉结果一律标注“视觉分析结果需核对”。
+- 聊天历史持久化暂不包含这些附加元数据（需要数据库迁移）。当前前端会在同一会话内按回答正文缓存安全元数据，因此刚生成的回答（包括保存后重新渲染）仍能看到卡片；刷新页面后卡片不会恢复，原始来源抽屉与引用仍可追溯。
+
+## 4. 报告插入安全边界
+
+`POST /api/v1/reports/{report_id}/sections/{section_id}/agent-answers/insert` 不再接受客户端提交的正文与来源，只接受 `chat_message_id`：
+
+- 服务端读取已持久化的智能体回答及其引用，校验会话与报告属于同一知识库；页码、来源块、Evidence 归属沿用原有校验。
+- 正文与来源均由服务器从聊天记录重建，客户端无法伪造 `content_append`、`sources` 或 `verified=true`（多余字段返回 422）。
+- 回答包含图片引用且正文含数值声明时拒绝插入（409）：未核验的视觉数值不能自动成为“已核实分析”。
+- 不含高风险数值的视觉回答允许插入，但正文前自动加上“⚠️ 视觉分析草稿，需人工核对，不作为精确统计结论”，并在响应 `warnings` 中返回；DOCX/PDF 导出保留该提示。
+- 结构化表格计算结果（`source_verified`）维持原有插入行为。
+
+## 5. 相关测试
+
+- `tests/test_multimodal_safety.py`：风险分类、数字抽取（忽略年份/季度）、闸门回答去除数字、SSE 不泄漏未核验数字、表格确定性计算不被拦截、视觉失败不回退 RAG。
+- `tests/test_reports_agent_insert.py`：服务端正文重建、视觉数值 409、表格回答可插入、跨库/页码/伪造字段/历史缺失等边界。
+- 前端 `VisualSourcesCard` 与聊天消息动作测试。
+
+## 6. 已知限制
+
+- 闸门针对“可识别的精确数值/图表数值问题”；无法识别所有语义变体，视觉模型仍可能在描述性文字中产生难以检测的错误。
+- 图片型表格抽取固定标记为 `unverified`，不进入自动精确统计。
+- 报告插入只验证来源元数据与关联关系，不能证明正文每句话都被来源支持；人工编辑内容不属于系统核实。
+- 历史图片缺失、VLM 不稳定、跨语言表头对比等既有局限仍然存在。
+
+## 7. 真实验收记录（2026-10-23）
+
+环境：DeepSeek Flash（规划与最终回答）+ Ollama `qwen3-vl:8b`（视觉），临时知识库（4 份非敏感测试 PDF：图表、扫描表格、GDP 表格 A/B、数学教材），服务端 API 使用最新分支代码启动。
+
+| 场景 | 实际结果 |
+| --- | --- |
+| 图表精确数值问题（“最低季度具体销售额”） | 真实 qwen3-vl:8b 返回含数字的描述；`complete.safety_gate="visual_numeric_withheld"`、`fact_status="visual_estimate"`、`finish_reason="safety_gate"`，回答中无具体数字（显示“〔数值未经核验〕”），`visual_sources=1`，前端展示告警横幅与“本次分析图片”缩略图（`/tmp/safety-gated-answer.png`）。 |
+| 结构化表格增长（表 1，m2-pdf-a.pdf） | 表格工具实际执行，回答引用 10.6977%、公式与 460 亿美元；`safety_gate="none"`、`fact_status="source_verified"`，未被视觉闸门拦截。 |
+| 报告插入（表格回答） | `agent-answers/insert` 仅提交 `chat_message_id`，服务端重建正文与 4 条来源，HTTP 201。 |
+| 报告插入（视觉草稿，无精确数字） | HTTP 201，正文自动加“⚠️ 视觉分析草稿，需人工核对”提示，`warnings` 返回提示；导出保留该提示。 |
+| 报告插入（伪造图片数值回答） | HTTP 409：“该回答包含未经核验的视觉数值，不能自动插入为已核实分析”。客户端伪造 `content_append/sources/verified` 字段返回 422。 |
+| 标准 RAG 回归 | `/rag/query` 标准模式正常返回 588 个 SSE 事件，无错误。 |
+| 浏览器端 | 浏览器中选择临时知识库、开启智能体提问图表数值问题：最终回答为确定性安全文本，回答下方直接出现图片卡片（缩略图可加载、可查看原图、可打开原文 PDF），无需先打开来源抽屉。 |
+
+未完成项：P1 的有界二次检索与错误反馈入口本轮未实现（需要更多检索/前端改造，已记录为后续事项）；历史会话刷新后安全卡片不恢复；报告插入只校验来源元数据，不证明正文逐句被来源支持。
+
+## 8. P1 设计建议（本轮未实现）
+
+- **有界二次检索**：在 `AgentRetrievalTool.retrieve` 之后增加一次受控补检索，仅在以下条件触发：首轮候选缺少图片/表格证据、问题显式询问图片/表格、或候选的文档/页码明显不匹配。用改写后的关键词 + 标题/页码/模态过滤调用现有 `UnifiedRetrievalService.search`，最多一次、结果合并去重并受同一候选预算约束；不引入新检索服务或新集合，失败时明确回答“未找到可用视觉证据”，不使用无关图片占位。需要新增 agent 单元测试覆盖触发/不触发/跨库隔离。
+- **错误反馈入口**：前端在回答操作区增加“报告问题”入口，后端新增 `POST /api/v1/agent/feedback`（或复用 chat 路由）：只记录时间、回答/分析 ID、知识库 ID、Evidence ID、工具名、模型名、错误分类（图片识别/数值/来源/资产缺失/其他）与有限文本；不存 PDF、完整会话、图片或密钥。落库需要新增轻量表和 Alembic 迁移，建议单独评审后再实施，避免在本轮安全加固中扩大迁移范围。
+
+## 9. 合并前 P0 加固（2026-10-24）
+
+针对代码审查发现的三条信任边界缺口，追加服务端修复：
+
+### 9.1 持久化回答不再等于“服务端已验证”
+
+- 普通聊天接口仍可用于保存历史记录，但“客户端创建了 assistant 消息”不再构成可信来源。
+- 新增服务端可信台账 `src/knowledge_scope/chat/trust.py`：每次 RAG/Agent 流式回答完成时，API 层用 HMAC-SHA256 对「会话、知识库、正文指纹、引用指纹、生成来源、工具轨迹、事实状态」签名，写入 `<data_dir>/agent-trust/<trust_id>.json`；密钥来自 `KNOWLEDGE_SCOPE_AGENT_TRUST_SECRET` 或本地自动生成的 32 字节密钥文件（两者都不进数据库、不进仓库）。
+- 智能体请求 `POST /api/v1/rag/query` 新增 `conversation_id`，用于把回答绑定到持久化会话；`complete` 事件返回 `trust_id` 与 `answer_generated_by`（`agent`/`rag`/`safety_gate`）。
+- 报告插入只读取可信台账：正文、引用、页码、来源块、工具轨迹必须与签名记录完全一致；任何改动（改正文、改引用、换会话/知识库、删除台账、伪造 ID）都会返回 409。历史消息默认不可信。
+- 本轮无需数据库迁移；台账与现有 `data/` 目录同级，随知识库数据一起备份/清理。
+
+### 9.2 表格成功不再放开整轮视觉门禁
+
+- 移除“表格工具成功即整轮跳过视觉门禁”的布尔判断；改为按工具分别记录事实状态：`agent_tool_trace[].fact_status`（表格为 `source_verified`，视觉为 `visual_estimate`/`unverified`）。
+- 高风险问题只要本轮执行过 `analyze_image`，就必须走确定性闸门：视觉数字省略/标注，表格确定性结果可保留并并入回答；`complete` 同时给出 `safety_gate=visual_numeric_withheld` 与逐工具 trace。
+- 纯表格高风险回答在流式输出前缓冲校验：每个数字都必须能在表格工具 payload 中找到；否则整段替换为确定性表格结果，并标记 `safety_gate=unverified_numbers_withheld`，不会出现先输出错误数字再修复。
+- 图片型表格不能借 `modality="table"` 绕过：报告侧依据可信台账中的工具轨迹（`analyze_image` 且 fact_status 非 `source_verified`）与 `safety_gate` 判断，而不是只看 citation.modality。
+
+### 9.3 合并前真实验收（DeepSeek Flash + qwen3-vl:8b）
+
+2026-10-24 在临时知识库上用真实模型验证：
+
+| 场景 | 实际结果 |
+| --- | --- |
+| 客户端伪造 assistant 消息（含虚假数值与引用）→ 报告插入 | 409，提示“没有可核验的服务端生成记录” |
+| 真实表格增长回答（10.6977%）→ 报告插入 | 201，正文与表格来源写入 |
+| 表格计算 + 图表最低季度金额（混合高风险） | 视觉数字被省略，回答只保留表格确定性结果；插入 409（含视觉来源且正文有数字，默认拒绝） |
+| 图片型表格具体数值问题 | 闸门触发（`vision_unavailable` / 表格工具结果可保留）；插入 409 或草稿提示 |
+| 标准 RAG 问答 | 正常返回（SSE 完整），无回归 |
+| 前端 | Vitest 132 passed，`vue-tsc`/ESLint 通过；回答下方图片卡片与安全提示保持可用 |
+
+结论：三条 P0 的服务端校验均已生效并完成对抗测试；仍需人工核对的边界（VLM 语义错误、图片型表格数值正确性、历史消息无签名记录）已在下文限制中明确。
+
+## 10. 最终正确性加固（2026-10-24）
+
+针对合并前审查发现的“数值对、业务字段错”与“视觉来源与执行记录错配”两类风险，追加以下修复：
+
+### 10.1 表格数值不再只按“数值集合”核验
+
+- 删除 `_numbers_supported_by_table` 正则式集合校验。高风险纯表格问题改为**不调用文本模型**：直接由 `TableAnalysisService` 的结构化结果确定性渲染答案（列、行、单位与公式一一对应），`finish_reason=deterministic_table`、`provider=null`、`fact_status=source_verified`。
+- 应用层用 `_structured_table_facts` 绑定“行标签 → 列 → 数值 → 单位”，因此国家/年份/指标互换不会因数字相同而通过；得到的是表格工具真实计算结果，而不是模型转述。
+- 需要模型参与的混合问题（表格 + 视觉/文本）也使用同一结构化事实，且视觉数字仍被门禁省略；无法保证字段对应时不再输出 `source_verified`。
+- 新增 `tests/test_table_fact_correspondence.py`：数值集合漏洞复现、国家互换、年份互换、同名数字不同单位、正确增长不被误拦、结构化 facts 绑定、compare 行列顺序。
+
+### 10.2 视觉素材与工具执行记录一一对应
+
+- Agent 记录**每一次** `analyze_image` 调用（`_VisualExecution`：candidate、outcome、真实 `asset_index`、`vision_task`），不再只保留最后一个视觉候选；工具去重键包含 `asset_index`，同一 Evidence 的多个资产不会被合并。
+- 工具失败时 payload 带 `execution_status=failed`、`error_code`、`error_message` 与原引用来源，`fact_status=not_available`；成功时带真实页码、`asset_index`、`vision_task`。
+- `complete.visual_sources[]` 逐个输出实际执行记录（`execution_status`、`vision_task`、`fact_status`、真实 document/evidence/page/asset_index），按执行顺序保留；前端图片卡片对失败执行显示“图片分析失败”徽标而不是“结果需核对”。
+- 新增测试：两张不同图片顺序与 asset_index、同一 Evidence 两个 asset_index、第一成功第二失败、仅视觉失败、多图顺序、trace 参数记录。
+
+### 10.3 可信台账运行复核
+
+- 密钥文件改为 `os.open(O_CREAT | O_EXCL, 0600)` 独占创建 + 短暂重试读取，避免多 worker 首次启动竞态；仍支持 `KNOWLEDGE_SCOPE_AGENT_TRUST_SECRET` 固定密钥；密钥文件丢失/被替换时验证 fail-closed。
+- 同一正文与引用在不同安全状态下重复记录时，保留已存在且更严格 `safety_gate` 的记录，不允许随后一次较宽松记录覆盖（防降级）。
+- 台账仍只证明“该回答由服务端流式生成、正文/引用未被篡改”，不表示每句事实均已被来源逐句核验；部署需固定密钥并保护 `<data_dir>/agent-trust` 与密钥文件权限。
+
+### 10.4 真实验收（2026-10-24，DeepSeek Flash + qwen3-vl:8b）
+
+| 场景 | 实际结果 |
+| --- | --- |
+| 客户端伪造 assistant 消息（“120 万元” + 图片 citation）→ 报告插入 | 409“没有可核验的服务端生成记录” |
+| 真实表格增长问题 → 回答 → 报告插入 | `deterministic_table`/`provider=null`/`source_verified`，10.6977% + 公式；插入 201 |
+| 表格增长 + 图表最低季度金额（混合） | `safety_gate=vision_unavailable`（本轮视觉工具未成功执行），回答无 120；插入 409 |
+| 图片型表格具体数值 | `safety_gate=visual_numeric_withheld`、`fact_status=unverified`，`visual_sources` 记录 `vision_task=extract_table`、page 2；插入走“视觉草稿”提示路径，不作为可信统计 |
+| 客户端保存后再次插入 | 混合回答仍 409；扫描表格仅草稿路径，安全状态不被客户端改动升级 |
+| 标准 RAG / 前端 | SSE 正常；Vitest 133、`vue-tsc`、ESLint 通过；浏览器图片卡片/查看原图/打开原文 PDF 正常 |
+
+限制：应用层无法判断 VLM 语义是否真正正确，只能保证“未核验的视觉精确数字不进入可信结论”；历史消息无签名记录不可插入；混合/图片型表格的数值正确性仍需人工核对；本轮无数据库迁移。

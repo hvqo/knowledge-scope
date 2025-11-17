@@ -17,10 +17,13 @@ from .errors import (
     VisionRequestError,
 )
 from .provider import VLMProvider
+from .safety import extract_numeric_claims
 from .schemas import (
     VisionAnalysisResult,
+    VisionNumericClaim,
     VisionSource,
     VisionTaskType,
+    VisualFactStatus,
     normalize_chart,
     normalize_description,
     normalize_table,
@@ -68,6 +71,7 @@ class VisionAnalysisService:
             return VisionAnalysisResult(
                 status="not_configured",
                 task_type=task_type,
+                fact_status="not_available",
                 sources=[source],
                 error_code="vlm_not_configured",
                 message="视觉模型未启用或未配置，无法执行图片理解",
@@ -131,6 +135,8 @@ class VisionAnalysisService:
             return VisionAnalysisResult(
                 status="needs_review" if warnings else "ok",
                 task_type=task_type,
+                fact_status="visual_estimate",
+                numeric_claims=_claims(answer, "visual_estimate"),
                 answer=answer,
                 provider=provider,
                 model=model,
@@ -143,6 +149,8 @@ class VisionAnalysisService:
             return VisionAnalysisResult(
                 status="needs_review" if warnings else "ok",
                 task_type=task_type,
+                fact_status="visual_estimate",
+                numeric_claims=_claims(answer, "visual_estimate"),
                 answer=answer,
                 chart_analysis=chart,
                 provider=provider,
@@ -152,9 +160,15 @@ class VisionAnalysisService:
                 sources=[source],
             )
         table, warnings = normalize_table(content)
+        table_text = " | ".join(
+            [table.title or "", table.unit or ""]
+            + [" | ".join(cell or "" for cell in row) for row in table.rows]
+        )
         return VisionAnalysisResult(
             status="needs_review",
             task_type=task_type,
+            fact_status="unverified",
+            numeric_claims=_claims(table_text, "unverified"),
             extracted_table=table,
             extraction_method="vlm",
             provider=provider,
@@ -178,6 +192,7 @@ class VisionAnalysisService:
         return VisionAnalysisResult(
             status="failed",
             task_type=task_type,
+            fact_status="not_available",
             provider=provider,
             model=model,
             latency_ms=latency_ms,
@@ -205,6 +220,17 @@ async def analyze_evidence_image(
         task_type=task_type,
         question=question,
     )
+
+
+def _claims(text: str, fact_status: VisualFactStatus) -> list[VisionNumericClaim]:
+    return [
+        VisionNumericClaim(
+            value=claim.value,
+            context=claim.context,
+            fact_status=fact_status,
+        )
+        for claim in extract_numeric_claims(text)
+    ]
 
 
 __all__ = ["VisionAnalysisService", "analyze_evidence_image"]

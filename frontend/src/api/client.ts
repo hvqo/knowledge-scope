@@ -43,8 +43,11 @@ import type {
   RAGCitation,
   RAGCompleteData,
   RAGAnswerMode,
+  RAGFactStatus,
+  RAGSafetyGate,
   RAGStreamEvent,
   RAGToolStatusData,
+  RAGVisualSource,
   VisionAnalysisResult,
   VisionAnalyzeRequest,
 } from "./types";
@@ -575,6 +578,8 @@ export interface RAGQueryRequest {
   knowledge_base_id: string;
   retrieval_mode?: RAGRequestedRetrievalMode;
   answer_mode?: RAGAnswerMode;
+  // Bound the server-side trust record to this persisted conversation.
+  conversation_id?: string;
   history?: RAGHistoryTurn[];
 }
 
@@ -1050,6 +1055,64 @@ function parseCitation(value: unknown): RAGCitation {
   return citation;
 }
 
+function nullableFactStatus(value: unknown): RAGFactStatus | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (
+    value === "source_verified" ||
+    value === "visual_estimate" ||
+    value === "unverified" ||
+    value === "not_available"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function nullableSafetyGate(value: unknown): RAGSafetyGate {
+  if (
+    value === "visual_numeric_withheld" ||
+    value === "visual_unverified" ||
+    value === "vision_unavailable"
+  ) {
+    return value;
+  }
+  return "none";
+}
+
+function parseVisualSources(value: unknown): RAGVisualSource[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const sources: RAGVisualSource[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    try {
+      sources.push({
+        knowledge_base_id: requiredString(item.knowledge_base_id, "knowledge_base_id"),
+        document_id: requiredString(item.document_id, "document_id"),
+        evidence_id: requiredString(item.evidence_id, "evidence_id"),
+        page_start: requiredFiniteNumber(item.page_start, "page_start"),
+        page_end: requiredFiniteNumber(item.page_end, "page_end"),
+        source_block_ids: Array.isArray(item.source_block_ids)
+          ? item.source_block_ids.filter((entry): entry is string => typeof entry === "string")
+          : [],
+        asset_index: isFiniteNumberValue(item.asset_index) ? item.asset_index : 0,
+        label: nullableString(item.label, "label"),
+        fact_status: nullableFactStatus(item.fact_status) ?? "visual_estimate",
+        execution_status: item.execution_status === "failed" ? "failed" : "completed",
+        vision_task: nullableString(item.vision_task, "vision_task"),
+      });
+    } catch {
+      // Skip malformed visual source entries rather than failing the stream.
+    }
+  }
+  return sources;
+}
+
 function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent {
   let parsed: unknown;
   try {
@@ -1142,6 +1205,17 @@ function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent
       retrieval_latency_ms: nullableFiniteNumber(parsed.retrieval_latency_ms, "retrieval_latency_ms"),
       llm_latency_ms: nullableFiniteNumber(parsed.llm_latency_ms, "llm_latency_ms"),
       latency_ms: requiredFiniteNumber(parsed.latency_ms, "latency_ms"),
+      fact_status: nullableFactStatus(parsed.fact_status),
+      safety_gate: nullableSafetyGate(parsed.safety_gate),
+      safety_notice: nullableString(parsed.safety_notice, "safety_notice"),
+      visual_sources: parseVisualSources(parsed.visual_sources),
+      answer_generated_by:
+        parsed.answer_generated_by === "agent" ||
+        parsed.answer_generated_by === "rag" ||
+        parsed.answer_generated_by === "safety_gate"
+          ? parsed.answer_generated_by
+          : null,
+      trust_id: nullableString(parsed.trust_id, "trust_id"),
     };
     return { event: "complete", data: complete };
   }

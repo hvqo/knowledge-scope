@@ -23,9 +23,11 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import aclosing
+from dataclasses import dataclass
 from typing import Any, Protocol
+from uuid import UUID
 
 from knowledge_scope.agent.planner import AgentPlanner
 from knowledge_scope.agent.schemas import (
@@ -57,10 +59,16 @@ from knowledge_scope.rag.schemas import (
     RAGQueryRequest,
     RAGStreamEvent,
     RAGToolStatusData,
+    RAGVisualSource,
 )
 from knowledge_scope.retrieval.unified import UnifiedRetrievalService
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.table_analysis.service import TableAnalysisService
+from knowledge_scope.vision.safety import (
+    assess_visual_risk,
+    build_gated_visual_answer,
+    extract_numeric_claims,
+)
 from knowledge_scope.vision.service import VisionAnalysisService
 
 logger = logging.getLogger(__name__)
@@ -91,6 +99,133 @@ _FALLBACK_NOTICE = (
     "未执行视觉分析或确定性计算；回答中若出现汇总、增长率等计算数值，"
     "均不是确定性工具结果，请以证据原文为准。）\n\n"
 )
+
+
+def _format_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
+    """Render deterministic table-tool results as trusted application text."""
+
+    if outcome is None or outcome.status != "completed":
+        return []
+    payload = outcome.payload or {}
+    if payload.get("status") != "ok":
+        return []
+    parts: list[str] = ["表格工具确定性计算结果（已核验）："]
+    columns = [
+        str(item.get("name", "")) for item in payload.get("columns") or [] if isinstance(item, dict)
+    ]
+    if columns:
+        parts.append("列：" + " | ".join(name for name in columns if name))
+    for row in (payload.get("rows") or [])[:6]:
+        cells = row.get("cells") if isinstance(row, dict) else row
+        if not isinstance(cells, list):
+            continue
+        parts.append("行：" + " | ".join("" if cell is None else str(cell) for cell in cells))
+    if payload.get("formula"):
+        parts.append("公式：" + str(payload["formula"]))
+    units = [str(unit) for unit in payload.get("units") or [] if unit]
+    if units:
+        parts.append("单位：" + " | ".join(units))
+    return ["\n".join(parts)] if len(parts) > 1 else []
+
+
+def _verified_table_answer(outcome: AgentToolOutcome | None) -> str:
+    facts = _format_table_facts(outcome)
+    if not facts:
+        return (
+            "表格工具没有返回可用于回答的确定性结果，因此本轮不输出精确数值，请核对原始表格证据。"
+        )
+    return (
+        "本轮回答中的部分数值无法由表格工具结果核验，为避免把未核验数字当作事实，"
+        "下面只给出表格工具的确定性计算结果：\n\n" + "\n".join(facts)
+    )
+
+
+def _table_cell_label(value: Any) -> bool:
+    """True when a cell is a textual row/indicator label, not a number."""
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return False
+    return not extract_numeric_claims(text)
+
+
+def _structured_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
+    """Render M2 structured results with explicit row, column, and unit binding.
+
+    The application — not the model — decides how each value is presented, so a
+    wrong field/value correspondence can never be published as verified text.
+    """
+
+    if outcome is None or outcome.status != "completed":
+        return []
+    payload = outcome.payload or {}
+    if payload.get("status") != "ok":
+        return []
+    columns = [
+        str(item.get("name", "")).strip()
+        for item in payload.get("columns") or []
+        if isinstance(item, dict)
+    ]
+    units = [str(unit).strip() for unit in payload.get("units") or [] if str(unit).strip()]
+    per_column_units = len(units) == len(columns)
+    facts: list[str] = []
+    for row in (payload.get("rows") or [])[:10]:
+        cells = row.get("cells") if isinstance(row, dict) else row
+        if not isinstance(cells, list):
+            continue
+        labels = [str(cell).strip() for cell in cells if _table_cell_label(cell)]
+        pairs: list[str] = []
+        for index, cell in enumerate(cells):
+            text = "" if cell is None else str(cell).strip()
+            if not text or _table_cell_label(cell):
+                continue
+            column = columns[index] if index < len(columns) else f"列 {index + 1}"
+            unit = ""
+            if len(units) == 1:
+                unit = f" {units[0]}"
+            elif per_column_units and units[index]:
+                unit = f" {units[index]}"
+            pairs.append(f"{column} = {text}{unit}")
+        if not pairs:
+            continue
+        prefix = " / ".join(labels) if labels else "结果"
+        facts.append(f"{prefix}：" + "；".join(pairs) + "。")
+    formula = str(payload.get("formula") or "").strip()
+    if formula:
+        facts.append(f"公式：{formula}")
+    if len(units) > 1 and not per_column_units:
+        facts.append("单位：" + " | ".join(units))
+    return facts
+
+
+def _structured_table_answer(outcome: AgentToolOutcome | None) -> str:
+    facts = _structured_table_facts(outcome)
+    if not facts:
+        return (
+            "表格工具没有返回可用于回答的确定性结果，因此本轮不输出精确数值，请核对原始表格证据。"
+        )
+    return "根据表格工具的确定性计算结果（已核验，数值与行列、单位一一对应）：\n\n" + "\n".join(
+        facts
+    )
+
+
+@dataclass(frozen=True)
+class _VisualExecution:
+    """One actual ``analyze_image`` attempt with its application parameters."""
+
+    candidate: AgentCandidate
+    outcome: AgentToolOutcome
+    asset_index: int
+    vision_task: str
+
+
+def _last_completed_visual(
+    executions: Sequence[_VisualExecution],
+) -> _VisualExecution | None:
+    for execution in reversed(executions):
+        if execution.outcome.status == "completed":
+            return execution
+    return None
 
 
 class _RAGStreamService(Protocol):
@@ -211,6 +346,12 @@ class AgentChatService:
         trace: list[RAGAgentToolTraceData] = []
         candidates: tuple[AgentCandidate, ...] = ()
         used_candidates: set[int] = set()
+        visual_executions: list[_VisualExecution] = []
+        visual_outcome: AgentToolOutcome | None = None
+        table_outcome: AgentToolOutcome | None = None
+        table_candidates: set[int] = set()
+        table_verified = False
+        risk = assess_visual_risk(request.query)
 
         if request.knowledge_base_id is None:  # validated by the request schema
             yield _error_event("agent", "智能体问答需要指定知识库")
@@ -239,6 +380,23 @@ class AgentChatService:
                 )
             )
             yield _tool_status("retrieval", "failed", "检索阶段失败，已降级为常规检索问答", step)
+            if self._needs_visual_number_gate(risk, visual_outcome):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_executions=[],
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "检索阶段失败",
@@ -264,6 +422,23 @@ class AgentChatService:
                     summary="未检索到可引用来源，已降级为常规检索问答",
                 )
             )
+            if self._needs_visual_number_gate(risk, visual_outcome):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_executions=[],
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "未检索到可引用来源",
@@ -295,7 +470,7 @@ class AgentChatService:
         )
 
         executor = self._build_executor(document_loader)
-        used_tool_keys: set[tuple[str, int]] = set()
+        used_tool_keys: set[tuple[str, int, int]] = set()
         try:
             for _round in range(self._settings.agent_max_rounds):
                 plan = await self._planner.plan(
@@ -310,7 +485,11 @@ class AgentChatService:
                 tool = plan.tool
                 if tool is None:  # validator guarantees a tool; defensive only
                     break
-                key = (tool, plan.evidence_index)
+                key = (
+                    tool,
+                    plan.evidence_index,
+                    plan.asset_index if tool == "analyze_image" else 0,
+                )
                 if key in used_tool_keys or tool_calls >= self._settings.agent_max_tool_calls:
                     yield _tool_status(
                         tool,
@@ -351,6 +530,22 @@ class AgentChatService:
                     second_candidate,
                 )
                 yield _tool_status(tool, outcome.status, outcome.summary, step)
+                if outcome.tool == "analyze_image":
+                    visual_executions.append(
+                        _VisualExecution(
+                            candidate=candidate,
+                            outcome=outcome,
+                            asset_index=plan.asset_index,
+                            vision_task=plan.vision_task or "describe_image",
+                        )
+                    )
+                    visual_outcome = outcome
+                elif outcome.tool == "analyze_table" and outcome.status == "completed":
+                    table_verified = True
+                    table_outcome = outcome
+                    table_candidates.add(candidate.index)
+                    if second_candidate is not None:
+                        table_candidates.add(second_candidate.index)
                 trace.append(
                     RAGAgentToolTraceData(
                         tool=outcome.tool,
@@ -359,6 +554,7 @@ class AgentChatService:
                         evidence_id=candidate.evidence_id,
                         document_id=candidate.citation.document_id,
                         parameters=_trace_parameters(plan, candidate, second_candidate),
+                        fact_status=outcome.fact_status,
                         error_code=outcome.error_code,
                     )
                 )
@@ -371,6 +567,23 @@ class AgentChatService:
                 )
         except AgentPlanningError:
             logger.warning("agent planning failed after %s tool calls", tool_calls)
+            if self._needs_visual_number_gate(risk, visual_outcome):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_executions=visual_executions,
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "工具规划失败",
@@ -383,6 +596,24 @@ class AgentChatService:
                 yield event
             return
 
+        if self._needs_visual_number_gate(risk, visual_outcome):
+            async for event in self._safety_gated_events(
+                request,
+                risk=risk,
+                candidates=candidates,
+                trace=trace,
+                tool_calls=tool_calls,
+                visual_executions=visual_executions,
+                table_outcome=table_outcome,
+                table_candidates=table_candidates,
+                retrieval_latency_ms=retrieval_latency_ms,
+                retrieval_degraded=retrieval_degraded,
+                branch_statuses=branch_statuses,
+                started=started,
+            ):
+                yield event
+            return
+
         async for event in self._answer_events(
             request,
             candidates=candidates,
@@ -390,6 +621,11 @@ class AgentChatService:
             tool_calls=tool_calls,
             trace=trace,
             used_candidates=used_candidates,
+            visual_executions=visual_executions,
+            table_verified=table_verified,
+            risk=risk,
+            table_outcome=table_outcome,
+            table_candidates=table_candidates,
             history_context=history_context,
             history_plan=history_plan,
             rewritten=rewritten,
@@ -400,6 +636,123 @@ class AgentChatService:
             started=started,
         ):
             yield event
+
+    @staticmethod
+    def _needs_visual_number_gate(
+        risk: object,
+        visual_outcome: AgentToolOutcome | None,
+    ) -> bool:
+        """Decide whether the turn must not trust visual numbers.
+
+        A successful table tool proves only its own deterministic calculation.
+        It never upgrades an unrelated visual-number claim, so the gate cannot
+        be skipped merely because a table tool succeeded.
+        """
+
+        if not bool(getattr(risk, "high_risk", False)):
+            return False
+        if visual_outcome is not None:
+            return True
+        return bool(getattr(risk, "visual_intent", False))
+
+    async def _safety_gated_events(
+        self,
+        request: RAGQueryRequest,
+        *,
+        risk: object,
+        candidates: tuple[AgentCandidate, ...],
+        trace: list[RAGAgentToolTraceData],
+        tool_calls: int,
+        visual_executions: Sequence[_VisualExecution],
+        retrieval_latency_ms: float,
+        retrieval_degraded: bool,
+        branch_statuses: dict[str, str] | None,
+        started: float,
+        table_outcome: AgentToolOutcome | None = None,
+        table_candidates: set[int] | None = None,
+    ) -> AsyncIterator[RAGStreamEvent]:
+        """Return a deterministic, number-free answer instead of trusting the VLM.
+
+        The normal streaming answer is never started for this turn, so an
+        unverified visual number cannot leak through ``answer_delta``.
+        """
+
+        completed_visual = _last_completed_visual(visual_executions)
+        vision_completed = completed_visual is not None
+        description: str | None = None
+        if completed_visual is not None:
+            payload = completed_visual.outcome.payload or {}
+            answer = payload.get("answer")
+            if isinstance(answer, str):
+                description = answer
+        verified_facts = _structured_table_facts(table_outcome)
+        answer, notice = build_gated_visual_answer(
+            description=description,
+            vision_completed=vision_completed,
+            verified_facts=verified_facts,
+        )
+        used = set(table_candidates or ())
+        for execution in visual_executions:
+            used.add(execution.candidate.index)
+        citations = _select_citations(
+            candidates,
+            used_markers=set(),
+            used_candidates=used,
+        )
+        if citations:
+            yield RAGStreamEvent(
+                event="citations",
+                data=RAGCitationsData(
+                    prompt_version=AGENT_PROMPT_VERSION,
+                    items=citations,
+                ).model_dump(mode="json"),
+            )
+        yield _delta_event(answer)
+        has_table_facts = bool(verified_facts)
+        if vision_completed and has_table_facts:
+            fact_status = "unverified"
+            gate = "visual_numeric_withheld"
+            notice = "表格部分为确定性计算结果（已核验）；图片中的数值未经核验，已省略精确数字。"
+        elif completed_visual is not None:
+            fact_status = completed_visual.outcome.fact_status or "not_available"
+            gate = "visual_numeric_withheld"
+        elif has_table_facts:
+            fact_status = "source_verified"
+            gate = "vision_unavailable"
+            notice = "视觉分析未能完成，已阻止未核验的数值输出；表格计算结果已核验"
+        else:
+            fact_status = "not_available"
+            gate = "vision_unavailable"
+        yield RAGStreamEvent(
+            event="complete",
+            data=RAGCompleteData(
+                status="completed",
+                prompt_version=AGENT_PROMPT_VERSION,
+                provider=None,
+                model=None,
+                retrieval_mode="unified",
+                route="unified",
+                answer_mode="agent",
+                tool_calls=tool_calls,
+                agent_candidates=_candidate_records(candidates),
+                agent_tool_trace=trace or None,
+                agent_degraded=False,
+                fact_status=fact_status,
+                safety_gate=gate,
+                safety_notice=notice,
+                visual_sources=_visual_sources(visual_executions),
+                rewritten_query=None,
+                retrieval_cached=False,
+                retrieval_escalated=False,
+                memories_used=len(request.memories) if request.memories else 0,
+                retrieval_degraded=retrieval_degraded,
+                retrieval_branch_statuses=branch_statuses,
+                finish_reason="safety_gate",
+                retrieval_latency_ms=retrieval_latency_ms,
+                llm_latency_ms=0.0,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            ).model_dump(mode="json"),
+        )
 
     async def _prepare_history(
         self,
@@ -451,6 +804,83 @@ class AgentChatService:
             error_message="不支持的智能体工具",
         )
 
+    async def _deterministic_table_events(
+        self,
+        request: RAGQueryRequest,
+        *,
+        candidates: tuple[AgentCandidate, ...],
+        tool_calls: int,
+        trace: list[RAGAgentToolTraceData],
+        used_candidates: set[int],
+        table_outcome: AgentToolOutcome,
+        table_candidates: set[int],
+        history_plan: HistoryPlan | None,
+        rewritten: str | None,
+        rewrite_latency_ms: float | None,
+        retrieval_latency_ms: float,
+        retrieval_degraded: bool,
+        branch_statuses: dict[str, str] | None,
+        started: float,
+    ) -> AsyncIterator[RAGStreamEvent]:
+        """Publish the M2 structured result directly, without model paraphrasing.
+
+        High-risk statistical questions are answered from the table tool output
+        itself. The model never gets a chance to attach the right number to the
+        wrong country/metric/unit, so no numeric-field correspondence has to be
+        inferred from free-form text.
+        """
+
+        answer = _structured_table_answer(table_outcome)
+        yield _delta_event(answer)
+        citations = _select_citations(
+            candidates,
+            used_markers=set(),
+            used_candidates=used_candidates | table_candidates,
+        )
+        yield RAGStreamEvent(
+            event="citations",
+            data=RAGCitationsData(
+                prompt_version=AGENT_PROMPT_VERSION,
+                items=citations,
+            ).model_dump(mode="json"),
+        )
+        history_fields = _history_fields(history_plan)
+        llm_latency_ms = 0.0
+        yield RAGStreamEvent(
+            event="complete",
+            data=RAGCompleteData(
+                status="completed",
+                prompt_version=AGENT_PROMPT_VERSION,
+                provider=None,
+                model=None,
+                retrieval_mode="unified",
+                route="unified",
+                answer_mode="agent",
+                tool_calls=tool_calls,
+                agent_candidates=_candidate_records(candidates),
+                agent_tool_trace=trace or None,
+                agent_degraded=False,
+                fact_status="source_verified",
+                safety_gate="none",
+                safety_notice="回答中的数值来自表格工具的确定性计算结果，未经模型改写。",
+                visual_sources=[],
+                rewritten_query=rewritten,
+                retrieval_cached=False,
+                retrieval_escalated=False,
+                rewrite_latency_ms=rewrite_latency_ms,
+                history_compressed_turns=history_fields[0],
+                history_cache_hit=history_fields[1],
+                history_summary_used=history_fields[2],
+                memories_used=len(request.memories) if request.memories else 0,
+                retrieval_degraded=retrieval_degraded,
+                retrieval_branch_statuses=branch_statuses,
+                finish_reason="deterministic_table",
+                retrieval_latency_ms=retrieval_latency_ms,
+                llm_latency_ms=llm_latency_ms,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            ).model_dump(mode="json"),
+        )
+
     async def _answer_events(
         self,
         request: RAGQueryRequest,
@@ -460,6 +890,11 @@ class AgentChatService:
         tool_calls: int,
         trace: list[RAGAgentToolTraceData],
         used_candidates: set[int],
+        visual_executions: Sequence[_VisualExecution],
+        table_verified: bool,
+        risk: object,
+        table_outcome: AgentToolOutcome | None,
+        table_candidates: set[int],
         history_context: str,
         history_plan: HistoryPlan | None,
         rewritten: str | None,
@@ -469,6 +904,29 @@ class AgentChatService:
         branch_statuses: dict[str, str] | None,
         started: float,
     ) -> AsyncIterator[RAGStreamEvent]:
+        if (
+            bool(getattr(risk, "high_risk", False))
+            and table_outcome is not None
+            and not visual_executions
+        ):
+            async for event in self._deterministic_table_events(
+                request,
+                candidates=candidates,
+                tool_calls=tool_calls,
+                trace=trace,
+                used_candidates=used_candidates,
+                table_outcome=table_outcome,
+                table_candidates=table_candidates,
+                history_plan=history_plan,
+                rewritten=rewritten,
+                rewrite_latency_ms=rewrite_latency_ms,
+                retrieval_latency_ms=retrieval_latency_ms,
+                retrieval_degraded=retrieval_degraded,
+                branch_statuses=branch_statuses,
+                started=started,
+            ):
+                yield event
+            return
         messages = [
             LLMMessage(role="system", content=_ANSWER_SYSTEM_PROMPT),
             LLMMessage(
@@ -556,6 +1014,23 @@ class AgentChatService:
             ).model_dump(mode="json"),
         )
         history_fields = _history_fields(history_plan)
+        if table_verified:
+            fact_status = "source_verified"
+            safety_gate = "none"
+            safety_notice = None
+        elif visual_executions:
+            completed_visual = _last_completed_visual(visual_executions)
+            fact_status = (
+                completed_visual.outcome.fact_status
+                if completed_visual is not None and completed_visual.outcome.fact_status
+                else "not_available"
+            )
+            safety_gate = "visual_unverified"
+            safety_notice = "视觉分析结果仅供参考，需人工核对，不能作为精确统计数据使用。"
+        else:
+            fact_status = "not_available"
+            safety_gate = "none"
+            safety_notice = None
         yield RAGStreamEvent(
             event="complete",
             data=RAGCompleteData(
@@ -570,6 +1045,10 @@ class AgentChatService:
                 agent_candidates=_candidate_records(candidates),
                 agent_tool_trace=trace or None,
                 agent_degraded=False,
+                fact_status=fact_status,
+                safety_gate=safety_gate,
+                safety_notice=safety_notice,
+                visual_sources=_visual_sources(visual_executions),
                 rewritten_query=rewritten,
                 retrieval_cached=False,
                 retrieval_escalated=False,
@@ -622,6 +1101,8 @@ class AgentChatService:
                 data["agent_degraded"] = True
                 data["agent_degraded_reason"] = reason[:200]
                 data["agent_tool_trace"] = [item.model_dump(mode="json") for item in trace] or None
+                data["fact_status"] = data.get("fact_status") or "not_available"
+                data.setdefault("safety_gate", "none")
                 yield RAGStreamEvent(event="complete", data=data)
             else:
                 yield event
@@ -635,10 +1116,12 @@ def _trace_parameters(
     parameters: dict[str, Any] = {}
     if plan.operation is not None:
         parameters["operation"] = plan.operation
-    if plan.vision_task is not None:
-        parameters["vision_task"] = plan.vision_task
-    if plan.asset_index:
+    if plan.tool == "analyze_image":
+        # Record the exact asset the planner asked for, including index 0.
+        parameters["vision_task"] = plan.vision_task or "describe_image"
         parameters["asset_index"] = plan.asset_index
+    elif plan.vision_task is not None:
+        parameters["vision_task"] = plan.vision_task
     if plan.question is not None:
         parameters["question"] = plan.question
     if plan.second_evidence_index is not None:
@@ -652,6 +1135,79 @@ def _trace_parameters(
         parameters["second_document_id"] = str(second_candidate.citation.document_id)
         parameters["second_evidence_id"] = second_candidate.evidence_id
     return parameters or None
+
+
+def _visual_sources(
+    executions: Sequence[_VisualExecution],
+) -> list[RAGVisualSource]:
+    """Expose every image the analyze_image tool actually attempted.
+
+    The identifiers and the asset index come from the executed plan and M1
+    validated lineage, never from model output. Duplicate assets are collapsed,
+    but distinct assets of the same Evidence stay separate and keep execution
+    order. Failed attempts are listed with ``execution_status="failed"`` so the
+    UI never presents them as successful analyses.
+    """
+
+    sources: list[RAGVisualSource] = []
+    seen: set[tuple[str, str, int]] = set()
+    for execution in executions:
+        candidate = execution.candidate
+        outcome = execution.outcome
+        knowledge_base_id = candidate.citation.knowledge_base_id
+        evidence_id = candidate.evidence_id
+        if knowledge_base_id is None or evidence_id is None:
+            continue
+        raw_sources = (outcome.payload or {}).get("sources")
+        page_start = candidate.citation.page_start
+        page_end = candidate.citation.page_end
+        source_block_ids = list(candidate.citation.source_block_ids)[:64]
+        for raw in raw_sources if isinstance(raw_sources, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                raw_kb = UUID(str(raw["knowledge_base_id"]))
+                raw_document = UUID(str(raw["document_id"]))
+                raw_evidence = str(raw["evidence_id"])
+                page_start = int(raw["page_start"])
+                page_end = int(raw["page_end"])
+                source_block_ids = [str(item) for item in raw.get("source_block_ids") or []][:64]
+            except (KeyError, TypeError, ValueError):
+                continue
+            knowledge_base_id = raw_kb
+            document_id = raw_document
+            evidence_id = raw_evidence
+            break
+        else:
+            document_id = candidate.citation.document_id
+        key = (str(document_id), evidence_id, execution.asset_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        completed = outcome.status == "completed"
+        try:
+            sources.append(
+                RAGVisualSource(
+                    knowledge_base_id=knowledge_base_id,
+                    document_id=document_id,
+                    evidence_id=evidence_id,
+                    page_start=page_start,
+                    page_end=page_end,
+                    source_block_ids=source_block_ids,
+                    asset_index=execution.asset_index,
+                    label=f"第 {page_start} 页图片",
+                    fact_status=(
+                        outcome.fact_status
+                        if completed and outcome.fact_status
+                        else "not_available"
+                    ),
+                    execution_status="completed" if completed else "failed",
+                    vision_task=execution.vision_task,
+                )
+            )
+        except ValueError:
+            continue
+    return sources
 
 
 def _candidate_records(

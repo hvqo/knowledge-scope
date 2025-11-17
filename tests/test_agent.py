@@ -1283,3 +1283,408 @@ async def test_agent_api_times_out_stalled_turn(
     assert "智能体执行超过" in response.text
     assert frames[-1] == "event: complete"
     assert '"answer_mode":"agent"' in response.text
+
+
+def _service_table_outcome() -> AgentToolOutcome:
+    return AgentToolOutcome(
+        tool="analyze_table",
+        status="completed",
+        summary="表格计算完成（growth）",
+        payload={
+            "status": "ok",
+            "operation": "growth",
+            "columns": [
+                {"name": "指标"},
+                {"name": "基期值"},
+                {"name": "报告期值"},
+                {"name": "绝对变化"},
+                {"name": "相对变化"},
+            ],
+            "rows": [{"cells": ["越南", "4300", "4760", "460", "10.6977"]}],
+            "formula": "((4760 - 4300) / 4300) × 100% = 10.6977%",
+            "units": ["亿美元", "%"],
+            "sources": [
+                {
+                    "document_id": str(DOC_ID),
+                    "evidence_id": "evidence_v1_" + "c" * 64,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "source_block_ids": ["p1-b3"],
+                }
+            ],
+        },
+        fact_status="source_verified",
+    )
+
+
+def _service_image_outcome() -> AgentToolOutcome:
+    return AgentToolOutcome(
+        tool="analyze_image",
+        status="completed",
+        summary="图表分析完成（fake-vlm）",
+        payload={
+            "status": "ok",
+            "answer": "Q1 最低约 120，Q4 最高约 210",
+            "fact_status": "visual_estimate",
+            "sources": [
+                {
+                    "knowledge_base_id": str(KB_ID),
+                    "document_id": str(DOC_ID),
+                    "evidence_id": "evidence_v1_" + "d" * 64,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "source_block_ids": ["p1-b2"],
+                }
+            ],
+        },
+        fact_status="visual_estimate",
+        numeric_claims=[{"value": "120", "fact_status": "visual_estimate"}],
+    )
+
+
+def test_mixed_table_and_visual_tools_gate_unverified_visual_numbers() -> None:
+    table_candidate = _candidate(
+        1,
+        marker="C1",
+        modality="table",
+        evidence_id="evidence_v1_" + "c" * 64,
+        table_columns=("年份", "GDP"),
+    )
+    image_candidate = _candidate(
+        2,
+        marker="C2",
+        modality="image",
+        evidence_id="evidence_v1_" + "d" * 64,
+    )
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_table",
+                "evidence_index": 1,
+                "operation": "growth",
+                "parameters": {
+                    "axis": "columns",
+                    "row": 0,
+                    "base_column": 1,
+                    "target_column": 2,
+                },
+            },
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 2,
+                "vision_task": "describe_image",
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["Q1 最低销售额为 120 万元。", "表格增长率为 10.6977%。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([table_candidate, image_candidate])),
+        executor=_StubExecutor([_service_table_outcome(), _service_image_outcome()]),
+    )
+    request = RAGQueryRequest(
+        query="计算表格中的增长率，并给出柱状图最低季度的具体金额。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    assert "120" not in answer
+    assert "10.6977" in answer
+    assert "未经核验" in answer
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["safety_gate"] == "visual_numeric_withheld"
+    assert complete.data["fact_status"] in {"visual_estimate", "unverified"}
+    assert len(complete.data["visual_sources"]) == 1
+
+
+def test_table_only_high_risk_answer_replaces_unverified_numbers() -> None:
+    table_candidate = _candidate(
+        1,
+        marker="C1",
+        modality="table",
+        evidence_id="evidence_v1_" + "c" * 64,
+        table_columns=("年份", "GDP"),
+    )
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_table",
+                "evidence_index": 1,
+                "operation": "growth",
+                "parameters": {
+                    "axis": "columns",
+                    "row": 0,
+                    "base_column": 1,
+                    "target_column": 2,
+                },
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["表格中的增长率是 99.9%。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([table_candidate])),
+        executor=_StubExecutor([_service_table_outcome()]),
+    )
+    request = RAGQueryRequest(
+        query="表格中的增长率是多少？请给出精确值。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    assert "99.9" not in answer
+    assert "10.6977" in answer
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["fact_status"] == "source_verified"
+    assert complete.data["safety_gate"] == "none"
+    assert complete.data["finish_reason"] == "deterministic_table"
+    assert complete.data["provider"] is None
+
+
+# ---------------------------------------------------------------------------
+# Visual execution provenance (multi-image, asset index, failure states)
+# ---------------------------------------------------------------------------
+
+
+def _visual_source(
+    *,
+    evidence_id: str,
+    document_id: UUID = DOC_ID,
+    page: int = 1,
+    blocks: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "knowledge_base_id": str(KB_ID),
+        "document_id": str(document_id),
+        "evidence_id": evidence_id,
+        "page_start": page,
+        "page_end": page,
+        "source_block_ids": blocks or ["p1-b2"],
+    }
+
+
+def _analyze_image_outcome(
+    *,
+    status: str = "completed",
+    asset_index: int = 0,
+    vision_task: str = "describe_image",
+    sources: list[dict[str, Any]] | None = None,
+    answer: str = "柱状图展示 2023 年季度销售额，Q4 最高。",
+    fact_status: str | None = "visual_estimate",
+) -> AgentToolOutcome:
+    payload: dict[str, Any] = {
+        "status": "ok" if status == "completed" else "failed",
+        "answer": answer,
+        "sources": sources or [],
+        "asset_index": asset_index,
+        "vision_task": vision_task,
+        "execution_status": status,
+    }
+    if status != "completed":
+        payload["error_code"] = "provider_connection"
+        payload["message"] = "无法连接视觉模型服务"
+    return AgentToolOutcome(
+        tool="analyze_image",
+        status=status,  # type: ignore[arg-type]
+        summary="图片理解完成（fake-vlm）" if status == "completed" else "视觉工具执行失败",
+        payload=payload,
+        error_code=None if status == "completed" else "provider_connection",
+        error_message=None if status == "completed" else "无法连接视觉模型服务",
+        fact_status=fact_status if status == "completed" else "not_available",
+    )
+
+
+def _visual_plan(
+    evidence_index: int,
+    *,
+    asset_index: int = 0,
+    task: str = "describe_image",
+) -> dict[str, Any]:
+    return {
+        "action": "call_tool",
+        "reason": "需要看图",
+        "tool": "analyze_image",
+        "evidence_index": evidence_index,
+        "asset_index": asset_index,
+        "vision_task": task,
+    }
+
+
+def _visual_sources_complete(events: list[RAGStreamEvent]) -> dict[str, Any]:
+    complete = next(event for event in events if event.event == "complete")
+    return complete.data
+
+
+def test_agent_service_reports_every_used_image_without_asset_collapse() -> None:
+    evidence_one = "evidence_v1_" + "1" * 64
+    evidence_two = "evidence_v1_" + "2" * 64
+    candidates = (
+        _candidate(1, marker="C1", evidence_id=evidence_one),
+        _candidate(2, marker="C2", evidence_id=evidence_two),
+    )
+    gateway = _FakeGateway(
+        plans=[
+            _visual_plan(1, asset_index=1, task="describe_image"),
+            _visual_plan(2, asset_index=0, task="analyze_chart"),
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["图 1 的柱状图显示 Q4 最高。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result(list(candidates))),
+        executor=_StubExecutor(
+            [
+                _analyze_image_outcome(
+                    asset_index=1, sources=[_visual_source(evidence_id=evidence_one)]
+                ),
+                _analyze_image_outcome(
+                    asset_index=0,
+                    vision_task="analyze_chart",
+                    sources=[_visual_source(evidence_id=evidence_two)],
+                ),
+            ]
+        ),
+    )
+    request = RAGQueryRequest(
+        query="对比图 1 和图 2，说明 2023 年季度销售额的变化趋势。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+    complete = _visual_sources_complete(events)
+    sources = complete["visual_sources"]
+    assert len(sources) == 2
+    assert [item["asset_index"] for item in sources] == [1, 0]
+    assert [item["evidence_id"] for item in sources] == [evidence_one, evidence_two]
+    assert all(item["execution_status"] == "completed" for item in sources)
+    trace = complete["agent_tool_trace"]
+    analyze_entries = [item for item in trace if item["tool"] == "analyze_image"]
+    assert [item["parameters"]["asset_index"] for item in analyze_entries] == [1, 0]
+    assert [item["parameters"]["vision_task"] for item in analyze_entries] == [
+        "describe_image",
+        "analyze_chart",
+    ]
+
+
+def test_agent_service_keeps_two_asset_indices_of_the_same_evidence() -> None:
+    evidence_id = "evidence_v1_" + "3" * 64
+    candidate = _candidate(1, marker="C1", evidence_id=evidence_id)
+    gateway = _FakeGateway(
+        plans=[
+            _visual_plan(1, asset_index=0),
+            _visual_plan(1, asset_index=1),
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["两张素材都已分析。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([candidate])),
+        executor=_StubExecutor(
+            [
+                _analyze_image_outcome(
+                    asset_index=0, sources=[_visual_source(evidence_id=evidence_id)]
+                ),
+                _analyze_image_outcome(
+                    asset_index=1, sources=[_visual_source(evidence_id=evidence_id)]
+                ),
+            ]
+        ),
+    )
+    request = RAGQueryRequest(
+        query="图 1 中最低季度的具体销售额是多少？",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+    complete = _visual_sources_complete(events)
+    sources = complete["visual_sources"]
+    assert [item["asset_index"] for item in sources] == [0, 1]
+    assert all(item["evidence_id"] == evidence_id for item in sources)
+
+
+def test_agent_service_marks_failed_visual_execution_separately() -> None:
+    first = "evidence_v1_" + "4" * 64
+    second = "evidence_v1_" + "5" * 64
+    candidates = (
+        _candidate(1, marker="C1", evidence_id=first),
+        _candidate(2, marker="C2", evidence_id=second),
+    )
+    gateway = _FakeGateway(
+        plans=[
+            _visual_plan(1, asset_index=0),
+            _visual_plan(2, asset_index=0),
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["Q1 销售额为 120 万元。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result(list(candidates))),
+        executor=_StubExecutor(
+            [
+                _analyze_image_outcome(asset_index=0, sources=[_visual_source(evidence_id=first)]),
+                _analyze_image_outcome(
+                    status="failed", asset_index=0, sources=[_visual_source(evidence_id=second)]
+                ),
+            ]
+        ),
+    )
+    request = RAGQueryRequest(
+        query="图 1 中最低季度的具体销售额是多少？请给出精确数值。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    complete = _visual_sources_complete(events)
+    sources = complete["visual_sources"]
+    assert "120" not in answer
+    assert [item["execution_status"] for item in sources] == ["completed", "failed"]
+    assert sources[1]["fact_status"] == "not_available"
+    assert complete["safety_gate"] == "visual_numeric_withheld"
+
+
+def test_agent_service_vision_failure_does_not_fall_back_to_number_guess() -> None:
+    evidence_id = "evidence_v1_" + "6" * 64
+    candidate = _candidate(1, marker="C1", evidence_id=evidence_id)
+    gateway = _FakeGateway(
+        plans=[
+            _visual_plan(1),
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["Q1 销售额为 120 万元。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([candidate])),
+        executor=_StubExecutor(
+            [
+                _analyze_image_outcome(
+                    status="failed", sources=[_visual_source(evidence_id=evidence_id)]
+                )
+            ]
+        ),
+    )
+    request = RAGQueryRequest(
+        query="图 1 中最低季度的具体销售额是多少？",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    complete = _visual_sources_complete(events)
+    assert "120" not in answer
+    assert complete["safety_gate"] == "vision_unavailable"
+    assert complete["fact_status"] == "not_available"
+    assert complete["visual_sources"][0]["execution_status"] == "failed"

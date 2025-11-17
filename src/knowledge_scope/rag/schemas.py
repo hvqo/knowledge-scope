@@ -53,6 +53,9 @@ class RAGQueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4_000)
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
+    # Bound server-generated trust records to the persisted conversation. Only
+    # the chat UI supplies this; direct API callers keep an unrecorded answer.
+    conversation_id: UUID | None = None
     retrieval_mode: RAGRequestedRetrievalMode = "dense"
     answer_mode: RAGAnswerMode = "standard"
     # Long-term memories injected by the API layer, scoped to one knowledge base.
@@ -262,6 +265,48 @@ class RAGAgentCandidateData(BaseModel):
     page_end: int = Field(ge=1)
 
 
+RAGFactStatus = Literal[
+    "source_verified",
+    "visual_estimate",
+    "unverified",
+    "not_available",
+]
+RAGSafetyGate = Literal[
+    "none",
+    "visual_numeric_withheld",
+    "visual_unverified",
+    "vision_unavailable",
+    # A high-risk answer contained numbers that could not be traced back to the
+    # executed table tool; the application replaced them before streaming.
+    "unverified_numbers_withheld",
+]
+
+
+class RAGVisualSource(BaseModel):
+    """One image the agent actually analysed, exposed for direct display.
+
+    Only identifiers that the server already validated are included; the
+    client builds image URLs through the existing Evidence asset endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    knowledge_base_id: UUID
+    document_id: UUID
+    evidence_id: str = Field(pattern=r"^evidence_v1_[0-9a-f]{64}$")
+    page_start: int = Field(ge=1)
+    page_end: int = Field(ge=1)
+    source_block_ids: list[str] = Field(default_factory=list, max_length=64)
+    asset_index: int = Field(default=0, ge=0, le=255)
+    label: str | None = Field(default=None, max_length=200)
+    fact_status: RAGFactStatus = "visual_estimate"
+    # Application-recorded execution state for this exact asset. A failed
+    # attempt is listed (so users can see which image was attempted) but is
+    # never presented as a successful visual analysis.
+    execution_status: Literal["completed", "failed"] = "completed"
+    vision_task: str | None = Field(default=None, max_length=40)
+
+
 class RAGAgentToolTraceData(BaseModel):
     """Sanitized record of one executed or skipped agent tool step."""
 
@@ -275,6 +320,9 @@ class RAGAgentToolTraceData(BaseModel):
     # Only the bounded, validated tool contract parameters (never free-form
     # model text) are echoed for auditability.
     parameters: dict[str, Any] | None = None
+    # Application-assigned provenance of this specific tool result. A verified
+    # table calculation never upgrades an additional visual-numeric claim.
+    fact_status: RAGFactStatus | None = None
     error_code: str | None = None
 
 
@@ -318,6 +366,17 @@ class RAGCompleteData(BaseModel):
     agent_degraded_reason: str | None = Field(default=None, max_length=200)
     agent_candidates: list[RAGAgentCandidateData] | None = None
     agent_tool_trace: list[RAGAgentToolTraceData] | None = None
+    # Application-assigned fact provenance and safety-gate outcome. These are
+    # always decided by server code, never by the model or the browser.
+    fact_status: RAGFactStatus | None = None
+    safety_gate: RAGSafetyGate = "none"
+    safety_notice: str | None = Field(default=None, max_length=400)
+    visual_sources: list[RAGVisualSource] = Field(default_factory=list)
+    # Which pipeline produced the answer and the signed server-side trust
+    # record id. ``answer_generated_by`` is set by the application wrapper, never
+    # by the model, and report insertion refuses answers without a valid record.
+    answer_generated_by: Literal["agent", "rag", "safety_gate"] | None = None
+    trust_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     # The follow-up question as rewritten for retrieval, when one was needed.
     rewritten_query: str | None = None
     # Whether the assembled context was served from the retrieval cache.
@@ -387,10 +446,13 @@ __all__ = [
     "RAGCompletionStatus",
     "RAGErrorData",
     "RAGEventName",
+    "RAGFactStatus",
     "RAGQueryRequest",
     "RAGRetrievalMode",
+    "RAGSafetyGate",
     "RAGStreamEvent",
     "RAGToolName",
     "RAGToolStatusData",
     "RAGToolStatusValue",
+    "RAGVisualSource",
 ]
