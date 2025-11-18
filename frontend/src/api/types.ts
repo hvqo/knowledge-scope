@@ -343,7 +343,7 @@ export type RAGCitationSnippetKind = "source" | "representation";
 export type RAGCompletionStatus = "completed" | "insufficient_evidence" | "error";
 
 export interface RAGCitationBranch {
-  branch: "dense" | "sparse" | "graph" | "multimodal";
+  branch: "dense" | "sparse" | "graph" | "multimodal" | "visual";
   rank: number;
   score: number;
   graph_seed_entity_id: string | null;
