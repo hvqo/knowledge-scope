@@ -596,29 +596,45 @@ class QdrantVisualStore:
         document_id: UUID,
         entries: list[tuple[VisualVectorPayload, bytes]],
     ) -> int:
-        """Replace one document's visual points without losing the old index.
+        """Encode and replace one document's visual point generation."""
 
-        Encoding happens before any write.  New points are written with
-        ``active=False``; only after the generation pointer switches are they
-        marked active and the previous generation removed.  A failed encode or
-        upsert therefore leaves the previous generation queryable.
-        """
-
-        client = self._get_client()
-        from qdrant_client import models
-
-        self.recover_document(document_id)
         payloads = [payload for payload, _bytes in entries]
         if not payloads:
-            self._delete_ids(self._scroll_ids(document_id=document_id))
-            return 0
-        knowledge_base_id = payloads[0].knowledge_base_id
+            return self.replace_document_vectors(document_id, [])
         try:
             vectors, _stats = self.encoder.encode_images(
                 [payload_bytes for _payload, payload_bytes in entries]
             )
         except Exception:
             raise VisualIndexError("视觉索引编码失败，旧索引保持不变") from None
+        return self.replace_document_vectors(
+            document_id,
+            [(payload, list(vector)) for payload, vector in zip(payloads, vectors, strict=True)],
+        )
+
+    def replace_document_vectors(
+        self,
+        document_id: UUID,
+        entries: list[tuple[VisualVectorPayload, list[float]]],
+    ) -> int:
+        """Publish pre-encoded visual vectors without exposing a visibility gap.
+
+        New points are written with ``active=False``; only after the generation
+        pointer switches are they marked active and the previous generation
+        removed.  A failed write therefore leaves the previous generation
+        queryable.
+        """
+
+        client = self._get_client()
+        from qdrant_client import models
+
+        self.recover_document(document_id)
+        payloads = [payload for payload, _vector in entries]
+        if not payloads:
+            self._delete_ids(self._scroll_ids(document_id=document_id))
+            return 0
+        knowledge_base_id = payloads[0].knowledge_base_id
+        vectors = [vector for _payload, vector in entries]
         generation = uuid4().hex
         staged_payloads = [
             payload.model_copy(update={"generation": generation, "active": False})
@@ -673,6 +689,27 @@ class QdrantVisualStore:
                     pass
             raise VisualIndexError("视觉索引切换失败，已回滚到旧索引") from None
         return len(points)
+
+    def document_active_records(self, *, document_id: UUID) -> list[dict[str, Any]]:
+        """Return the currently visible (pointer generation) payloads for a document."""
+
+        pointer = self._read_pointer(document_id)
+        pointer_generation = pointer.get("active_generation") if pointer else None
+        records = self._scroll_records(document_id=document_id)
+        active: list[dict[str, Any]] = []
+        for record in records:
+            payload = record.payload if isinstance(record.payload, dict) else {}
+            if payload.get("kind") == "generation_pointer":
+                continue
+            generation = payload.get("generation")
+            if isinstance(pointer_generation, str) and pointer_generation:
+                if generation != pointer_generation:
+                    continue
+            elif generation:
+                # No committed pointer: a generation-tagged point is pending.
+                continue
+            active.append(dict(payload))
+        return active
 
     def _delete_pointer(self, document_id: UUID) -> None:
         from qdrant_client import models

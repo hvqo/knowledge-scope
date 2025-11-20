@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 from typing import Annotated
@@ -84,6 +85,8 @@ from .schemas import (
     EvidenceDetailResponse,
     EvidenceRepresentationResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/knowledge-bases/{knowledge_base_id}/documents",
@@ -385,6 +388,21 @@ async def upload_document(
             ) from None
         metadata_committed = True
         await session.refresh(document)
+        ingestion_worker = getattr(request.app.state, "ingestion_worker", None)
+        if ingestion_worker is not None:
+            try:
+                await asyncio.to_thread(
+                    ingestion_worker.enqueue,
+                    document.id,
+                    knowledge_base_id,
+                    source_sha256=document.sha256,
+                )
+            except Exception:
+                logger.warning(
+                    "failed to enqueue auto-ingestion document=%s",
+                    document.id,
+                    exc_info=True,
+                )
         return document
     except UploadValidationError as error:
         await session.rollback()

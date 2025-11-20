@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol
 
 from knowledge_scope.shared.config import Settings
 
+from .model_loading import MODEL_LOADING_LOCK
 from .qdrant import RetrievedChunk
 
 RerankerDType = Literal["float16", "float32", "bfloat16"]
@@ -182,7 +183,8 @@ class LocalCrossEncoderReranker:
         if self.spec.prompt_mode == "qwen_default_query":
             constructor_kwargs["default_prompt_name"] = "query"
         try:
-            self._model = CrossEncoder(**constructor_kwargs)
+            with MODEL_LOADING_LOCK:
+                self._model = CrossEncoder(**constructor_kwargs)
         except Exception as error:
             raise RerankerError(f"local reranker could not be loaded: {self.model_id}") from error
         self._torch = torch

@@ -6,6 +6,7 @@ import type {
   KnowledgeBaseUpdateRequest,
   MetaResponse,
   Document,
+  IngestionStatusResponse,
   ChatConversation,
   ChatConversationDetail,
   ChatConversationListResponse,
@@ -451,6 +452,25 @@ export function appendChatMessage(
 export interface DocumentListParams {
   limit?: number;
   offset?: number;
+}
+
+export function fetchDocumentIngestion(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<IngestionStatusResponse> {
+  return request<IngestionStatusResponse>(
+    `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/ingestion`,
+  );
+}
+
+export function retryDocumentIngestion(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<IngestionStatusResponse> {
+  return request<IngestionStatusResponse>(
+    `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/ingestion/retry`,
+    { method: "POST" },
+  );
 }
 
 export function fetchDocuments(

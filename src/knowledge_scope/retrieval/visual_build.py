@@ -196,6 +196,149 @@ class VisualIndexBuilder:
         self.settings = settings
         self.store = store
 
+    def _collect_document_entries(
+        self,
+        knowledge_base_id: UUID,
+        artifact: MultimodalEvidenceDocument,
+        *,
+        mode: BuildMode,
+        stats: VisualBuildStats,
+        model_fingerprint: str,
+    ) -> list[tuple[VisualVectorPayload, bytes]]:
+        """Encode one evidence document without touching the vector collection."""
+
+        canonical = _load_canonical(self.settings, artifact.document_id)
+        entries: list[tuple[VisualVectorPayload, bytes]] = []
+        for evidence in artifact.evidence:
+            stats.evidences_scanned += 1
+            if evidence.modality != "image":
+                continue
+            stats.image_evidences += 1
+            page_number = evidence.lineage.page_start
+            page_image_count, page_has_table = _page_signals(canonical, page_number)
+            caption = _representation_text(evidence, "caption")
+            context = _representation_text(evidence, "context")
+            representation_ids = _representation_ids(evidence)
+            for asset_index, asset_ref in enumerate(evidence.lineage.asset_refs):
+                stats.images_total += 1
+                try:
+                    path = _asset_path(self.settings, artifact.document_id, asset_ref)
+                except VisualBuildError:
+                    stats.images_invalid += 1
+                    continue
+                if not path.is_file():
+                    stats.images_missing += 1
+                    stats.skipped_reasons["asset_missing"] = (
+                        stats.skipped_reasons.get("asset_missing", 0) + 1
+                    )
+                    continue
+                try:
+                    image_bytes = path.read_bytes()
+                except OSError:
+                    stats.images_invalid += 1
+                    continue
+                width, height, mime = _image_meta(image_bytes)
+                if mime == "image/invalid" or not image_bytes:
+                    stats.images_invalid += 1
+                    continue
+                decision = decide_image_index(
+                    caption=caption,
+                    context=context,
+                    image_width=width,
+                    image_height=height,
+                    page_image_count=page_image_count,
+                    page_has_table=page_has_table,
+                    asset_size_bytes=len(image_bytes),
+                )
+                if mode == "selective" and decision.mode != "text_and_visual":
+                    stats.images_skipped_by_policy += 1
+                    stats.skipped_reasons["policy_text_only"] = (
+                        stats.skipped_reasons.get("policy_text_only", 0) + 1
+                    )
+                    continue
+                stats.images_selected += 1
+                payload = VisualVectorPayload(
+                    collection_fingerprint=model_fingerprint,
+                    knowledge_base_id=knowledge_base_id,
+                    document_id=artifact.document_id,
+                    evidence_id=evidence.evidence_id,
+                    page_number=max(1, page_number),
+                    section_path=list(evidence.lineage.section_path),
+                    source_block_ids=list(evidence.lineage.source_block_ids),
+                    asset_index=asset_index,
+                    asset_ref=asset_ref,
+                    asset_sha256=hashlib.sha256(image_bytes).hexdigest(),
+                    asset_mime=mime,
+                    image_width=width,
+                    image_height=height,
+                    caption=caption,
+                    context=context,
+                    representation_ids=representation_ids,
+                    representations=_representation_refs(evidence),
+                    policy_mode=decision.mode,
+                    policy_reason=decision.reason,
+                    policy_version=decision.policy_version,
+                    model_id=self.store.model_id,
+                    model_fingerprint=model_fingerprint,
+                    embedding_dim=self.store.encoder.contract.dimension,
+                )
+                entries.append((payload, image_bytes))
+        return entries
+
+    def _document_stats(
+        self,
+        knowledge_base_id: UUID,
+        mode: BuildMode,
+    ) -> VisualBuildStats:
+        return VisualBuildStats(
+            knowledge_base_id=knowledge_base_id,
+            mode=mode,
+            collection_name=self.store.collection_name,
+            model_id=self.store.model_id,
+        )
+
+    def _finish_stats(self, stats: VisualBuildStats, started: float) -> VisualBuildStats:
+        stats.total_latency_ms = (perf_counter() - started) * 1_000
+        vram_probe = getattr(self.store.encoder, "vram_peak_mb", None)
+        stats.vram_peak_mb = vram_probe() if callable(vram_probe) else vram_probe
+        return stats
+
+    def prepare_document(
+        self,
+        knowledge_base_id: UUID,
+        document_id: UUID,
+        artifact: MultimodalEvidenceDocument,
+        *,
+        mode: BuildMode = "all",
+    ) -> tuple[list[tuple[VisualVectorPayload, bytes]], VisualBuildStats]:
+        """Encode one document into memory for a later atomic publish."""
+
+        if mode not in {"all", "selective"}:
+            raise ValueError("mode must be all or selective")
+        started = perf_counter()
+        model_fingerprint = visual_encoder_fingerprint(self.store.encoder.contract)
+        stats = self._document_stats(knowledge_base_id, mode)
+        stats.documents_scanned = 1
+        entries = self._collect_document_entries(
+            knowledge_base_id,
+            artifact,
+            mode=mode,
+            stats=stats,
+            model_fingerprint=model_fingerprint,
+        )
+        stats.document_ids = [str(document_id)]
+        return entries, self._finish_stats(stats, started)
+
+    def publish_document(
+        self,
+        document_id: UUID,
+        entries: list[tuple[VisualVectorPayload, bytes]],
+    ) -> int:
+        """Replace one document's visual generation, or clear it when empty."""
+
+        self.store.ensure_collection()
+        return self.store.replace_document(document_id, entries)
+
     def build(
         self,
         knowledge_base_id: UUID,
@@ -205,10 +348,6 @@ class VisualIndexBuilder:
     ) -> VisualBuildStats:
         if mode not in {"all", "selective"}:
             raise ValueError("mode must be all or selective")
-        if self.settings.visual_model_id and not self.settings.visual_embedding_enabled:
-            # Building is an explicit operator action; it does not silently
-            # enable query-time visual retrieval for everyone.
-            pass
         started = perf_counter()
         self.store.ensure_collection()
         model_fingerprint = visual_encoder_fingerprint(self.store.encoder.contract)
@@ -225,97 +364,22 @@ class VisualIndexBuilder:
             if selected_document_ids and artifact.document_id not in selected_document_ids:
                 continue
             stats.documents_scanned += 1
-            canonical = _load_canonical(self.settings, artifact.document_id)
-            entries: list[_AssetCandidate] = []
-            for evidence in artifact.evidence:
-                stats.evidences_scanned += 1
-                if evidence.modality != "image":
-                    continue
-                stats.image_evidences += 1
-                page_number = evidence.lineage.page_start
-                page_image_count, page_has_table = _page_signals(canonical, page_number)
-                caption = _representation_text(evidence, "caption")
-                context = _representation_text(evidence, "context")
-                representation_ids = _representation_ids(evidence)
-                for asset_index, asset_ref in enumerate(evidence.lineage.asset_refs):
-                    stats.images_total += 1
-                    try:
-                        path = _asset_path(self.settings, artifact.document_id, asset_ref)
-                    except VisualBuildError:
-                        stats.images_invalid += 1
-                        continue
-                    if not path.is_file():
-                        stats.images_missing += 1
-                        stats.skipped_reasons["asset_missing"] = (
-                            stats.skipped_reasons.get("asset_missing", 0) + 1
-                        )
-                        continue
-                    try:
-                        image_bytes = path.read_bytes()
-                    except OSError:
-                        stats.images_invalid += 1
-                        continue
-                    width, height, mime = _image_meta(image_bytes)
-                    if mime == "image/invalid" or not image_bytes:
-                        stats.images_invalid += 1
-                        continue
-                    decision = decide_image_index(
-                        caption=caption,
-                        context=context,
-                        image_width=width,
-                        image_height=height,
-                        page_image_count=page_image_count,
-                        page_has_table=page_has_table,
-                        asset_size_bytes=len(image_bytes),
-                    )
-                    if mode == "selective" and decision.mode != "text_and_visual":
-                        stats.images_skipped_by_policy += 1
-                        stats.skipped_reasons["policy_text_only"] = (
-                            stats.skipped_reasons.get("policy_text_only", 0) + 1
-                        )
-                        continue
-                    stats.images_selected += 1
-                    payload = VisualVectorPayload(
-                        collection_fingerprint=model_fingerprint,
-                        knowledge_base_id=knowledge_base_id,
-                        document_id=artifact.document_id,
-                        evidence_id=evidence.evidence_id,
-                        page_number=max(1, page_number),
-                        section_path=list(evidence.lineage.section_path),
-                        source_block_ids=list(evidence.lineage.source_block_ids),
-                        asset_index=asset_index,
-                        asset_ref=asset_ref,
-                        asset_sha256=hashlib.sha256(image_bytes).hexdigest(),
-                        asset_mime=mime,
-                        image_width=width,
-                        image_height=height,
-                        caption=caption,
-                        context=context,
-                        representation_ids=representation_ids,
-                        representations=_representation_refs(evidence),
-                        policy_mode=decision.mode,
-                        policy_reason=decision.reason,
-                        policy_version=decision.policy_version,
-                        model_id=self.store.model_id,
-                        model_fingerprint=model_fingerprint,
-                        embedding_dim=self.store.encoder.contract.dimension,
-                    )
-                    entries.append(_AssetCandidate(payload=payload, image_bytes=image_bytes))
+            document_started = perf_counter()
+            entries = self._collect_document_entries(
+                knowledge_base_id,
+                artifact,
+                mode=mode,
+                stats=stats,
+                model_fingerprint=model_fingerprint,
+            )
             if not entries:
                 continue
-            embed_started = perf_counter()
-            indexed = self.store.replace_document(
-                artifact.document_id,
-                [(entry.payload, entry.image_bytes) for entry in entries],
-            )
-            stats.embedding_latency_ms += (perf_counter() - embed_started) * 1_000
+            stats.embedding_latency_ms += (perf_counter() - document_started) * 1_000
+            indexed = self.store.replace_document(artifact.document_id, entries)
             stats.images_indexed += indexed
             stats.documents_indexed += 1
             stats.document_ids.append(str(artifact.document_id))
-        stats.total_latency_ms = (perf_counter() - started) * 1_000
-        vram_probe = getattr(self.store.encoder, "vram_peak_mb", None)
-        stats.vram_peak_mb = vram_probe() if callable(vram_probe) else vram_probe
-        return stats
+        return self._finish_stats(stats, started)
 
 
 __all__ = [
