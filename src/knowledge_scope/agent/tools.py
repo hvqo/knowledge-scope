@@ -57,6 +57,7 @@ class AgentRetrievalResult:
     retrieval_latency_ms: float
     degraded: bool
     branch_statuses: dict[str, str]
+    visual_intent: str = "plain"
 
 
 def _first_content(evidence: MultimodalEvidence, representation_types: Sequence[str]) -> str | None:
@@ -108,6 +109,41 @@ def _clip(text: str, limit: int) -> str:
     return stripped[: max(limit - 1, 0)] + "…"
 
 
+def _has_visual_branch(item: Any) -> bool:
+    branches = getattr(item, "branches", ()) or ()
+    return any(getattr(branch, "branch", None) == "visual" for branch in branches)
+
+
+def _select_agent_items(
+    items: list[Any],
+    *,
+    intent: str,
+    limit: int,
+    visual_quota: int,
+) -> list[Any]:
+    """Ensure explicit visual questions keep their top visual candidates."""
+    selected = list(items[:limit])
+    if intent != "explicit" or not selected:
+        return selected
+    visual_items = [item for item in items if _has_visual_branch(item)]
+    if not visual_items:
+        return selected
+    selected_visual = sum(1 for item in selected if _has_visual_branch(item))
+    needed = min(visual_quota, len(visual_items)) - selected_visual
+    if needed <= 0:
+        return selected
+    selected_ids = {getattr(item, "candidate_id", id(item)) for item in selected}
+    extras = [
+        item for item in visual_items if getattr(item, "candidate_id", id(item)) not in selected_ids
+    ][:needed]
+    if not extras:
+        return selected
+    kept = selected[: len(selected) - len(extras)]
+    chosen = kept + extras
+    chosen.sort(key=lambda item: getattr(item, "final_rank", 0))
+    return chosen
+
+
 class AgentRetrievalTool:
     """Wrap the existing unified retrieval service for one agent turn."""
 
@@ -124,13 +160,25 @@ class AgentRetrievalTool:
         self._document_loader = document_loader
         self._result_limit = max(1, min(result_limit, 20))
 
-    async def retrieve(self, query: str, knowledge_base_id: UUID) -> AgentRetrievalResult:
+    async def retrieve(
+        self,
+        query: str,
+        knowledge_base_id: UUID,
+        *,
+        document_id: UUID | None = None,
+    ) -> AgentRetrievalResult:
         result = await self._unified.search(
             query,
             knowledge_base_id,
+            document_id=document_id,
             failure_mode="degraded",
         )
-        items = list(result.items[: self._result_limit])
+        items = _select_agent_items(
+            list(result.items),
+            intent=getattr(result, "visual_intent", "plain"),
+            limit=self._result_limit,
+            visual_quota=self._settings.agent_visual_candidate_quota,
+        )
         titles: dict[UUID, str | None] = {}
         documents: dict[UUID, Document | None] = {}
         for item in items:
@@ -149,6 +197,7 @@ class AgentRetrievalTool:
             columns: tuple[str, ...] = ()
             row_labels: tuple[str, ...] = ()
             issue: str | None = None
+            asset_index: int | None = None
             if item.candidate_kind == "evidence" and item.modality == "table":
                 document = documents.get(item.document_id)
                 evidence_id = item.evidence_id
@@ -166,6 +215,19 @@ class AgentRetrievalTool:
                         issue = error.code
                     except Exception:
                         issue = "table_unavailable"
+            if item.candidate_kind == "evidence" and item.modality == "image":
+                document = documents.get(item.document_id)
+                evidence_id = item.evidence_id
+                if document is not None and evidence_id is not None:
+                    try:
+                        snapshot = get_evidence(self._settings, document, evidence_id)
+                        asset_refs = list(snapshot.evidence.lineage.asset_refs)
+                        for ref in citation.asset_refs:
+                            if ref in asset_refs:
+                                asset_index = asset_refs.index(ref)
+                                break
+                    except AssetAccessError:
+                        asset_index = None
             candidates.append(
                 AgentCandidate(
                     index=index,
@@ -175,6 +237,7 @@ class AgentRetrievalTool:
                     table_columns=columns,
                     table_rows=row_labels,
                     table_issue=issue,
+                    asset_index=asset_index,
                 )
             )
             if remaining <= 0:
@@ -200,6 +263,7 @@ class AgentRetrievalTool:
             retrieval_latency_ms=result.total_latency_ms,
             degraded=result.degraded,
             branch_statuses={branch.branch: branch.status for branch in result.branches},
+            visual_intent=getattr(result, "visual_intent", "plain"),
         )
 
 

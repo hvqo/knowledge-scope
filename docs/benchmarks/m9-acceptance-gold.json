@@ -1,0 +1,314 @@
+{
+  "questions": [
+    {
+      "id": "q01",
+      "query": "分析图 1 中柱状图展示的季度销售额趋势，并指出峰值季度。",
+      "category": "visual_chart",
+      "expected_docs": [
+        "vision"
+      ],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_numbers": [
+        "210"
+      ],
+      "expected_phrases": [
+        "Q4",
+        "趋势"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q02",
+      "query": "这张季度销售柱状图里，各季度的销售额变化说明了什么趋势？",
+      "category": "visual_detail",
+      "expected_docs": [
+        "vision"
+      ],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_phrases": [
+        "上升",
+        "Q1"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q03",
+      "query": "图中柱状图显示的销售额从哪个季度开始增长？整体是上升还是下降？",
+      "category": "visual_detail",
+      "expected_docs": [
+        "vision"
+      ],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_phrases": [
+        "upward",
+        "趋势"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": null,
+      "expected_supplementary": false,
+      "note": "安全门禁拦截高风险视觉数值，回答为确定性安全文本；语义正确（上升趋势），记录为安全行为"
+    },
+    {
+      "id": "q04",
+      "query": "表 1（m2-pdf-a.pdf）中越南 2024 年 GDP 相比 2023 年增长了百分之几？",
+      "category": "table_growth",
+      "expected_docs": [
+        "table_a"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10.6977"
+      ],
+      "expected_phrases": [
+        "460"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q05",
+      "query": "请对比表 1（m2-pdf-a.pdf）和表 2（m2-pdf-b.pdf）中越南、泰国 2024 年的 GDP，给出差异与相对变化。",
+      "category": "cross_doc_compare",
+      "expected_docs": [
+        "table_a",
+        "table_b"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "60",
+        "1.2766"
+      ],
+      "expected_phrases": [
+        "100"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q06",
+      "query": "m2-pdf-a.pdf 表 1 中三个国家 2024 年 GDP 合计是多少？",
+      "category": "table_aggregate",
+      "expected_docs": [
+        "table_a"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10010"
+      ],
+      "expected_phrases": [
+        "亿美元"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q07",
+      "query": "m2-pdf-a.pdf 表 1 中越南 2023 年和 2024 年的 GDP 分别是多少？",
+      "category": "table_select",
+      "expected_docs": [
+        "table_a"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4300",
+        "4760"
+      ],
+      "expected_phrases": [
+        "亿美元"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q08",
+      "query": "请比较越南和泰国 2024 年 GDP，并分析展示两国 GDP 对比的柱状图。",
+      "category": "missing_visual_evidence",
+      "expected_docs": [
+        "table_a"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4760",
+        "5200"
+      ],
+      "expected_phrases": [
+        "没有可用",
+        "没有",
+        "缺少",
+        "无法"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": false,
+      "expected_supplementary": true,
+      "expected_phrases_mode": "any"
+    },
+    {
+      "id": "q09",
+      "query": "请给出 2025 年越南 GDP 的数值。",
+      "category": "missing_year",
+      "expected_docs": [],
+      "expected_tools": [],
+      "expected_numbers": [],
+      "expected_phrases": [
+        "没有找到",
+        "没有",
+        "无法"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": false,
+      "expected_supplementary": true,
+      "expected_phrases_mode": "any"
+    },
+    {
+      "id": "q10",
+      "query": "分析该文档中的系统总体架构图，说明主要模块和数据流向。",
+      "category": "research_visual",
+      "expected_docs": [
+        "yolo"
+      ],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_phrases": [
+        "模块",
+        "数据"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q11",
+      "query": "文档中的训练流程图和检测流程图分别展示了什么步骤？",
+      "category": "multi_image",
+      "expected_docs": [
+        "yolo"
+      ],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_phrases": [
+        "训练",
+        "检测"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    },
+    {
+      "id": "q12a",
+      "query": "越南 2024 年 GDP 是多少？",
+      "category": "followup_turn1",
+      "expected_docs": [
+        "table_a",
+        "table_b"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4760",
+        "4700"
+      ],
+      "expected_phrases": [
+        "亿美元"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false,
+      "followup_group": "q12",
+      "expected_numbers_mode": "any",
+      "note": "问题未指定表格；表1=4760（实际值）、表2=4700（预测值），两种口径均可，需回答中说明来源",
+      "expected_docs_mode": "any"
+    },
+    {
+      "id": "q12b",
+      "query": "那比 2023 年增长了百分之几？",
+      "category": "followup_turn2",
+      "expected_docs": [
+        "table_a",
+        "table_b"
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10.6977",
+        "4.4444"
+      ],
+      "expected_phrases": [
+        "相对变化"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": true,
+      "expected_supplementary": false,
+      "followup_group": "q12",
+      "expected_numbers_mode": "any",
+      "note": "沿用上轮所选表口径；4.4444 对应表2，10.6977 对应表1；另观察到相对变化单位被标为“亿美元”（真实展示缺陷）",
+      "expected_docs_mode": "any"
+    },
+    {
+      "id": "q13",
+      "query": "请解释量子纠缠与 GDP 的统计关系。",
+      "category": "negative",
+      "expected_docs": [],
+      "expected_tools": [],
+      "expected_numbers": [],
+      "expected_phrases": [
+        "没有找到",
+        "没有",
+        "无法"
+      ],
+      "expect_visual_source": false,
+      "expected_sufficient": false,
+      "expected_supplementary": true,
+      "expected_phrases_mode": "any"
+    },
+    {
+      "id": "q14",
+      "query": "请对比表 1（m2-pdf-a.pdf）与 m3-vision-acceptance.pdf 第 2 页图片表格中的越南 2024 年 GDP 数值是否一致。",
+      "category": "scanned_vs_structured",
+      "expected_docs": [
+        "table_a",
+        "vision"
+      ],
+      "expected_tools": [
+        "analyze_image",
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4760"
+      ],
+      "expected_phrases": [
+        "一致"
+      ],
+      "expect_visual_source": true,
+      "expected_sufficient": true,
+      "expected_supplementary": false
+    }
+  ]
+}

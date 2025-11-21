@@ -143,3 +143,79 @@
 
 - M5 及以后可把 `AgentRetrievalTool`、`AgentToolExecutor` 作为可复用工具层接入更复杂的编排，但本阶段不引入 LangGraph、多智能体或新的向量库。
 - 表格计算与视觉分析仍以独立服务存在，智能体仅做编排，不改变其契约。
+
+## M9 证据需求、充分性与单次补检索
+
+M9 在原有「检索 → 规划 → 工具 → 回答」链路上增加一层**可检查的证据需求**，不引入新的编排框架：
+
+1. `src/knowledge_scope/agent/evidence.py` 从问题中抽取 `EvidenceRequirement`（对象 / 年份或年份区间 /
+   指标 / 是否需要图片特征 / 是否需要表格 / 是否比较），再对 ≤6 条候选做 `EvidenceAssessment`：
+   逐项检查对象、年份、指标、图片、表格与比较对象覆盖，并检测候选表格之间的单位冲突。
+   该检查是**词面匹配**：它只能证明候选「提到」了要求，不能证明语义上足以回答。
+2. 若检查不通过且 `KNOWLEDGE_SCOPE_AGENT_EVIDENCE_SUFFICIENCY_ENABLED=true`，执行**至多一次**
+   补充检索：`build_supplementary_query` 用缺失项（对象/年份/指标 + 图表/统计表）构造查询，保留
+   知识库与文档范围，避免与原问题完全相同；结果按真实 `Document/Evidence/asset_index` 身份与
+   初次候选去重合并，统一重编号 `C1..Cn`，并记录补检索原因、query、新增条数、覆盖前后差异与耗时。
+   补检索失败时保留初次候选继续回答，并在 trace 中标记 failed。补检索与工具调用**分开计数**。
+3. Planner 视觉兜底：当问题明确要求原生视觉特征（趋势/峰值/图中关系等）、候选含可读图片、
+   视觉意图为 explicit 且模型直接返回 final 时，应用层强制构造一次 `analyze_image`；`auto_visual=True`
+   写入 trace，避免只靠 Prompt 或模型自觉。同图不同任务/问题不判为重复调用。
+4. Unified Retrieval 的 explicit 视觉配额从 2 提升到 4（`KNOWLEDGE_SCOPE_VISUAL_QUOTA_EXPLICIT`），
+   修复「正确图片视觉排名第 3 却被文本候选挤出」的融合问题；配额仍只在视觉意图明确时生效。
+5. `agent_max_rounds` 默认 3、`agent_max_tool_calls` 仍为 3；补检索不占工具预算，简单问题仍走短路径。
+6. SSE `complete` 增加审计字段：`agent_evidence_required/missing/satisfied/coverage_before/after/conflicts`、
+   `agent_supplementary_retrieval/query/added/latency_ms/error`、`agent_visual_auto_called`。
+   证据不足时回答必须明确缺少什么，不拼凑；精确数值仍需确定性表格工具，视觉结论仍走 M6 安全门禁与
+   可信台账/报告插入边界。
+
+### M9.1 正确性修复与真实验收（10–15 题）
+
+初次 M9 交付暴露了三类正确性问题：充分性判断按全局词面覆盖，可能把分别提到对象/年份/指标的无关候选拼成"充分"；
+同一 Evidence 下的不同图片缺少 `asset_index`，合并/去重时会混淆；扫描表问题只调用结构化表格工具，未读取图片。
+M9.1 在原分支做了最小修复：
+
+1. **逐条 Evidence 绑定**：`assess_evidence()` 要求同一候选同时绑定对象 + 年份 + 指标（无对象时要求年份 + 指标共存）；
+   "X 与 Y 的关系"会抽取 `relation_terms` 并要求直接证据；单位/统计口径冲突强制 `satisfied=false`；
+   图片型问题需要图片证据绑定对象/关系，扫描表（`scanned_table`）允许图片自身满足视觉需求，但仍要求结构化表格绑定对象。
+2. **多图 asset_index**：`AgentCandidate.asset_index` 通过 `get_evidence().lineage.asset_refs` 解析真实素材下标；
+   `_candidate_identity` / `_merge_candidates` / `_renumber_candidates` / `_VisualExecution` / `_trace_parameters`
+   全部保留 `asset_index`，`_effective_asset_index()` 用于工具调用与 trace。
+3. **Planner 视觉兜底**：Planner 返回 `final` 但问题明确要求原生视觉特征时，应用层自动调用 `analyze_image`；
+   比较/扫描表场景允许在表格工具之后补一次视觉调用；重复表格计划分支强制转视觉；仍受 `agent_max_tool_calls`
+   与 auto_visual 一次约束，不改变 Planner 对文本/表格的自主判断。
+
+真实验收（同一 15 题原始 gold；真实 DeepSeek Flash + Ollama `qwen3-vl:8b`；隔离 KB；
+CPU 文本嵌入/reranker/视觉编码 + GPU VLM；Baseline 关闭 M9 机制）：
+
+| 指标 | Baseline（关闭 M9） | M9.1（修复后） |
+| --- | --- | --- |
+| Tool Selection | 14/15 (93.3%) | 15/15 (100%) |
+| Evidence Sufficiency | 8/9 (88.9%) | 9/9 (100%) |
+| Supplementary Trigger | 6/9 (66.7%) | 9/9 (100%) |
+| Key Evidence Coverage | 15/15 (100%) | 15/15 (100%) |
+| Visual Tool Call | 14/15 (93.3%) | 15/15 (100%) |
+| Answer Accuracy | 15/15 (100%) | 14/15 (93.3%) |
+| E2E Success | 11/15 (73.3%) | 14/15 (93.3%) |
+| 延迟 mean / median / p95 | 34.4s / 25.3s / 71.3s | 42.4s / 37.3s / 81.1s |
+
+- 补检索：实际触发 3 次（q08/q09/q13，全部为 gold 期望不足的问题）；应补触发率 3/3，不应补避免率 12/12；
+  初次充分性判断 15/15 与 gold 期望一致，补检索后最终充分性 9/9（q08/q09/q13 保持"证据不足"并明确说明缺什么）。
+- 多图/扫描表：q14 同时调用 `analyze_image` + `analyze_table`，`visual_sources` 1 条、`asset_index` 与 Evidence 对齐；
+  q08 先补检索再自动视觉 + 表格，最终引用两份文档。
+- q03 失败为安全门禁：问题包含"峰值/精确数值"触发视觉数字门禁，回答被替换为确定性安全文本（英文趋势 + 数值打码），
+  gold 中文短语不匹配；人工核对回答语义正确，属于安全策略与评测口径差异，不是新回归。
+- 工具层仍有真实失败：q14 表格对比因中英文表头（国家 vs Country）报"未找到列"；q08/q14 的
+  `analyze_image(extract_table)` 未提取出表格列；最终回答基于原始证据文本对照，已明确说明未使用工具计算。
+- 默认开关决策：M9.1 在 E2E、充分性、补检索触发、视觉调用上均有明确收益且未发现重要回归（延迟增加约 8 秒，
+  主要来自补检索与自动视觉），因此保持 `agent_evidence_sufficiency_enabled=true`、`agent_visual_tool_auto=true`；
+  仍保留配置开关用于回退。
+- 运行脚本：`scripts/m9_acceptance.py --fixtures <fixtures.json> --gold docs/benchmarks/m9-acceptance-gold.json --output result.json`
+  （支持 `--only q01,q02` 单题复验）。
+
+### 已知局限
+
+- 证据充分性为逐条词面绑定，仍不能证明语义支撑：对「提到但语义不相关」「跨语言表头」「VLM 提取失败」等情况会误判；
+  M9.1 通过保守缺失提示缓解，但未引入语义模型自评（避免以模型自评代替事实校验）。
+- 自动视觉/补检索增加延迟（mean 34.4s → 42.4s）；扫描表跨语言表头仍是结构化表格工具的真实限制，回答只能降级为原文对照。
+- 本数据集没有真实国别统计报告，使用真实技术/研究报告与已知表格 PDF 做技术验证，不构成国别业务结论。
+- 视觉配额 / 自动视觉调用只覆盖“是否有图片与意图”的启发式判断，不保证视觉证据与问题语义匹配。

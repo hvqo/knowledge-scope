@@ -112,7 +112,8 @@ class Settings(BaseSettings):
     )
     visual_candidate_limit: int = Field(default=8, ge=1, le=100)
     visual_fusion_quota: int = Field(default=2, ge=0, le=5)
-    visual_quota_ambiguous: int = Field(default=1, ge=0, le=5)
+    visual_quota_ambiguous: int = Field(default=1, ge=0, le=3)
+    visual_quota_explicit: int = Field(default=4, ge=1, le=6)
     visual_max_image_pixels: int = Field(default=12_000_000, ge=250_000)
     visual_encoder_cache_dir: str = Field(default="", max_length=2_000)
     ingestion_enabled: bool = True
@@ -160,10 +161,15 @@ class Settings(BaseSettings):
     # existing retrieval, vision, and table-analysis capabilities.  The standard
     # RAG path is always kept as the fallback and is not changed by this switch.
     agent_enabled: bool = True
-    agent_max_rounds: int = Field(default=2, ge=1, le=3)
+    agent_max_rounds: int = Field(default=3, ge=1, le=3)
     agent_max_tool_calls: int = Field(default=3, ge=1, le=5)
     agent_planner_max_tokens: int = Field(default=512, ge=64, le=2_048)
     agent_retrieval_limit: int = Field(default=6, ge=1, le=20)
+    agent_evidence_sufficiency_enabled: bool = True
+    agent_supplementary_retrieval_max: int = Field(default=1, ge=0, le=1)
+    agent_supplementary_candidate_limit: int = Field(default=4, ge=1, le=8)
+    agent_visual_tool_auto: bool = True
+    agent_visual_candidate_quota: int = Field(default=3, ge=1, le=6)
     agent_context_budget_chars: int = Field(default=6_000, ge=500)
     agent_question_max_chars: int = Field(default=500, ge=1, le=2_000)
     agent_tool_result_max_chars: int = Field(default=3_000, ge=200, le=20_000)
