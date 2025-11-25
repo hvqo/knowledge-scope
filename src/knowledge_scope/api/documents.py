@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -18,6 +19,9 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi import (
+    Path as APIPath,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -25,6 +29,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_scope.chunking.models import ChunkedDocument
 from knowledge_scope.chunking.service import CHUNKING_DIRECTORY_NAME, chunk_artifact_path
+from knowledge_scope.documents.assets import (
+    AssetAccessError,
+    AssetTooLargeError,
+    AssetUnsupportedError,
+    get_evidence,
+    list_evidence_asset_previews,
+    resolve_evidence_asset,
+)
 from knowledge_scope.documents.models import (
     DOCUMENT_MEDIA_TYPE_PDF,
     DOCUMENT_STATUS_UPLOADED,
@@ -68,6 +80,9 @@ from .schemas import (
     DocumentChunkResponse,
     DocumentListResponse,
     DocumentResponse,
+    EvidenceAssetResponse,
+    EvidenceDetailResponse,
+    EvidenceRepresentationResponse,
 )
 
 router = APIRouter(
@@ -75,9 +90,30 @@ router = APIRouter(
     tags=["documents"],
 )
 
+EVIDENCE_ID_PATTERN = re.compile(r"^evidence_v1_[0-9a-f]{64}$")
+
 
 class ChunkArtifactError(RuntimeError):
     """Raised when a persisted chunk artifact cannot be read for preview."""
+
+
+def _invalid_evidence_id() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="证据不存在")
+
+
+def _asset_access_http_error(error: AssetAccessError) -> HTTPException:
+    """Map internal asset failures to a controlled, path-free HTTP status."""
+    if isinstance(error, AssetTooLargeError):
+        return HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=error.message,
+        )
+    if isinstance(error, AssetUnsupportedError):
+        return HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=error.message,
+        )
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error.message)
 
 
 def _runtime_settings(request: Request) -> Settings:
@@ -484,6 +520,115 @@ async def list_document_chunks(
             )
             for ordinal, payload in enumerate(indexed_payloads)
         ],
+    )
+
+
+@router.get("/{document_id}/evidence/{evidence_id}", response_model=EvidenceDetailResponse)
+async def get_document_evidence(
+    knowledge_base_id: UUID,
+    document_id: UUID,
+    evidence_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> EvidenceDetailResponse:
+    """Expose validated evidence metadata and canonical content for preview."""
+    await _get_knowledge_base(session, knowledge_base_id)
+    document = await _get_document(session, knowledge_base_id, document_id)
+    if EVIDENCE_ID_PATTERN.fullmatch(evidence_id) is None:
+        raise _invalid_evidence_id()
+
+    settings = _runtime_settings(request)
+    try:
+        snapshot = await asyncio.to_thread(get_evidence, settings, document, evidence_id)
+        previews = await asyncio.to_thread(
+            list_evidence_asset_previews,
+            settings,
+            document,
+            evidence_id,
+        )
+    except AssetAccessError as error:
+        raise _asset_access_http_error(error) from None
+
+    evidence = snapshot.evidence
+    return EvidenceDetailResponse(
+        document_id=document.id,
+        knowledge_base_id=document.knowledge_base_id,
+        evidence_id=evidence.evidence_id,
+        modality=evidence.modality,
+        page_start=evidence.lineage.page_start,
+        page_end=evidence.lineage.page_end,
+        source_block_ids=list(evidence.lineage.source_block_ids),
+        section_path=list(evidence.lineage.section_path),
+        source_fingerprint=evidence.lineage.source_fingerprint,
+        representations=[
+            EvidenceRepresentationResponse(
+                representation_id=representation.representation_id,
+                representation_type=representation.representation_type,
+                content=representation.content,
+                searchable=representation.searchable,
+            )
+            for representation in evidence.representations
+        ],
+        assets=[
+            EvidenceAssetResponse(
+                index=preview.index,
+                media_type=preview.media_type,
+                size_bytes=preview.size_bytes,
+                available=preview.available,
+            )
+            for preview in previews
+        ],
+    )
+
+
+@router.get(
+    "/{document_id}/evidence/{evidence_id}/assets/{asset_index}",
+    response_class=FileResponse,
+    responses={
+        200: {
+            "content": {
+                "image/jpeg": {},
+                "image/png": {},
+                "image/webp": {},
+            }
+        }
+    },
+)
+async def get_document_evidence_asset(
+    knowledge_base_id: UUID,
+    document_id: UUID,
+    evidence_id: str,
+    asset_index: Annotated[int, APIPath(ge=0, le=255)],
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    """Stream one original evidence asset without exposing filesystem paths."""
+    await _get_knowledge_base(session, knowledge_base_id)
+    document = await _get_document(session, knowledge_base_id, document_id)
+    if EVIDENCE_ID_PATTERN.fullmatch(evidence_id) is None:
+        raise _invalid_evidence_id()
+
+    settings = _runtime_settings(request)
+    try:
+        asset = await asyncio.to_thread(
+            resolve_evidence_asset,
+            settings,
+            document,
+            evidence_id,
+            asset_index,
+        )
+    except AssetAccessError as error:
+        raise _asset_access_http_error(error) from None
+
+    return FileResponse(
+        asset.path,
+        media_type=asset.media_type,
+        filename=f"evidence-asset-{asset.index}{asset.path.suffix.lower()}",
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, max-age=0, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
