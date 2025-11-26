@@ -4,13 +4,19 @@ import { ElDialog } from "element-plus";
 import { computed, ref, watch } from "vue";
 
 import {
+  analyzeVision,
   ApiError,
   documentFileUrl,
   evidenceAssetUrl,
   fetchEvidenceDetail,
   getUserFacingError,
 } from "../../api/client";
-import type { EvidenceRepresentationType, RAGCitation } from "../../api/types";
+import type {
+  EvidenceRepresentationType,
+  RAGCitation,
+  VisionAnalysisResult,
+  VisionTaskType,
+} from "../../api/types";
 import AnswerMath from "./AnswerMath.vue";
 
 const props = defineProps<{
@@ -23,6 +29,18 @@ const props = defineProps<{
 const emit = defineEmits<{ "update:modelValue": [value: boolean] }>();
 
 const imageFailed = ref(false);
+
+const visionTask = ref<VisionTaskType | null>(null);
+const visionQuestion = ref("");
+const visionLoading = ref(false);
+const visionResult = ref<VisionAnalysisResult | null>(null);
+const visionError = ref<string | null>(null);
+
+const visionTasks: { value: VisionTaskType; label: string }[] = [
+  { value: "describe_image", label: "解读图片" },
+  { value: "analyze_chart", label: "分析图表" },
+  { value: "extract_table", label: "识别表格" },
+];
 
 const documentId = computed(() => props.citation?.document_id ?? null);
 const evidenceId = computed(() => props.citation?.evidence_id ?? null);
@@ -182,10 +200,97 @@ function openSourcePage(): void {
   );
 }
 
+const canUseVision = computed(() => {
+  const modality = detail.value?.modality;
+  if (modality !== "image" && modality !== "table") {
+    return false;
+  }
+  return imageSrc.value !== null && !imageFailed.value;
+});
+
+const visibleVisionTasks = computed(() => {
+  if (detail.value?.modality === "table") {
+    return visionTasks.filter((task) => task.value === "extract_table");
+  }
+  return visionTasks;
+});
+
+const activeAssetIndex = computed(() => imageAsset.value?.index ?? 0);
+
+const visionChart = computed(() => visionResult.value?.chart_analysis ?? null);
+const visionTable = computed(() => visionResult.value?.extracted_table ?? null);
+const visionWarnings = computed(() => visionResult.value?.warnings ?? []);
+const chartSections = computed(() => {
+  const chart = visionChart.value;
+  if (chart === null) {
+    return [];
+  }
+  return [
+    { title: "图表类型", items: chart.chart_type === null ? [] : [chart.chart_type] },
+    { title: "坐标轴与分类", items: chart.axes },
+    { title: "数据系列", items: chart.series },
+    { title: "主要趋势", items: chart.trends },
+    { title: "峰值与低谷", items: chart.peaks },
+    { title: "显著异常", items: chart.anomalies },
+    { title: "图表限制", items: chart.limitations },
+  ].filter((section) => section.items.length > 0);
+});
+
+function startVisionTask(task: VisionTaskType): void {
+  if (visionLoading.value) {
+    return;
+  }
+  visionTask.value = task;
+  visionQuestion.value = "";
+  visionResult.value = null;
+  visionError.value = null;
+}
+
+async function runVisionAnalysis(): Promise<void> {
+  const knowledgeBaseId = props.knowledgeBaseId;
+  const currentDocumentId = documentId.value;
+  const currentEvidenceId = evidenceId.value;
+  const task = visionTask.value;
+  if (
+    knowledgeBaseId === null ||
+    currentDocumentId === null ||
+    currentEvidenceId === null ||
+    task === null
+  ) {
+    return;
+  }
+  visionLoading.value = true;
+  visionError.value = null;
+  visionResult.value = null;
+  try {
+    visionResult.value = await analyzeVision({
+      knowledge_base_id: knowledgeBaseId,
+      document_id: currentDocumentId,
+      evidence_id: currentEvidenceId,
+      asset_index: activeAssetIndex.value,
+      task_type: task,
+      question: visionQuestion.value.trim() || null,
+    });
+  } catch (error) {
+    if (error instanceof ApiError && error.detail) {
+      visionError.value = error.detail;
+    } else {
+      visionError.value = getUserFacingError(error, "视觉模型暂时不可用，请稍后重试。");
+    }
+  } finally {
+    visionLoading.value = false;
+  }
+}
+
 watch(
   () => [props.modelValue, evidenceId.value, imageSrc.value],
   () => {
     imageFailed.value = false;
+    visionTask.value = null;
+    visionQuestion.value = "";
+    visionLoading.value = false;
+    visionResult.value = null;
+    visionError.value = null;
   },
 );
 </script>
@@ -274,8 +379,191 @@ watch(
           </p>
         </div>
 
+        <section
+          v-if="canUseVision"
+          class="asset-preview__vision"
+        >
+          <div class="asset-preview__vision-actions">
+            <button
+              v-for="task in visibleVisionTasks"
+              :key="task.value"
+              type="button"
+              class="asset-preview__button asset-preview__button--ghost"
+              :class="{ 'is-active': visionTask === task.value }"
+              :disabled="visionLoading"
+              @click="startVisionTask(task.value)"
+            >
+              {{ task.label }}
+            </button>
+          </div>
+          <div
+            v-if="visionTask"
+            class="asset-preview__vision-form"
+          >
+            <input
+              v-model="visionQuestion"
+              class="asset-preview__input"
+              type="text"
+              :placeholder="
+                visionTask === 'extract_table'
+                  ? '可选：说明需要提取的表格范围'
+                  : '可选：针对这张图片提问'
+              "
+              :disabled="visionLoading"
+            >
+            <button
+              type="button"
+              class="asset-preview__button"
+              :disabled="visionLoading"
+              @click="runVisionAnalysis"
+            >
+              {{ visionLoading ? '解读中…' : '开始解读' }}
+            </button>
+          </div>
+          <p
+            v-if="visionLoading"
+            class="asset-preview__state"
+          >
+            视觉模型正在解读图片，可能需要数秒…
+          </p>
+          <p
+            v-else-if="visionError"
+            class="asset-preview__state asset-preview__state--warning"
+          >
+            {{ visionError }}
+          </p>
+          <template v-else-if="visionResult">
+            <div
+              v-if="visionResult.status === 'not_configured'"
+              class="asset-preview__state asset-preview__state--warning"
+            >
+              <p>{{ visionResult.message || '视觉模型未启用，无法解读图片。' }}</p>
+              <p class="asset-preview__hint">
+                配置 KNOWLEDGE_SCOPE_VLM_ENABLED、KNOWLEDGE_SCOPE_VLM_BASE_URL、KNOWLEDGE_SCOPE_VLM_MODEL 后可启用该能力。
+              </p>
+            </div>
+            <div
+              v-else-if="visionResult.status === 'failed'"
+              class="asset-preview__state asset-preview__state--warning"
+            >
+              <p>{{ visionResult.message || '视觉模型解读失败。' }}</p>
+              <p class="asset-preview__hint">
+                原始图片与引用信息不受影响，可稍后重试。
+              </p>
+            </div>
+            <template v-else>
+              <p class="asset-preview__hint">
+                由视觉模型 {{ visionResult.provider || '未知服务' }} / {{ visionResult.model || '未知模型' }} 生成，仅供参考；原始图片与引用信息未改变。
+              </p>
+              <p
+                v-if="visionResult.status === 'needs_review'"
+                class="asset-preview__warning"
+              >
+                视觉模型结果需人工核对。
+              </p>
+              <p
+                v-if="visionResult.answer"
+                class="asset-preview__text"
+              >
+                {{ visionResult.answer }}
+              </p>
+              <dl
+                v-if="visionChart"
+                class="asset-preview__chart"
+              >
+                <template
+                  v-for="section in chartSections"
+                  :key="section.title"
+                >
+                  <dt>{{ section.title }}</dt>
+                  <dd>
+                    <ul>
+                      <li
+                        v-for="(item, itemIndex) in section.items"
+                        :key="itemIndex"
+                      >
+                        {{ item }}
+                      </li>
+                    </ul>
+                  </dd>
+                </template>
+              </dl>
+              <div
+                v-if="visionTable"
+                class="asset-preview__vision-table"
+              >
+                <p
+                  v-if="visionTable.title"
+                  class="asset-preview__caption"
+                >
+                  {{ visionTable.title }}<span v-if="visionTable.unit">（单位：{{ visionTable.unit }}）</span>
+                </p>
+                <table
+                  v-if="visionTable.columns.length > 0 && visionTable.rows.length > 0"
+                  class="asset-preview__table"
+                >
+                  <thead>
+                    <tr>
+                      <th
+                        v-for="(column, columnIndex) in visionTable.columns"
+                        :key="columnIndex"
+                      >
+                        {{ column }}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="(row, rowIndex) in visionTable.rows"
+                      :key="rowIndex"
+                    >
+                      <td
+                        v-for="(cell, cellIndex) in row"
+                        :key="cellIndex"
+                      >
+                        {{ cell === null || cell === '' ? '—' : cell }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p class="asset-preview__warning">
+                  视觉模型提取，数值需核对，不能作为精确统计数据使用。
+                </p>
+                <p
+                  v-if="visionTable.merged_cell_info.length > 0"
+                  class="asset-preview__hint"
+                >
+                  合并单元格：{{ visionTable.merged_cell_info.join('；') }}
+                </p>
+                <ul
+                  v-if="visionTable.warnings.length > 0"
+                  class="asset-preview__warnings"
+                >
+                  <li
+                    v-for="(warning, warningIndex) in visionTable.warnings"
+                    :key="warningIndex"
+                  >
+                    {{ warning }}
+                  </li>
+                </ul>
+              </div>
+              <ul
+                v-if="visionWarnings.length > 0"
+                class="asset-preview__warnings"
+              >
+                <li
+                  v-for="(warning, warningIndex) in visionWarnings"
+                  :key="warningIndex"
+                >
+                  {{ warning }}
+                </li>
+              </ul>
+            </template>
+          </template>
+        </section>
+
         <div
-          v-else-if="detail.modality === 'table'"
+          v-if="detail.modality === 'table'"
           class="asset-preview__asset"
         >
           <table
@@ -346,7 +634,7 @@ watch(
         </div>
 
         <div
-          v-else-if="detail.modality === 'formula'"
+          v-if="detail.modality === 'formula'"
           class="asset-preview__asset"
         >
           <div
@@ -370,7 +658,7 @@ watch(
         </div>
 
         <div
-          v-else
+          v-if="detail.modality === 'text'"
           class="asset-preview__asset"
         >
           <p
@@ -612,5 +900,113 @@ watch(
 .asset-preview__button:focus-visible {
   outline: 2px solid var(--ks-accent);
   outline-offset: 2px;
+}
+
+.asset-preview__button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.asset-preview__vision {
+  display: flex;
+  padding: 12px 14px;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px dashed var(--ks-border);
+  border-radius: var(--ks-radius-md);
+}
+
+.asset-preview__vision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.asset-preview__vision-actions .asset-preview__button.is-active {
+  color: var(--ks-accent-strong);
+  background: var(--ks-accent-soft);
+  border-color: var(--ks-accent);
+}
+
+.asset-preview__vision-form {
+  display: flex;
+  gap: 8px;
+}
+
+.asset-preview__input {
+  min-width: 0;
+  padding: 6px 10px;
+  color: var(--ks-text);
+  font: inherit;
+  font-size: 12px;
+  background: var(--ks-surface);
+  border: 1px solid var(--ks-border);
+  border-radius: var(--ks-radius-sm);
+  flex: 1 1 auto;
+}
+
+.asset-preview__input:focus-visible {
+  outline: 2px solid var(--ks-accent);
+  outline-offset: 1px;
+}
+
+.asset-preview__warning {
+  margin: 0;
+  padding: 8px 10px;
+  color: #8a5a00;
+  font-size: 12px;
+  line-height: 1.6;
+  background: #fff8ec;
+  border: 1px solid #f0d9b5;
+  border-radius: var(--ks-radius-sm);
+}
+
+.asset-preview__chart {
+  display: grid;
+  margin: 0;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 12px;
+}
+
+.asset-preview__chart dt {
+  color: var(--ks-ink);
+  font-size: 12px;
+  font-weight: 660;
+}
+
+.asset-preview__chart dd {
+  margin: 0;
+  color: var(--ks-text);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.asset-preview__chart ul {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.asset-preview__vision-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.asset-preview__table th {
+  padding: 6px 9px;
+  color: var(--ks-ink);
+  font-weight: 660;
+  text-align: left;
+  background: var(--ks-accent-soft);
+  border: 1px solid var(--ks-border);
+}
+
+.asset-preview__warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ks-muted);
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>

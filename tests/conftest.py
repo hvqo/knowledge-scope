@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -166,6 +166,7 @@ async def _test_client(
     *,
     max_upload_size_bytes: int = 50 * 1024 * 1024,
     llm_gateway: object | None = None,
+    vlm_provider: object | None = None,
 ) -> AsyncIterator[AsyncClient]:
     settings = Settings(
         _env_file=None,
@@ -180,6 +181,7 @@ async def _test_client(
         vector_store=_TestVectorStore(),
         graph_store=_TestGraphStore(),  # type: ignore[arg-type]
         llm_gateway=llm_gateway,  # type: ignore[arg-type]
+        vlm_provider=vlm_provider,  # type: ignore[arg-type]
     )
 
     async with postgres_test_engine.connect() as connection:
@@ -238,3 +240,22 @@ async def limited_client(
         max_upload_size_bytes=8,
     ) as http_client:
         yield http_client
+
+
+@pytest.fixture
+def vlm_client_factory(
+    postgres_test_database: str,
+    postgres_test_engine: AsyncEngine,
+    test_data_dir: Path,
+) -> Callable[[object], AbstractAsyncContextManager[AsyncClient]]:
+    """Build an API client whose app carries the supplied mock vision provider."""
+
+    def factory(vlm_provider: object) -> AbstractAsyncContextManager[AsyncClient]:
+        return _test_client(
+            postgres_test_database,
+            postgres_test_engine,
+            test_data_dir,
+            vlm_provider=vlm_provider,
+        )
+
+    return factory

@@ -400,6 +400,63 @@ export interface EvidenceDetail {
   assets: EvidenceAssetRecord[];
 }
 
+export type VisionTaskType = "describe_image" | "analyze_chart" | "extract_table";
+export type VisionStatus = "ok" | "needs_review" | "not_configured" | "failed";
+
+export interface VisionSource {
+  knowledge_base_id: string;
+  document_id: string;
+  evidence_id: string;
+  page_start: number;
+  page_end: number;
+  source_block_ids: string[];
+}
+
+export interface ChartAnalysis {
+  chart_type: string | null;
+  axes: string[];
+  series: string[];
+  trends: string[];
+  peaks: string[];
+  anomalies: string[];
+  limitations: string[];
+}
+
+export interface ExtractedVisionTable {
+  title: string | null;
+  unit: string | null;
+  columns: string[];
+  rows: (string | null)[][];
+  merged_cell_info: string[];
+  warnings: string[];
+  extraction_method: "vlm";
+}
+
+export interface VisionAnalysisResult {
+  status: VisionStatus;
+  task_type: VisionTaskType;
+  answer: string | null;
+  chart_analysis: ChartAnalysis | null;
+  extracted_table: ExtractedVisionTable | null;
+  extraction_method: "vlm" | null;
+  provider: string | null;
+  model: string | null;
+  latency_ms: number | null;
+  warnings: string[];
+  sources: VisionSource[];
+  error_code: string | null;
+  message: string | null;
+}
+
+export interface VisionAnalyzeRequest {
+  knowledge_base_id: string;
+  document_id: string;
+  evidence_id: string;
+  asset_index: number;
+  task_type: VisionTaskType;
+  question?: string | null;
+}
+
 export interface RAGCompleteData {
   status: RAGCompletionStatus;
   prompt_version: string;
