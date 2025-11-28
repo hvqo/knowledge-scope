@@ -72,7 +72,7 @@ def _citation_for_dense(item: RerankedChunk, marker: str) -> RAGCitation:
     )
 
 
-def _citation_for_unified(item: UnifiedCandidate, marker: str) -> RAGCitation:
+def citation_for_unified(item: UnifiedCandidate, marker: str) -> RAGCitation:
     if item.candidate_kind == "chunk":
         source_text = item.source_text.strip() if item.source_text else ""
         snippet = source_text[:1_000] or None
@@ -162,7 +162,7 @@ def assemble_context(
             citation = _citation_for_dense(ranked, f"C{len(selected) + 1}")
             text = ranked.chunk.payload.text.strip()
         elif isinstance(ranked, UnifiedCandidate):
-            citation = _citation_for_unified(ranked, f"C{len(selected) + 1}")
+            citation = citation_for_unified(ranked, f"C{len(selected) + 1}")
             if ranked.candidate_kind == "chunk":
                 # A chunk citation may only carry authoritative chunk text.  Its
                 # rerank carrier is not a substitute for missing source text.
@@ -209,4 +209,9 @@ def assemble_context(
     return ContextSelection(items=tuple(selected), character_count=character_count)
 
 
-__all__ = ["ContextSelection", "SelectedContextItem", "assemble_context"]
+__all__ = [
+    "ContextSelection",
+    "SelectedContextItem",
+    "assemble_context",
+    "citation_for_unified",
+]

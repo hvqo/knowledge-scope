@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 
-import type { RAGRetrievalMode } from "../api/types";
+import type { RAGAnswerMode, RAGRetrievalMode } from "../api/types";
 
 /**
  * Chat workspace UI state.
@@ -15,6 +15,7 @@ export const useChatStore = defineStore("chat", () => {
   const activeConversationId = ref<string | null>(null);
   const isSidebarOpen = ref(false);
   const retrievalMode = ref<RAGRetrievalMode | "auto">("auto");
+  const answerMode = ref<RAGAnswerMode>("standard");
 
   function setSelectedKnowledgeBase(id: string | null): void {
     selectedKnowledgeBaseId.value = id;
@@ -22,6 +23,10 @@ export const useChatStore = defineStore("chat", () => {
 
   function setRetrievalMode(mode: RAGRetrievalMode | "auto"): void {
     retrievalMode.value = mode;
+  }
+
+  function setAnswerMode(mode: RAGAnswerMode): void {
+    answerMode.value = mode;
   }
 
   function setActiveConversation(id: string | null): void {
@@ -41,8 +46,10 @@ export const useChatStore = defineStore("chat", () => {
     activeConversationId,
     isSidebarOpen,
     retrievalMode,
+    answerMode,
     setSelectedKnowledgeBase,
     setRetrievalMode,
+    setAnswerMode,
     setActiveConversation,
     toggleSidebar,
     closeSidebar,
