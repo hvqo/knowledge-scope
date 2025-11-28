@@ -26,6 +26,7 @@ from knowledge_scope.llm.schemas import (
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.table_analysis.models import (
     TableAnalysisRequest,
+    TableOperation,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,80 @@ _PLANNER_SYSTEM_PROMPT = """你是 KnowledgeScope 的多模态检索分析助手
 - 一条计划最多调用一个工具；已经获得的工具结果不要重复调用。
 - 当问题要求对比两份不同文档/表格中的同名指标时，必须使用一次 compare 调用，并给出
   second_evidence_index、key_column、value_column；不要拆成两次 select，也不要自行计算差异。
+- 如果候选文本证据已经能直接回答（例如标题、定义、原文位置、概述），优先输出 final，
+  不要为了「看起来更专业」而调用视觉或表格工具。
+- 但涉及表格中的具体数值查询（例如「某国某年 GDP 是多少」）、汇总、增长率或跨表对比时，
+  必须调用 analyze_table，用确定性工具取数，不能凭原文摘录直接给出计算结论。
 - 如果工具失败或候选来源不足，宁可输出 final，让最终回答明确说明限制，也不要编造数据。
 - 输出必须是单个合法 JSON 对象，且只包含上面工具约定中的字段。"""
+
+
+def _infer_table_operation(parameters: dict[str, object]) -> TableOperation | None:
+    """Infer the operation from an unambiguous parameter shape.
+
+    Small planners occasionally emit correct parameters with the wrong
+    ``operation`` label. The parameter contract is disjoint enough that this
+    normalization is safe and avoids a needless degraded answer.
+    """
+    keys = set(parameters)
+    if {"key_column", "value_column"} <= keys:
+        return "compare"
+    if "axis" in keys:
+        return "growth"
+    if "functions" in keys and "column" in keys:
+        return "aggregate"
+    if {"operator", "value"} <= keys and "column" in keys:
+        return "filter"
+    if "direction" in keys and "column" in keys:
+        return "sort"
+    if keys <= {"columns", "rows"}:
+        return "select"
+    return None
+
+
+_OPERATION_PARAMETER_KEYS: dict[str, set[str]] = {
+    "select": {"columns", "rows"},
+    "filter": {"column", "operator", "value", "columns"},
+    "sort": {"column", "direction", "limit", "columns"},
+    "aggregate": {"column", "functions", "group_by"},
+    "growth": {"axis", "column", "row", "base_column", "target_column", "base_row"},
+    "compare": {"key_column", "value_column", "keys"},
+}
+
+
+def _sanitize_parameters(
+    parameters: dict[str, object], operation: TableOperation
+) -> dict[str, object]:
+    """Drop keys that do not belong to the inferred operation.
+
+    Planners sometimes mix keys from two operations (for example aggregate
+    parameters plus ``columns``). After inferring the operation from the
+    unambiguous keys, unrelated keys are ignored instead of failing the plan.
+    """
+    allowed = _OPERATION_PARAMETER_KEYS.get(operation)
+    if allowed is None:
+        return parameters
+    sanitized = {key: value for key, value in parameters.items() if key in allowed}
+    if operation == "aggregate":
+        raw_functions = sanitized.get("functions")
+        if isinstance(raw_functions, list):
+            synonyms = {
+                "average": "avg",
+                "mean": "avg",
+                "total": "sum",
+                "minimum": "min",
+                "maximum": "max",
+            }
+            normalized: list[str] = []
+            for raw_function in raw_functions:
+                if not isinstance(raw_function, str):
+                    continue
+                function = synonyms.get(raw_function.strip().lower(), raw_function.strip().lower())
+                if function in {"sum", "avg", "min", "max"} and function not in normalized:
+                    normalized.append(function)
+            if normalized:
+                sanitized["functions"] = normalized
+    return sanitized
 
 
 def _candidate_line(candidate: AgentCandidate) -> str:
@@ -225,6 +298,7 @@ class AgentPlanner:
                 }
             else:
                 compare_table = None
+            parameters = dict(plan.parameters or {})
             payload: dict[str, object] = {
                 "schema_version": "1.0",
                 "knowledge_base_id": candidate.citation.knowledge_base_id,
@@ -233,17 +307,36 @@ class AgentPlanner:
                     "document_id": str(candidate.citation.document_id),
                     "evidence_id": candidate.evidence_id,
                 },
-                "parameters": plan.parameters or {},
+                "parameters": parameters,
             }
             if compare_table is not None:
                 payload["compare_table"] = compare_table
             try:
                 TableAnalysisRequest.model_validate(payload)
             except ValidationError as error:
-                first = error.errors()[0]
-                raise AgentPlanningError(
-                    f"表格工具参数不合法（{first.get('loc')}）：{first.get('msg')}"
-                ) from error
+                inferred = _infer_table_operation(parameters)
+                if inferred is None or inferred == plan.operation:
+                    first = error.errors()[0]
+                    raise AgentPlanningError(
+                        f"表格工具参数不合法（{first.get('loc')}）：{first.get('msg')}"
+                    ) from error
+                payload["operation"] = inferred
+                sanitized = _sanitize_parameters(parameters, inferred)
+                payload["parameters"] = sanitized
+                try:
+                    TableAnalysisRequest.model_validate(payload)
+                except ValidationError:
+                    first = error.errors()[0]
+                    raise AgentPlanningError(
+                        f"表格工具参数不合法（{first.get('loc')}）：{first.get('msg')}"
+                    ) from error
+                plan.operation = inferred
+                plan.parameters = sanitized
+                logger.info(
+                    "agent planner normalized table operation to %s for parameters %s",
+                    inferred,
+                    sorted(parameters),
+                )
         if plan.second_evidence_index is not None and (
             second is None or second.modality != "table" or not second.tool_capable
         ):

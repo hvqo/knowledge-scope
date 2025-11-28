@@ -118,6 +118,27 @@
 - 真实验收：标准 RAG 问答、确定性表格计算、跨文档对比、图片/图表/图片表格视觉工具，以及工具失败降级；
   验证 `tool_status` 顺序、引用来源与素材预览可用。
 
+## M5 可靠性加固
+
+- citation 只保留「被回答实际引用」或「工具实际使用」的候选：服务端按回答中的 `[Cx]` marker 过滤，
+  模型自造或越界的 marker 在流式输出阶段即被剥离，未使用的候选不再出现在来源列表。
+- 降级路径保留真实执行信息：`complete.agent_degraded=true` 时仍写入真实 `tool_calls`、
+  `agent_tool_trace`，前端提示「未执行视觉分析或确定性计算」，不会把降级回答伪装成工具结果。
+- 规划日志只记录失败类别、尝试次数和结构化校验错误，不写原始模型输出或用户问题。
+  规划器在参数形状明确但 operation 标签错误时做一次安全归一化，避免无谓降级。
+- 多轮问题复用现有 `HistoryCompressor` 与 `QueryRewriteService`：指代消解后的检索 query、压缩历史
+  与改写依据进入规划与回答提示；`complete` 返回 `rewritten_query` 与历史压缩元数据。
+- 单轮墙钟上限由 `KNOWLEDGE_SCOPE_AGENT_TIMEOUT_SECONDS` 控制，超时返回受控 `error` + `complete(error)`；
+  每个请求独立持有流与规划状态，取消/断开连接不会污染并发会话。
+
+## 智能体回答写入报告
+
+`POST /api/v1/reports/{report_id}/sections/{section_id}/agent-answers/insert` 接收
+`content_append` 与 1–12 条 `rag_evidence` 来源。服务端逐条校验：报告知识库与来源知识库一致、
+文档属于该知识库、Evidence 页码与 source block 与服务器记录一致；历史文档缺少解析产物时
+返回 warning 并保留引用信息，其他不一致直接 409/422 拒绝。校验通过后在单个事务中追加正文并持久化来源。
+前端「插入报告」对话框复用该接口，不需要把回答重新交给模型生成。
+
 ## 与后续阶段的关系
 
 - M5 及以后可把 `AgentRetrievalTool`、`AgentToolExecutor` 作为可复用工具层接入更复杂的编排，但本阶段不引入 LangGraph、多智能体或新的向量库。
