@@ -37,11 +37,12 @@ DEV Baseline Run #2（run ID：`9dd19827-0329-4618-914e-3a72f5d5e16c`）的调�
 23 次以同样的 512-token 截断并产生结构化解析失败。这是已确认的输出容量瓶颈，不是对模型
 质量的重新评估。
 
-因此，后续 ChatBI provider DEV 运行将统一使用 `1024` output tokens：首次和有界 repair 的
-NL2SQL 生成共用 `chatbi_nl2sql_max_tokens=1024`，结果分析使用
-`chatbi_analysis_max_tokens=1024`。修复次数、prompt、response schema、temperature、模型、
-比较器和数据集均不变；历史 Run #1/Run #2 产物不回写，TEST split 仍不可用。该调整只修正已
-确认的输出预算限制，在新的 DEV 运行前不宣称质量提升。
+因此，A5.7d1 及其后续已记录的 1024-token 运行使用：首次和有界 repair 的 NL2SQL 生成共用
+`chatbi_nl2sql_max_tokens=1024`，结果分析使用 `chatbi_analysis_max_tokens=1024`。这段数字只
+描述对应的历史运行；后续窄实验可以显式改变 NL2SQL 配置，但不得回写历史产物。修复次数、
+prompt、response schema、temperature、模型、比较器和数据集均不变；历史 Run #1/Run #2 产物不
+回写，TEST split 仍不可用。该调整只修正已确认的输出预算限制，在新的 DEV 运行前不宣称质量
+提升。
 
 ## A5.7d2 分析契约硬化（未运行 provider）
 
@@ -84,6 +85,27 @@ fingerprint 和 Git revision/dirty 状态；不记录 chain-of-thought。Run #5�
 本实验不改变 comparator。`alias_derived` 只是问题类别，不是别名失败类别；normalized result
 comparator 本来就忽略输出列名/别名，`result_mismatch` 诊断必须归因于列数、列顺序、行值、行粒度、
 排序或其他实际语义差异，不能把 alias 单独计为 Execution Accuracy 失败。
+
+## A5.7d6 高推理 + 2048 输出预算实验（未运行 provider）
+
+A5.7d6 是一个仅用于下一轮 DEV 的受控配置准备：NL2SQL 初次生成和有界 repair 都使用
+provider-neutral 的 `reasoning="high"`，DeepSeek 适配器在请求边界发送
+`thinking: {"type":"enabled"}` 与 `reasoning_effort: "high"`；两者的 `max_tokens` 都为
+`2048`。结果分析保持 `reasoning="disabled"` 和 `chatbi_analysis_max_tokens=1024`。prompt
+`a5.3-v3`、JSON 单字段 SQL contract、temperature、provider/model、gateway retry、Agent
+预算、validator、executor、comparator、冻结 DEV 数据集和 fixture 均不变。
+
+Run #5 的 `reasoning=None` 没有记录 provider 的有效 reasoning 参数，因此只能作为“provider
+默认/高推理倾向”的诊断，不能证明与显式 `high` 语义完全等价。Run #8 与 Run #5 的比较如果
+要解释为预算实验，仍需先在 provenance 中核对有效 provider 配置；本次不调用 provider、不运行
+DEV/TEST，也不修改 Run #5、Run #6、Run #7。新的 artifact 会记录解析后的 NL2SQL/repair
+预算、provider-effective thinking 字段、analysis 独立预算以及 model、dataset/fixture
+fingerprint、Git revision 和 dirty 状态，不记录 chain-of-thought。
+
+`Settings` 仍遵循环境变量优先级：已有的
+`KNOWLEDGE_SCOPE_CHATBI_NL2SQL_MAX_TOKENS=512` 会有意覆盖默认值。执行下一轮前必须以
+preflight 和 artifact provenance 核对实际解析预算是否为 `2048`；analysis budget 不受该变量
+影响。
 
 ## 冻结输入
 

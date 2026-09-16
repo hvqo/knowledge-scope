@@ -95,10 +95,27 @@ def test_v2_provenance_records_explicit_nl2sql_reasoning_mode() -> None:
         max_chars=settings.chatbi_schema_context_max_chars,
     )
 
-    assert configuration.nl2sql_max_tokens == 1024
-    assert configuration.nl2sql_reasoning == "low"
+    assert configuration.nl2sql_max_tokens == 2048
+    assert configuration.nl2sql_reasoning == "high"
     assert configuration.nl2sql_thinking_type == "enabled"
-    assert configuration.nl2sql_reasoning_effort == "low"
+    assert configuration.nl2sql_reasoning_effort == "high"
+
+
+def test_v2_provenance_uses_resolved_budgets() -> None:
+    settings = Settings(
+        _env_file=None,
+        chatbi_nl2sql_max_tokens=3072,
+        chatbi_analysis_max_tokens=768,
+    )
+
+    configuration = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    assert configuration.nl2sql_max_tokens == 3072
+    assert configuration.agent_limits.analysis_max_tokens == 768
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(

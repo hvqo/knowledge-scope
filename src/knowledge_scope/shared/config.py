@@ -14,7 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
-DEFAULT_CHATBI_NL2SQL_MAX_TOKENS: Final = 1024
+DEFAULT_CHATBI_NL2SQL_MAX_TOKENS: Final = 2048
 DEFAULT_CHATBI_ANALYSIS_MAX_TOKENS: Final = 1024
 
 

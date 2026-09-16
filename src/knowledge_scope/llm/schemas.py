@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 LLMMessageRole = Literal["system", "user"]
 # Provider-neutral reasoning controls.  Adapters translate these semantic
 # values to the provider-specific request shape at their HTTP boundary.
-LLMReasoningMode = Literal["enabled", "disabled", "low"]
+LLMReasoningMode = Literal["enabled", "disabled", "low", "high"]
 LLMTaskType = Literal[
     "rag_answer",
     "graph_extraction",

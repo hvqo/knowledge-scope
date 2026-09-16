@@ -161,12 +161,12 @@ class DeepSeekProvider:
             payload["max_tokens"] = request.max_tokens
         if request.response_format is not None:
             payload["response_format"] = request.response_format.model_dump(mode="json")
-        if request.reasoning == "low":
-            # ``low`` is a provider-neutral application mode.  DeepSeek needs
-            # thinking enabled plus an explicit effort value to avoid falling
-            # back to its default/high reasoning behavior.
+        if request.reasoning in {"low", "high"}:
+            # ``low`` and ``high`` are provider-neutral application modes.
+            # DeepSeek needs thinking enabled plus an explicit effort value to
+            # avoid relying on provider defaults.
             payload["thinking"] = {"type": "enabled"}
-            payload["reasoning_effort"] = "low"
+            payload["reasoning_effort"] = request.reasoning
         elif request.reasoning is not None:
             payload["thinking"] = {"type": request.reasoning}
         if stream:

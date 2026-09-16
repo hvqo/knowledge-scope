@@ -24,7 +24,7 @@ def test_llm_request_normalizes_messages_and_model() -> None:
     assert request.task_type == "rag_answer"
 
 
-@pytest.mark.parametrize("reasoning", ["enabled", "disabled", "low"])
+@pytest.mark.parametrize("reasoning", ["enabled", "disabled", "low", "high"])
 def test_llm_request_accepts_provider_neutral_reasoning_modes(reasoning: str) -> None:
     request = LLMRequest(
         messages=[LLMMessage(role="user", content="问题")],
