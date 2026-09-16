@@ -100,6 +100,7 @@ def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
     assert configuration.nl2sql_reasoning == "disabled"
     assert configuration.nl2sql_thinking_type == "disabled"
     assert configuration.nl2sql_reasoning_effort is None
+    assert configuration.nl2sql_result_contract_enabled is True
 
 
 def test_v2_provenance_uses_resolved_budgets() -> None:
@@ -138,6 +139,20 @@ def test_runtime_provenance_retains_historical_low_and_high_modes() -> None:
         assert historical.nl2sql_reasoning == mode
         assert historical.nl2sql_thinking_type == "enabled"
         assert historical.nl2sql_reasoning_effort == mode
+
+
+def test_historical_provenance_without_result_contract_flag_remains_readable() -> None:
+    settings = Settings(_env_file=None)
+    payload = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    ).model_dump(mode="json")
+    payload.pop("nl2sql_result_contract_enabled")
+
+    historical = EvaluationRuntimeConfiguration.model_validate(payload)
+
+    assert historical.nl2sql_result_contract_enabled is False
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(
@@ -678,7 +693,11 @@ class _DeterministicV2Gateway:
         self.requests.append(request)
         if request.task_type == "nl2sql":
             response = (
-                '{"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
+                '{"result_contract":{"row_grain":"detail","grain_keys":["chatbi_demo.customers.customer_id"],'
+                '"output_columns":[{"kind":"source","source":"chatbi_demo.customers.customer_name"}],'
+                '"group_by":[],"order_by":[{"key":"chatbi_demo.customers.customer_id",'
+                '"direction":"asc"}],"limit":null},'
+                '"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
             )
             input_tokens, output_tokens = 13, 8
         elif request.task_type == "chatbi_analysis":

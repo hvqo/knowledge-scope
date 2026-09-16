@@ -97,6 +97,37 @@ def _candidate(request: _NL2SQLRequest, sql: str) -> SQLCandidate:
     )
 
 
+def _generation_payload(sql: str, *, expression: str = "1") -> str:
+    """Build the smallest structured response used by provider-free tests."""
+    normalized = " ".join(sql.strip().split()).lower()
+    if normalized == "select id from public.sales":
+        contract = {
+            "row_grain": "detail",
+            "grain_keys": ["public.sales.id"],
+            "output_columns": [{"kind": "source", "source": "public.sales.id"}],
+            "group_by": [],
+            "order_by": [],
+            "limit": None,
+        }
+    else:
+        contract = {
+            "row_grain": "scalar",
+            "grain_keys": [],
+            "output_columns": [
+                {
+                    "kind": "derived",
+                    "expression": expression,
+                    "source_columns": [],
+                    "alias": "answer",
+                }
+            ],
+            "group_by": [],
+            "order_by": [],
+            "limit": None,
+        }
+    return json.dumps({"result_contract": contract, "sql": sql}, ensure_ascii=False)
+
+
 def _data_source() -> DataSource:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     return DataSource(
@@ -133,7 +164,7 @@ class _FakeGateway:
 async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens() -> None:
     class SequenceGateway:
         def __init__(self) -> None:
-            self.responses = ["not json", json.dumps({"sql": "SELECT 1"})]
+            self.responses = ["not json", _generation_payload("SELECT 1")]
             self.requests: list[LLMRequest] = []
 
         async def complete(self, request: LLMRequest) -> LLMResult:
@@ -229,7 +260,7 @@ async def test_production_generation_discovers_snapshot_from_registered_datasour
 
     discovery = FakeDiscovery()
     data_source_provider = FakeDataSourceProvider()
-    gateway = _FakeGateway(json.dumps({"sql": "SELECT 1"}))
+    gateway = _FakeGateway(_generation_payload("SELECT 1"))
     service = NL2SQLService(
         gateway,
         schema_discovery=discovery,
@@ -295,7 +326,7 @@ async def test_candidate_generation_exposes_usage_and_bounded_repair_context() -
         async def get(self, _datasource_id: UUID) -> DataSource:
             return _data_source()
 
-    gateway = _FakeGateway(json.dumps({"sql": "SELECT 1"}))
+    gateway = _FakeGateway(_generation_payload("SELECT 1"))
     service = NL2SQLService(
         gateway,
         schema_discovery=FakeDiscovery(),
@@ -346,7 +377,7 @@ async def test_production_validation_uses_discovered_snapshot_not_caller_snapsho
             return _data_source()
 
     service = NL2SQLService(
-        _FakeGateway(json.dumps({"sql": "SELECT * FROM public.invented_table"})),
+        _FakeGateway(_generation_payload("SELECT 1 FROM public.invented_table")),
         schema_discovery=FakeDiscovery(),
         data_source_provider=FakeDataSourceProvider(),
     )
@@ -359,7 +390,7 @@ async def test_production_validation_uses_discovered_snapshot_not_caller_snapsho
             max_chars=10_000,
         )
 
-    assert error.value.category is ChatBIErrorCategory.UNKNOWN_TABLE
+    assert error.value.category is ChatBIErrorCategory.RESULT_CONTRACT_INCONSISTENT
 
 
 @pytest.mark.anyio
@@ -411,7 +442,7 @@ def test_prompt_is_versioned_and_contains_only_question_and_structural_context()
     messages = build_nl2sql_messages(request)
 
     assert [message.role for message in messages] == ["system", "user"]
-    assert "a5.3-v3" in messages[0].content
+    assert "a5.3-v4" in messages[0].content
     assert request.question in messages[1].content
     assert "Approved semantic schema context JSON" in messages[1].content
     assert "Comment:" not in messages[1].content
@@ -430,13 +461,11 @@ def test_nl2sql_prompt_enforces_general_exact_projection_contract() -> None:
     )
 
     required_rules = (
-        "Select exactly the columns or derived values needed",
-        "Do not add helpful",
-        "Preserve the natural order",
-        "For top-k, minimum, maximum, earliest, or latest questions",
+        "intended row_grain",
+        "stable grain_keys",
+        "exact ordered output_columns",
         "Never use SELECT *",
-        "concise, stable aliases",
-        "used only for joins, filters, grouping, or deterministic tie-breaking",
+        "Do not return explanations",
     )
     for rule in required_rules:
         assert rule in base_messages[0].content
@@ -883,7 +912,7 @@ def test_omitted_relation_is_not_usable_even_when_it_exists_in_snapshot() -> Non
 @pytest.mark.anyio
 async def test_generation_uses_gateway_and_rejected_candidate_never_becomes_validated() -> None:
     request = _request()
-    gateway = _FakeGateway(json.dumps({"sql": "SELECT id FROM public.sales"}))
+    gateway = _FakeGateway(_generation_payload("SELECT id FROM public.sales"))
     result = await NL2SQLService(gateway, max_tokens=128)._generate_and_validate(request)
 
     assert result.candidate.provider == "fake"
@@ -892,7 +921,12 @@ async def test_generation_uses_gateway_and_rejected_candidate_never_becomes_vali
     assert gateway.requests[0].response_format is not None
     assert gateway.requests[0].max_tokens == 128
 
-    rejected_gateway = _FakeGateway(json.dumps({"sql": "DROP TABLE public.sales"}))
+    rejected_gateway = _FakeGateway(
+        _generation_payload(
+            "SELECT pg_catalog.pg_read_file('secret')",
+            expression="pg_catalog.pg_read_file('secret')",
+        )
+    )
     with pytest.raises(ChatBIError) as error:
         await NL2SQLService(rejected_gateway)._generate_and_validate(request)
     assert error.value.category is ChatBIErrorCategory.UNSAFE_QUERY
@@ -929,7 +963,7 @@ async def test_provider_failure_is_normalized_without_raw_error_text() -> None:
 
 def test_candidate_question_and_identity_must_match_request_and_snapshot() -> None:
     request = _request()
-    service = NL2SQLService(_FakeGateway('{"sql":"SELECT 1"}'))
+    service = NL2SQLService(_FakeGateway(_generation_payload("SELECT 1")))
     mismatched = _candidate(request, "SELECT 1").model_copy(update={"question": "another"})
 
     with pytest.raises(ChatBIError) as error:

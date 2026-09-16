@@ -19,7 +19,9 @@ A5.2 只读 schema discovery
         ↓
 SchemaDiscoveryResult（当前 snapshot + 已预算 context）
         ↓
-LLMGateway（结构化 JSON：只接受 {"sql":"..."}）
+LLMGateway（一次结构化 JSON：ResultContract + sql）
+        ↓
+ResultContract 结构校验 + SQL/ResultContract 一致性校验
         ↓
 SQLCandidate（应用补充 provider/model/context fingerprint）
         ↓
@@ -42,6 +44,35 @@ authoritative snapshot。低层 `_SQLSafetyValidator` 和
 当前没有 SQL executor；未来执行代码必须重新从 `datasource_id` 和不受信任的
 SQL 候选进入上述 trusted validation path，不能接收调用方传入或反序列化的
 `ValidatedSQL`。
+
+## ResultContract
+
+NL2SQL 的一次结构化响应使用 `a5.3-v4` contract：
+
+```json
+{
+  "result_contract": {
+    "contract_version": "1.0",
+    "row_grain": "scalar|detail|grouped",
+    "grain_keys": ["schema.relation.column"],
+    "output_columns": [],
+    "group_by": [],
+    "order_by": [],
+    "limit": null
+  },
+  "sql": "SELECT ..."
+}
+```
+
+`grain_keys` 描述结果中行或实体的稳定身份，不要求出现在 SELECT 投影中；
+`output_columns` 则是有序的最终输出列。Contract 校验会根据当前受信任的
+schema context 检查来源、分组、排序和上限，随后再按 SQL AST 检查投影顺序、
+缺失/多余列、DISTINCT、分组与 limit 是否一致。别名只是显示元数据，不能替代
+底层来源身份。派生列只使用小型语义描述，不接受完整 SQL AST。
+
+ResultContract 只改善结果结构的约束，不能证明 SQL 的业务正确性，不能替代
+A5.3 的 SQL 安全校验，也不能替代执行结果评测；它同样不处理不支持或含糊问题的
+资格判断。Contract 不会授权原本不安全的 SQL。
 
 ## AST 校验范围
 
@@ -91,7 +122,8 @@ delimiter-safe escaping；标识符
 `connection_ref`、数据库 URL 或凭据。
 
 `chatbi nl2sql` 是开发者 smoke-test：它先从注册数据源执行只读 schema
-discovery，再生成和验证 SQL，输出安全的结构化结果；没有 SQL 执行 endpoint。
+discovery，再生成 ResultContract + SQL，进行结构一致性和安全验证，输出安全的结构化
+结果；没有 SQL 执行 endpoint。
 当前执行 adapter 只接受同一 trusted validation path 产生的内部结果，见
 [`chatbi-sql-execution.md`](chatbi-sql-execution.md)；本模块仍没有参数绑定、结果行脱敏、MCP、
 NL2SQL 质量评测或前端 ChatBI 页面；有界 Agent 的编排见

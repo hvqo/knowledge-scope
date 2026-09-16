@@ -59,7 +59,11 @@ from knowledge_scope.chatbi.execution import (
     SQLExecutionService,
 )
 from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE, NL2SQLService
-from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION, SQLCandidate
+from knowledge_scope.chatbi.nl2sql_models import (
+    NL2SQL_PROMPT_VERSION,
+    ResultContract,
+    SQLCandidate,
+)
 from knowledge_scope.chatbi.policy import QueryPolicy, SQLDialect, default_query_policy
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.chatbi.schema_models import SchemaDiscoveryResult, SchemaObjectKind
@@ -617,6 +621,9 @@ class EvaluationRuntimeConfiguration(_EvaluationModel):
     provider_timeout_seconds: StrictFloat = Field(gt=0)
     provider_max_retries: StrictInt = Field(ge=0)
     nl2sql_prompt_version: StrictStr = Field(min_length=1, max_length=64)
+    # Missing on historical artifacts; new runs explicitly record that the
+    # structured result contract is part of the generation boundary.
+    nl2sql_result_contract_enabled: StrictBool = False
     analysis_prompt_version: StrictStr = Field(min_length=1, max_length=64)
     agent_limits: EvaluationAgentLimits
     query_policy: EvaluationQueryPolicy
@@ -899,6 +906,7 @@ def _evaluation_configuration(
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,
+        nl2sql_result_contract_enabled=True,
         analysis_prompt_version=CHATBI_ANALYSIS_PROMPT_VERSION,
         agent_limits=EvaluationAgentLimits.model_validate(limits.model_dump(mode="json")),
         query_policy=_evaluation_policy(policy),
@@ -1653,6 +1661,7 @@ class _TimedGeneration:
         max_tokens: int | None = None,
         previous_sql: str | None = None,
         validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         is_repair = previous_sql is not None or validation_error is not None
         schema_before = self._timing.schema_prep_ms
@@ -1669,6 +1678,7 @@ class _TimedGeneration:
                     max_tokens=max_tokens,
                     previous_sql=previous_sql,
                     validation_error=validation_error,
+                    previous_contract=previous_contract,
                 )
             self._timing.stages = self._timing.stages.model_copy(update={stage: "passed"})
             return result

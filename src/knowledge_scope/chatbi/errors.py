@@ -17,6 +17,8 @@ class ChatBIErrorCategory(StrEnum):
     INVALID_QUERY = "invalid_query"
     GENERATION_FAILED = "generation_failed"
     MALFORMED_MODEL_OUTPUT = "malformed_model_output"
+    RESULT_CONTRACT_INVALID = "result_contract_invalid"
+    RESULT_CONTRACT_INCONSISTENT = "result_contract_inconsistent"
     SQL_PARSE_ERROR = "sql_parse_error"
     UNSAFE_QUERY = "unsafe_query"
     POLICY_VIOLATION = "policy_violation"

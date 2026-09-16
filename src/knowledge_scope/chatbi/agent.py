@@ -27,7 +27,7 @@ from knowledge_scope.shared.config import DEFAULT_CHATBI_ANALYSIS_MAX_TOKENS
 from .errors import ChatBIError, ChatBIErrorCategory, StructuredOutputError
 from .execution import SQLExecutionOutcome, SQLExecutionService, redact_sql_literals
 from .nl2sql import LLMUsageMetadata, NL2SQLGenerationError, NL2SQLService
-from .nl2sql_models import NL2SQLInput, SQLCandidate
+from .nl2sql_models import NL2SQLInput, ResultContract, SQLCandidate
 from .policy import QueryPolicy
 from .schemas import (
     ColumnMetadata,
@@ -45,6 +45,8 @@ _MAX_QUESTION_LENGTH: Final = 10_000
 _REPAIRABLE_CATEGORIES: Final = frozenset(
     {
         ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+        ChatBIErrorCategory.RESULT_CONTRACT_INVALID,
+        ChatBIErrorCategory.RESULT_CONTRACT_INCONSISTENT,
         ChatBIErrorCategory.SQL_PARSE_ERROR,
         ChatBIErrorCategory.UNKNOWN_TABLE,
         ChatBIErrorCategory.UNKNOWN_COLUMN,
@@ -225,6 +227,7 @@ class CandidateGenerationService(Protocol):
         max_tokens: int | None = None,
         previous_sql: str | None = None,
         validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         """Generate an untrusted candidate from a fresh trusted schema snapshot."""
 
@@ -455,6 +458,7 @@ class ChatBIAgentService:
         outcome: SQLExecutionOutcome | None = None
         repair_sql: str | None = None
         repair_error: str | None = None
+        repair_contract: ResultContract | None = None
         sql_attempts = 0
         repair_attempts = 0
         step_count = 0
@@ -560,10 +564,14 @@ class ChatBIAgentService:
                         max_tokens=None,
                         previous_sql=repair_sql,
                         validation_error=repair_error,
+                        previous_contract=repair_contract,
                     )
                 )
                 add_usage(generation_result)
                 candidate = generated
+                repair_sql = None
+                repair_error = None
+                repair_contract = None
                 add_trace("schema_prepared", attempt=sql_attempts)
                 add_trace("sql_generated", attempt=sql_attempts)
             except asyncio.CancelledError:
@@ -583,8 +591,16 @@ class ChatBIAgentService:
                     and sql_attempts < self._limits.max_sql_attempts
                 ):
                     repair_attempts += 1
-                    repair_sql = candidate.sql if candidate is not None else None
                     repair_error = error.safe_message
+                    if isinstance(error, NL2SQLGenerationError):
+                        repair_sql = error.candidate_sql
+                        repair_contract = error.result_contract
+                    elif candidate is not None:
+                        repair_sql = candidate.sql
+                        repair_contract = candidate.result_contract
+                    else:
+                        repair_sql = None
+                        repair_contract = None
                     add_trace(
                         "repair_requested", attempt=sql_attempts, error_category=error.category
                     )
@@ -710,6 +726,7 @@ class ChatBIAgentService:
                     repair_attempts += 1
                     repair_sql = candidate.sql
                     repair_error = execution_result.error_message or rejection_category.value
+                    repair_contract = candidate.result_contract
                     add_trace(
                         "repair_requested",
                         attempt=sql_attempts,

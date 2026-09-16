@@ -42,12 +42,24 @@ from .nl2sql import (
 )
 from .nl2sql_models import (
     NL2SQL_MAX_TOKENS,
+    RESULT_CONTRACT_VERSION,
     NL2SQLInput,
     NL2SQLResult,
+    ResultContract,
     SQLCandidate,
     SQLGenerationPayload,
 )
 from .policy import QueryPolicy, SQLDialect, default_query_policy
+from .result_contract import (
+    AggregateFunction,
+    OutputColumnKind,
+    ResultGrain,
+    ResultOrderByTerm,
+    ResultOutputColumn,
+    SortDirection,
+    validate_result_contract,
+    validate_sql_result_contract,
+)
 from .schema_models import (
     SchemaColumn,
     SchemaContextBudgetError,
@@ -81,6 +93,8 @@ __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
     "NL2SQL_MAX_TOKENS",
     "NL2SQL_REASONING_MODE",
+    "RESULT_CONTRACT_VERSION",
+    "AggregateFunction",
     "ChatBIAgentLimits",
     "ChatBIAgentService",
     "ChatBIAnalysisPayload",
@@ -101,6 +115,7 @@ __all__ = [
     "NL2SQLInput",
     "NL2SQLResult",
     "NL2SQLService",
+    "OutputColumnKind",
     "PostgresExecutionAdapter",
     "QueryAuditRecord",
     "QueryExecutionRequest",
@@ -110,6 +125,10 @@ __all__ = [
     "QueryTruncationReason",
     "RegisteredDataSourceProvider",
     "ResolvedDatabaseCredentials",
+    "ResultContract",
+    "ResultGrain",
+    "ResultOrderByTerm",
+    "ResultOutputColumn",
     "SQLCandidate",
     "SQLDialect",
     "SQLExecutionAuditRecord",
@@ -129,6 +148,7 @@ __all__ = [
     "SchemaUniqueConstraint",
     "SecretReferenceResolver",
     "SemanticSchemaContext",
+    "SortDirection",
     "build_chatbi_analysis_messages",
     "build_nl2sql_messages",
     "build_nl2sql_repair_messages",
@@ -141,4 +161,6 @@ __all__ = [
     "redact_sql_literals",
     "render_structural_schema_context",
     "validate_connection_ref",
+    "validate_result_contract",
+    "validate_sql_result_contract",
 ]

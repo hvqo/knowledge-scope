@@ -25,12 +25,14 @@ from .nl2sql_models import (
     NL2SQL_PROMPT_VERSION,
     NL2SQLInput,
     NL2SQLResult,
+    ResultContract,
     SQLCandidate,
     SQLGenerationPayload,
     ValidatedSQL,
     _NL2SQLRequest,
 )
 from .policy import QueryPolicy
+from .result_contract import validate_result_contract, validate_sql_result_contract
 from .schema_models import (
     SchemaContextBudgetError,
     SchemaDiscoveryResult,
@@ -124,12 +126,16 @@ class NL2SQLGenerationError(ChatBIError):
         message: str,
         *,
         usage: LLMUsageMetadata,
+        candidate_sql: str | None = None,
+        result_contract: ResultContract | None = None,
         response_parse_outcome: Literal[
             "structured_output_parse_error", "structured_output_schema_error"
         ] = "structured_output_schema_error",
     ) -> None:
         super().__init__(category, message)
         self.usage = usage
+        self.candidate_sql = candidate_sql
+        self.result_contract = result_contract
         self.response_parse_outcome = response_parse_outcome
 
 
@@ -173,22 +179,18 @@ def build_nl2sql_messages(request: _NL2SQLRequest) -> list[LLMMessage]:
     """Build a versioned prompt using structural, comment-free schema JSON."""
     system = (
         f"KnowledgeScope NL2SQL contract {NL2SQL_PROMPT_VERSION}.\n"
-        "Generate one read-only PostgreSQL query from the approved schema context.\n"
-        "Use only tables and columns shown in that context; never invent schema objects.\n"
-        "Use explicit joins supported by the context and keep the query bounded. Select exactly "
-        "the columns or derived values needed to answer the user's question. Do not add helpful, "
-        "descriptive, identifier, date, region, customer, or metadata columns unless requested "
-        "or semantically necessary.\n"
-        "Preserve the natural order of clearly requested fields. For an entity plus a metric, "
-        "return only the requested identifying field(s) and metric. For top-k, minimum, maximum, "
-        "earliest, or latest questions, do not return a full source row unless explicitly asked.\n"
-        "Never use SELECT *. Use concise, stable aliases for derived values that reflect the "
-        "requested concept. Columns used only for joins, filters, grouping, or deterministic "
-        "tie-breaking do not belong in SELECT unless requested.\n"
-        "If the context cannot answer the question, still return a query only when a safe, "
-        "supported read-only query is possible.\n"
-        'Return exactly one JSON object with one string field: {"sql":"..."}.\n'
-        "Do not return explanations, confidence, safety claims, markdown, or extra fields."
+        "Generate one bounded, read-only PostgreSQL query and its semantic result contract "
+        "from the approved schema JSON. Use only discovered tables and columns.\n"
+        "The result contract must state the intended row_grain (scalar, detail, or grouped), "
+        "stable grain_keys, the exact ordered output_columns, structural group_by and order_by "
+        "terms, and an explicit limit only when the question requires one. Grain keys describe "
+        "identity and need not be selected, but grouped contracts must retain them in group_by.\n"
+        "Use output_columns with kind source, aggregate, or derived. Source references are "
+        "schema.relation.column; aggregate uses count/sum/avg/min/max; derived includes its "
+        "expression and source_columns. Never use SELECT * or add unrequested columns.\n"
+        'Return exactly {"result_contract":{...},"sql":"..."}. Do not return explanations, '
+        "confidence, safety claims, markdown, chain-of-thought, or extra fields. If the schema "
+        "cannot answer the question safely, return no invented objects."
     )
     try:
         structural_context = render_structural_schema_context(
@@ -222,6 +224,7 @@ def build_nl2sql_repair_messages(
     *,
     previous_sql: str | None,
     validation_error: str,
+    previous_contract: ResultContract | None = None,
 ) -> list[LLMMessage]:
     """Add bounded, structured repair context without exposing driver details."""
     messages = build_nl2sql_messages(request)
@@ -235,6 +238,11 @@ def build_nl2sql_repair_messages(
     )
     repair_payload = json.dumps(
         {
+            "previous_result_contract": (
+                previous_contract.model_dump(mode="json")
+                if isinstance(previous_contract, ResultContract)
+                else None
+            ),
             "previous_sql": safe_previous_sql,
             "validation_error": safe_error,
         },
@@ -290,7 +298,9 @@ class NL2SQLService:
         request: _NL2SQLRequest,
         *,
         max_tokens: int | None = None,
-        repair_context: tuple[str | None, str] | None = None,
+        repair_context: tuple[str | None, str]
+        | tuple[str | None, str, ResultContract | None]
+        | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         """Generate one application-enriched candidate from structured model output."""
         request = self._validated_request(request)
@@ -308,6 +318,7 @@ class NL2SQLService:
                 request,
                 previous_sql=repair_context[0],
                 validation_error=repair_context[1],
+                previous_contract=repair_context[2] if len(repair_context) > 2 else None,
             )
         llm_request = LLMRequest(
             messages=messages,
@@ -356,7 +367,32 @@ class NL2SQLService:
                 provider=result.provider,
                 model=result.model,
                 prompt_version=NL2SQL_PROMPT_VERSION,
+                result_contract=payload.result_contract,
             )
+            try:
+                contract = validate_result_contract(
+                    payload.result_contract,
+                    schema_snapshot=request.schema_snapshot,
+                    semantic_context=request.semantic_context,
+                    policy=request.policy,
+                )
+                validate_sql_result_contract(
+                    payload.sql,
+                    contract,
+                    schema_snapshot=request.schema_snapshot,
+                    semantic_context=request.semantic_context,
+                    policy=request.policy,
+                )
+            except ChatBIError as error:
+                raise NL2SQLGenerationError(
+                    error.category,
+                    error.safe_message,
+                    usage=usage,
+                    candidate_sql=payload.sql,
+                    result_contract=payload.result_contract,
+                    response_parse_outcome="structured_output_schema_error",
+                ) from None
+            candidate = candidate.model_copy(update={"result_contract": contract})
             return candidate, result
         except StructuredOutputError as error:
             raise NL2SQLGenerationError(
@@ -366,6 +402,8 @@ class NL2SQLService:
                 response_parse_outcome=error.output_category,
             ) from None
         except ChatBIError as error:
+            if isinstance(error, NL2SQLGenerationError):
+                raise
             raise NL2SQLGenerationError(
                 error.category,
                 error.safe_message,
@@ -401,6 +439,20 @@ class NL2SQLService:
             raise ChatBIError(
                 ChatBIErrorCategory.POLICY_VIOLATION,
                 "SQL candidate question does not match the request",
+            )
+        if candidate.result_contract is not None:
+            contract = validate_result_contract(
+                candidate.result_contract,
+                schema_snapshot=request.schema_snapshot,
+                semantic_context=request.semantic_context,
+                policy=request.policy,
+            )
+            validate_sql_result_contract(
+                candidate.sql,
+                contract,
+                schema_snapshot=request.schema_snapshot,
+                semantic_context=request.semantic_context,
+                policy=request.policy,
             )
         return self._validator.validate(
             candidate,
@@ -556,6 +608,7 @@ class NL2SQLService:
         max_tokens: int | None = None,
         previous_sql: str | None = None,
         validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         """Generate an untrusted candidate and retain normalized usage metadata.
 
@@ -578,7 +631,11 @@ class NL2SQLService:
             policy=policy,
             max_chars=max_chars,
         )
-        repair_context = (previous_sql, validation_error) if validation_error is not None else None
+        repair_context = (
+            (previous_sql, validation_error, previous_contract)
+            if validation_error is not None
+            else None
+        )
         return await self._generate_with_result(
             request,
             max_tokens=max_tokens,

@@ -1482,6 +1482,7 @@ def _v2_configuration(
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,
+        nl2sql_result_contract_enabled=True,
         analysis_prompt_version=CHATBI_ANALYSIS_PROMPT_VERSION,
         agent_limits=EvaluationAgentLimits.model_validate(limits.model_dump(mode="json")),
         query_policy=EvaluationQueryPolicy.model_validate(policy.model_dump(mode="json")),

@@ -10,7 +10,8 @@ PostgreSQL schema discovery、NL2SQL 校验和只读执行服务，不建立第�
 question
   -> registered datasource lookup
   -> trusted schema discovery
-  -> NL2SQL LLM call
+  -> NL2SQL LLM call（a5.3-v4：ResultContract + SQL）
+  -> ResultContract / SQL 一致性校验
   -> SQLCandidate（不可信）
   -> fresh datasource-bound AST / policy validation
   -> read-only PostgreSQL execution
