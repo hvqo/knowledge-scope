@@ -313,6 +313,7 @@ class NL2SQLService:
             max_tokens=output_budget,
             model=request.model,
             response_format=LLMResponseFormat(type="json_object"),
+            reasoning="disabled",
         )
         try:
             result = await self._gateway.complete(llm_request)

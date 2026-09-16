@@ -607,6 +607,9 @@ class EvaluationRuntimeConfiguration(_EvaluationModel):
 
     max_chars: StrictInt = Field(ge=1)
     nl2sql_max_tokens: StrictInt = Field(ge=1)
+    # ``None`` preserves pre-A5.7d4 artifacts whose effective reasoning mode
+    # was not recorded; new provider runs populate the explicit value.
+    nl2sql_reasoning: Literal["disabled"] | None = None
     provider_timeout_seconds: StrictFloat = Field(gt=0)
     provider_max_retries: StrictInt = Field(ge=0)
     nl2sql_prompt_version: StrictStr = Field(min_length=1, max_length=64)
@@ -870,6 +873,7 @@ def _evaluation_configuration(
     return EvaluationRuntimeConfiguration(
         max_chars=max_chars,
         nl2sql_max_tokens=settings.chatbi_nl2sql_max_tokens,
+        nl2sql_reasoning="disabled",
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,

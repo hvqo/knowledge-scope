@@ -58,6 +58,14 @@ NL2SQL 投影规则：按问题选择恰好足够的列或派生值，不自动�
 辅助列，并在问题明确时保持请求顺序。该修改不包含 case ID、fixture 表名、reference SQL
 或期望答案，也尚未运行新的 DEV/TEST provider 评测，不宣称准确率提升。
 
+## A5.7d4 生成稳定性实验（未运行 provider）
+
+A5.7d4 只在 NL2SQL 初次生成和有界 repair 请求中显式设置 provider-neutral 的
+`reasoning=disabled`；DeepSeek 适配器因此发送 `thinking: {"type":"disabled"}`。结果分析、
+其他 LLM task、prompt v3、结构化输出契约、1024-token 上限、重试策略、验证器、执行器和冻结
+数据集均不变。下一次 provider 运行的 provenance 会记录实际 NL2SQL reasoning mode，Run #5
+不会被回写或重新解释；本次未运行 DEV/TEST provider 评测。
+
 ## 冻结输入
 
 评测输入来自 `docs/benchmarks/a5-7-chatbi-eval-v2.json`，状态为

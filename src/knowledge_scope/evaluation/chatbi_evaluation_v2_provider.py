@@ -1471,6 +1471,7 @@ def _v2_configuration(
     return EvaluationRuntimeConfiguration(
         max_chars=max_chars,
         nl2sql_max_tokens=settings.chatbi_nl2sql_max_tokens,
+        nl2sql_reasoning="disabled",
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,

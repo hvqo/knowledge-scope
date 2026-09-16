@@ -59,6 +59,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     _local_postgres_urls,
     _prepare_v2_preflight,
     _TimingState,
+    _v2_configuration,
     _v2_query_policy,
     _v2_record,
     _v2_usage_aggregate,
@@ -83,6 +84,19 @@ def test_v2_provider_selects_only_the_frozen_dev_split() -> None:
     assert {case.split for case in selected} == {"dev"}
     with pytest.raises(V2ProviderBenchmarkError, match="permits only"):
         select_v2_provider_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_v2_provenance_records_explicit_nl2sql_reasoning_mode() -> None:
+    settings = Settings(_env_file=None)
+
+    configuration = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    assert configuration.nl2sql_max_tokens == 1024
+    assert configuration.nl2sql_reasoning == "disabled"
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(

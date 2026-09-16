@@ -29,6 +29,9 @@ def _settings() -> Settings:
 
 
 def test_provider_payload_supports_json_mode_and_reasoning_control() -> None:
+    default_payload = DeepSeekProvider._payload(_request(), "configured-model", stream=False)
+    assert "thinking" not in default_payload
+
     request = _request().model_copy(
         update={
             "response_format": LLMResponseFormat(type="json_object"),
@@ -40,6 +43,47 @@ def test_provider_payload_supports_json_mode_and_reasoning_control() -> None:
 
     assert payload["response_format"] == {"type": "json_object"}
     assert payload["thinking"] == {"type": "disabled"}
+
+    enabled_payload = DeepSeekProvider._payload(
+        _request().model_copy(update={"reasoning": "enabled"}),
+        "configured-model",
+        stream=False,
+    )
+    assert enabled_payload["thinking"] == {"type": "enabled"}
+
+
+@pytest.mark.anyio
+async def test_deepseek_provider_translates_disabled_reasoning_at_http_boundary() -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads((await request.aread()).decode())
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "{}"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.deepseek.com/v1/",
+    )
+    provider = DeepSeekProvider(_settings(), client=client)
+    request = _request().model_copy(update={"reasoning": "disabled"})
+    try:
+        await provider.complete(request, model="configured-model")
+    finally:
+        await client.aclose()
+
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["thinking"] == {"type": "disabled"}
 
 
 @pytest.mark.anyio
