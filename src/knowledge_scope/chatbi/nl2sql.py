@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Final, Literal, Protocol
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from knowledge_scope.llm.errors import LLMError
 from knowledge_scope.llm.schemas import (
     LLMMessage,
+    LLMReasoningMode,
     LLMRequest,
     LLMResponseFormat,
     LLMResult,
@@ -37,6 +38,8 @@ from .schema_models import (
 )
 from .schemas import SQL_TEXT_MAX_LENGTH, DataSource
 from .sql_validation import _SQLSafetyValidator
+
+NL2SQL_REASONING_MODE: Final[LLMReasoningMode] = "low"
 
 
 class CompletionGateway(Protocol):
@@ -313,7 +316,7 @@ class NL2SQLService:
             max_tokens=output_budget,
             model=request.model,
             response_format=LLMResponseFormat(type="json_object"),
-            reasoning="disabled",
+            reasoning=NL2SQL_REASONING_MODE,
         )
         try:
             result = await self._gateway.complete(llm_request)
@@ -660,6 +663,7 @@ class NL2SQLService:
 
 
 __all__ = [
+    "NL2SQL_REASONING_MODE",
     "CompletionGateway",
     "LLMUsageMetadata",
     "NL2SQLGenerationError",

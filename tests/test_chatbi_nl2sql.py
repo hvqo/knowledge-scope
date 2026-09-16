@@ -162,7 +162,7 @@ async def test_default_nl2sql_and_repair_budgets_are_1024() -> None:
 
     assert candidate.sql == "SELECT 1"
     assert [item.max_tokens for item in gateway.requests] == [1024, 1024]
-    assert [item.reasoning for item in gateway.requests] == ["disabled", "disabled"]
+    assert [item.reasoning for item in gateway.requests] == ["low", "low"]
     assert gateway.requests[0].messages[0] == gateway.requests[1].messages[0]
 
 
@@ -315,7 +315,7 @@ async def test_candidate_generation_exposes_usage_and_bounded_repair_context() -
     assert usage.input_tokens == 10
     assert usage.output_tokens == 5
     assert len(gateway.requests) == 1
-    assert gateway.requests[0].reasoning == "disabled"
+    assert gateway.requests[0].reasoning == "low"
     repair_content = gateway.requests[0].messages[1].content
     assert '"previous_sql":"SELECT * FROM public.missing"' in repair_content
     assert '"validation_error":"unknown table"' in repair_content

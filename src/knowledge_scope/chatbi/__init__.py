@@ -33,6 +33,7 @@ from .execution import (
     redact_sql_literals,
 )
 from .nl2sql import (
+    NL2SQL_REASONING_MODE,
     NL2SQLService,
     RegisteredDataSourceProvider,
     SchemaDiscoveryProvider,
@@ -79,6 +80,7 @@ from .sql_validation import policy_fingerprint
 __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
     "NL2SQL_MAX_TOKENS",
+    "NL2SQL_REASONING_MODE",
     "ChatBIAgentLimits",
     "ChatBIAgentService",
     "ChatBIAnalysisPayload",

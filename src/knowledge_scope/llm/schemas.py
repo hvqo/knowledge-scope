@@ -10,7 +10,9 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LLMMessageRole = Literal["system", "user"]
-LLMReasoningMode = Literal["enabled", "disabled"]
+# Provider-neutral reasoning controls.  Adapters translate these semantic
+# values to the provider-specific request shape at their HTTP boundary.
+LLMReasoningMode = Literal["enabled", "disabled", "low"]
 LLMTaskType = Literal[
     "rag_answer",
     "graph_extraction",

@@ -66,6 +66,25 @@ A5.7d4 只在 NL2SQL 初次生成和有界 repair 请求中显式设置 provider
 数据集均不变。下一次 provider 运行的 provenance 会记录实际 NL2SQL reasoning mode，Run #5
 不会被回写或重新解释；本次未运行 DEV/TEST provider 评测。
 
+## A5.7d5 低推理 NL2SQL 实验（未运行 provider）
+
+A5.7d5 是一个只改变 NL2SQL 初次生成和有界 repair 推理控制的窄实验：应用层使用
+provider-neutral 的 `reasoning=low`，DeepSeek 适配器在请求边界映射为
+`thinking: {"type":"enabled"}` 与 `reasoning_effort: "low"`。`None` 仍表示不发送显式推理
+控制，`disabled` 仍表示 `thinking.type=disabled`；结果分析、其他 LLM task、prompt
+`a5.3-v3`、JSON 单字段 SQL contract、temperature、1024 output-token 上限、重试策略、验证器、
+执行器和冻结数据集均不变。初次生成与 repair 使用同一 `low` 设置，repair 不回落到 provider
+默认推理模式。
+
+下一次 provider artifact 会在配置 provenance 中记录 provider-neutral reasoning mode、实际
+`thinking.type`、`reasoning_effort`、解析后的 output-token budget，以及 model、dataset/fixture
+fingerprint 和 Git revision/dirty 状态；不记录 chain-of-thought。Run #5（provider 默认/高推理诊断）
+和 Run #6（disabled 稳定性基线）保持原样，本轮实现尚未运行 DEV/TEST provider 评测。
+
+本实验不改变 comparator。`alias_derived` 只是问题类别，不是别名失败类别；normalized result
+comparator 本来就忽略输出列名/别名，`result_mismatch` 诊断必须归因于列数、列顺序、行值、行粒度、
+排序或其他实际语义差异，不能把 alias 单独计为 Execution Accuracy 失败。
+
 ## 冻结输入
 
 评测输入来自 `docs/benchmarks/a5-7-chatbi-eval-v2.json`，状态为

@@ -47,6 +47,7 @@ from knowledge_scope.chatbi import (
 from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
 from knowledge_scope.chatbi.errors import ChatBIErrorCategory
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
+from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE
 from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION
 from knowledge_scope.chatbi.policy import QueryPolicy, SQLDialect
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider, data_source_from_record
@@ -1471,7 +1472,9 @@ def _v2_configuration(
     return EvaluationRuntimeConfiguration(
         max_chars=max_chars,
         nl2sql_max_tokens=settings.chatbi_nl2sql_max_tokens,
-        nl2sql_reasoning="disabled",
+        nl2sql_reasoning=NL2SQL_REASONING_MODE,
+        nl2sql_thinking_type="enabled",
+        nl2sql_reasoning_effort="low",
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,

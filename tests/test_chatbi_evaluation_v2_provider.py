@@ -96,7 +96,9 @@ def test_v2_provenance_records_explicit_nl2sql_reasoning_mode() -> None:
     )
 
     assert configuration.nl2sql_max_tokens == 1024
-    assert configuration.nl2sql_reasoning == "disabled"
+    assert configuration.nl2sql_reasoning == "low"
+    assert configuration.nl2sql_thinking_type == "enabled"
+    assert configuration.nl2sql_reasoning_effort == "low"
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(
