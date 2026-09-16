@@ -39,6 +39,52 @@ RESULT_CONTRACT_MAX_IDENTIFIER_LENGTH: Final = 512
 RESULT_CONTRACT_MAX_EXPRESSION_LENGTH: Final = 4_000
 
 
+def build_result_contract_prompt_example() -> dict[str, object]:
+    """Return the canonical structural example embedded in the NL2SQL prompt.
+
+    The schema/relation names are placeholders for structure only.  The
+    generation prompt separately requires model output to use only the
+    approved discovered schema.  Keeping this example next to the production
+    result-contract models lets parser tests detect prompt/schema drift.
+    """
+    return {
+        "result_contract": {
+            "contract_version": RESULT_CONTRACT_VERSION,
+            "row_grain": "grouped",
+            "grain_keys": ["public.example.category"],
+            "output_columns": [
+                {
+                    "kind": "source",
+                    "source": "public.example.category",
+                    "alias": "category",
+                },
+                {
+                    "kind": "aggregate",
+                    "function": "sum",
+                    "source": "public.example.amount",
+                    "alias": "total_amount",
+                },
+                {
+                    "kind": "derived",
+                    "expression": "amount * 1.0",
+                    "source_columns": ["public.example.amount"],
+                    "alias": "normalized_amount",
+                },
+            ],
+            "group_by": ["public.example.category"],
+            "order_by": [
+                {"key": "public.example.category", "direction": "asc"},
+                {"key": "total_amount", "direction": "desc"},
+            ],
+            "limit": None,
+        },
+        "sql": (
+            "SELECT category, SUM(amount) AS total_amount, amount * 1.0 AS normalized_amount "
+            "FROM public.example GROUP BY category ORDER BY category ASC, total_amount DESC"
+        ),
+    }
+
+
 class ResultGrain(StrEnum):
     """The small set of generic row-grain descriptions supported by v1."""
 
@@ -1120,6 +1166,7 @@ __all__ = [
     "ResultOrderByTerm",
     "ResultOutputColumn",
     "SortDirection",
+    "build_result_contract_prompt_example",
     "validate_result_contract",
     "validate_sql_result_contract",
 ]

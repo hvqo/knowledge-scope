@@ -71,10 +71,12 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
+    DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2,
     DEFAULT_PROVIDER_OUTPUT_V2,
     V2ProviderBenchmarkError,
     preflight_v2_provider_benchmark,
     run_v2_provider_benchmark,
+    run_v2_provider_diagnostic,
 )
 from knowledge_scope.evaluation.embedding_benchmark import (
     DEFAULT_CHUNK_INDEX,
@@ -358,6 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
     chatbi_eval_v2_provider.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_V2)
     chatbi_eval_v2_provider.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE_PATH_V2)
     chatbi_eval_v2_provider.add_argument("--output", type=Path, default=DEFAULT_PROVIDER_OUTPUT_V2)
+    chatbi_eval_v2_provider.add_argument(
+        "--diagnostic-case",
+        action="append",
+        dest="diagnostic_cases",
+        default=None,
+        help="run the fixed three-DEV structured-output diagnostic cases only",
+    )
     mcp = subparsers.add_parser(
         "mcp",
         help="run the local MCP server",
@@ -1668,13 +1677,27 @@ async def _run_chatbi_eval_v2_provider_async(
     settings: Settings,
 ) -> dict[str, object]:
     """Run the provider-free v2 preflight or the explicit DEV benchmark."""
+    diagnostic_cases = args.diagnostic_cases
+    diagnostic_output = args.output
+    if diagnostic_cases is not None and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
+        diagnostic_output = DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2
     if args.preflight:
         report = await preflight_v2_provider_benchmark(
             settings,
             split=args.split,
             dataset_path=args.dataset,
             fixture_path=args.fixture,
-            output_path=args.output,
+            output_path=diagnostic_output,
+            diagnostic_case_ids=diagnostic_cases,
+        )
+    elif diagnostic_cases is not None:
+        report = await run_v2_provider_diagnostic(
+            settings,
+            split=args.split,
+            case_ids=diagnostic_cases,
+            dataset_path=args.dataset,
+            fixture_path=args.fixture,
+            output_path=diagnostic_output,
         )
     else:
         report = await run_v2_provider_benchmark(

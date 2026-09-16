@@ -57,6 +57,7 @@ from .result_contract import (
     ResultOrderByTerm,
     ResultOutputColumn,
     SortDirection,
+    build_result_contract_prompt_example,
     validate_result_contract,
     validate_sql_result_contract,
 )
@@ -152,6 +153,7 @@ __all__ = [
     "build_chatbi_analysis_messages",
     "build_nl2sql_messages",
     "build_nl2sql_repair_messages",
+    "build_result_contract_prompt_example",
     "build_safe_search_path_statement",
     "build_semantic_schema_context",
     "create_postgres_schema_discovery_service",

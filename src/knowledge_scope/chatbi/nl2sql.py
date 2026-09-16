@@ -16,6 +16,8 @@ from knowledge_scope.llm.schemas import (
     LLMRequest,
     LLMResponseFormat,
     LLMResult,
+    StructuredOutputBoundaryDiagnostic,
+    StructuredOutputBoundaryObservation,
 )
 from knowledge_scope.shared.config import DEFAULT_CHATBI_NL2SQL_MAX_TOKENS
 
@@ -32,7 +34,11 @@ from .nl2sql_models import (
     _NL2SQLRequest,
 )
 from .policy import QueryPolicy
-from .result_contract import validate_result_contract, validate_sql_result_contract
+from .result_contract import (
+    build_result_contract_prompt_example,
+    validate_result_contract,
+    validate_sql_result_contract,
+)
 from .schema_models import (
     SchemaContextBudgetError,
     SchemaDiscoveryResult,
@@ -131,12 +137,16 @@ class NL2SQLGenerationError(ChatBIError):
         response_parse_outcome: Literal[
             "structured_output_parse_error", "structured_output_schema_error"
         ] = "structured_output_schema_error",
+        diagnostic: StructuredOutputBoundaryDiagnostic | None = None,
+        boundary_observation: StructuredOutputBoundaryObservation | None = None,
     ) -> None:
         super().__init__(category, message)
         self.usage = usage
         self.candidate_sql = candidate_sql
         self.result_contract = result_contract
         self.response_parse_outcome = response_parse_outcome
+        self.diagnostic = diagnostic
+        self.boundary_observation = boundary_observation
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -152,7 +162,130 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
-def _parse_generation_payload(text: str) -> SQLGenerationPayload:
+def _safe_json_key(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return "".join(
+        character if character.isprintable() and character not in {"\\", '"'} else "?"
+        for character in normalized[:64]
+    )
+
+
+def _safe_json_keys(value: object) -> tuple[str, ...]:
+    if not isinstance(value, dict):
+        return ()
+    keys = {_safe_json_key(key) for key in value}
+    return tuple(sorted(key for key in keys if key is not None))
+
+
+def _safe_validation_metadata(error: ValidationError) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    field_paths: set[str] = set()
+    error_codes: set[str] = set()
+    for item in error.errors(include_url=False):
+        location = item.get("loc", ())
+        if isinstance(location, tuple):
+            path_parts: list[str] = []
+            for part in location:
+                if isinstance(part, int):
+                    path_parts.append(str(part))
+                elif isinstance(part, str):
+                    safe_part = _safe_json_key(part)
+                    if safe_part is not None:
+                        path_parts.append(safe_part)
+            if path_parts:
+                field_paths.add(".".join(path_parts)[:128])
+        code = item.get("type")
+        if isinstance(code, str) and code:
+            normalized_code = "".join(
+                character if character.isalnum() or character == "_" else "_" for character in code
+            )
+            if normalized_code:
+                error_codes.add(normalized_code[:64])
+    return tuple(sorted(field_paths))[:16], tuple(sorted(error_codes))[:16]
+
+
+def _boundary_diagnostic(
+    *,
+    logical_stage: Literal["generation", "repair_generation"],
+    stage: str,
+    top_level_keys: tuple[str, ...] = (),
+    result_contract_keys: tuple[str, ...] = (),
+    sql_key_present: bool = False,
+    sql_is_string: bool = False,
+    sql_length: int | None = None,
+    field_paths: tuple[str, ...] = (),
+    error_codes: tuple[str, ...] = (),
+) -> StructuredOutputBoundaryDiagnostic:
+    return StructuredOutputBoundaryDiagnostic(
+        logical_stage=logical_stage,
+        stage=stage,
+        field_paths=field_paths,
+        error_codes=error_codes,
+        top_level_keys=top_level_keys,
+        result_contract_keys=result_contract_keys,
+        sql_key_present=sql_key_present,
+        sql_is_string=sql_is_string,
+        sql_length=sql_length,
+    )
+
+
+def _boundary_observation(
+    *,
+    logical_stage: Literal["generation", "repair_generation"],
+    json_decode_status: str = "not_attempted",
+    top_level_shape_status: str = "not_attempted",
+    top_level_keys: tuple[str, ...] = (),
+    result_contract_keys: tuple[str, ...] = (),
+    result_contract_schema_status: str = "not_attempted",
+    sql_key_present: bool = False,
+    sql_is_string: bool = False,
+    sql_length: int | None = None,
+    sql_field_status: str = "not_attempted",
+    semantic_contract_validation_status: str = "not_attempted",
+    sql_contract_consistency_status: str = "not_attempted",
+    a5_3_validation_status: str = "not_attempted",
+    diagnostic: StructuredOutputBoundaryDiagnostic | None = None,
+) -> StructuredOutputBoundaryObservation:
+    return StructuredOutputBoundaryObservation(
+        logical_stage=logical_stage,
+        json_decode_status=json_decode_status,
+        top_level_shape_status=top_level_shape_status,
+        top_level_keys=top_level_keys,
+        result_contract_keys=result_contract_keys,
+        result_contract_schema_status=result_contract_schema_status,
+        sql_key_present=sql_key_present,
+        sql_is_string=sql_is_string,
+        sql_length=sql_length,
+        sql_field_status=sql_field_status,
+        semantic_contract_validation_status=semantic_contract_validation_status,
+        sql_contract_consistency_status=sql_contract_consistency_status,
+        a5_3_validation_status=a5_3_validation_status,
+        diagnostic=diagnostic,
+    )
+
+
+def _parse_generation_payload_with_observation(
+    text: str,
+    *,
+    logical_stage: Literal["generation", "repair_generation"],
+) -> tuple[SQLGenerationPayload, StructuredOutputBoundaryObservation]:
+    empty_observation = _boundary_observation(logical_stage=logical_stage)
+    if not isinstance(text, str) or not text.strip():
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="provider_content_missing",
+        )
+        observation = empty_observation.model_copy(update={"diagnostic": diagnostic})
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_parse_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        )
     try:
         payload = json.loads(
             text,
@@ -160,34 +293,285 @@ def _parse_generation_payload(text: str) -> SQLGenerationPayload:
             parse_constant=_reject_json_constant,
         )
     except (TypeError, ValueError):
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="json_decode_failed",
+        )
+        observation = empty_observation.model_copy(
+            update={"json_decode_status": "failed", "diagnostic": diagnostic}
+        )
         raise StructuredOutputError(
             ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
             "LLM returned malformed NL2SQL output",
             output_category="structured_output_parse_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
         ) from None
-    try:
-        return SQLGenerationPayload.model_validate(payload)
-    except ValidationError:
+    top_level_keys = _safe_json_keys(payload)
+    shape_observation = empty_observation.model_copy(
+        update={
+            "json_decode_status": "passed",
+            "top_level_keys": top_level_keys,
+        }
+    )
+    if not isinstance(payload, dict):
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="top_level_shape_invalid",
+            top_level_keys=top_level_keys,
+        )
+        observation = shape_observation.model_copy(
+            update={"top_level_shape_status": "failed", "diagnostic": diagnostic}
+        )
         raise StructuredOutputError(
             ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
             "LLM returned malformed NL2SQL output",
             output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
         ) from None
+    shape_observation = shape_observation.model_copy(update={"top_level_shape_status": "passed"})
+    required = ("result_contract", "sql")
+    missing = tuple(name for name in required if name not in payload)
+    if missing:
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="required_top_level_field_missing",
+            top_level_keys=top_level_keys,
+            result_contract_keys=_safe_json_keys(payload.get("result_contract")),
+            sql_key_present="sql" in payload,
+            sql_is_string=isinstance(payload.get("sql"), str),
+            sql_length=len(payload["sql"]) if isinstance(payload.get("sql"), str) else None,
+            field_paths=missing,
+            error_codes=("missing",),
+        )
+        observation = shape_observation.model_copy(
+            update={
+                "result_contract_keys": diagnostic.result_contract_keys,
+                "sql_key_present": diagnostic.sql_key_present,
+                "sql_is_string": diagnostic.sql_is_string,
+                "sql_length": diagnostic.sql_length,
+                "diagnostic": diagnostic,
+            }
+        )
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    result_contract_keys = _safe_json_keys(payload["result_contract"])
+    sql_value = payload["sql"]
+    sql_is_string = isinstance(sql_value, str)
+    sql_length = len(sql_value) if sql_is_string else None
+    field_observation = shape_observation.model_copy(
+        update={
+            "result_contract_keys": result_contract_keys,
+            "sql_key_present": True,
+            "sql_is_string": sql_is_string,
+            "sql_length": sql_length,
+        }
+    )
+    extra_keys = tuple(sorted(set(payload) - set(required)))
+    if extra_keys:
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="top_level_schema_invalid",
+            top_level_keys=top_level_keys,
+            result_contract_keys=result_contract_keys,
+            sql_key_present=True,
+            sql_is_string=sql_is_string,
+            sql_length=sql_length,
+            field_paths=extra_keys,
+            error_codes=("extra_forbidden",),
+        )
+        observation = field_observation.model_copy(update={"diagnostic": diagnostic})
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    if not isinstance(payload["result_contract"], dict):
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="result_contract_schema_invalid",
+            top_level_keys=top_level_keys,
+            result_contract_keys=result_contract_keys,
+            sql_key_present=True,
+            sql_is_string=sql_is_string,
+            sql_length=sql_length,
+            field_paths=("result_contract",),
+            error_codes=("dict_type",),
+        )
+        observation = field_observation.model_copy(
+            update={
+                "result_contract_schema_status": "failed",
+                "diagnostic": diagnostic,
+            }
+        )
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    if not sql_is_string or not sql_value.strip() or sql_length is None or sql_length > 100_000:
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="sql_field_invalid",
+            top_level_keys=top_level_keys,
+            result_contract_keys=result_contract_keys,
+            sql_key_present=True,
+            sql_is_string=sql_is_string,
+            sql_length=sql_length,
+            field_paths=("sql",),
+            error_codes=("string_type" if not sql_is_string else "string_invalid",),
+        )
+        observation = field_observation.model_copy(
+            update={
+                "result_contract_schema_status": "not_attempted",
+                "sql_field_status": "failed",
+                "diagnostic": diagnostic,
+            }
+        )
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    try:
+        ResultContract.model_validate(payload["result_contract"])
+    except ValidationError as error:
+        field_paths, error_codes = _safe_validation_metadata(error)
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="result_contract_schema_invalid",
+            top_level_keys=top_level_keys,
+            result_contract_keys=result_contract_keys,
+            sql_key_present=True,
+            sql_is_string=True,
+            sql_length=sql_length,
+            field_paths=field_paths,
+            error_codes=error_codes,
+        )
+        observation = field_observation.model_copy(
+            update={
+                "result_contract_schema_status": "failed",
+                "sql_field_status": "passed",
+                "diagnostic": diagnostic,
+            }
+        )
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    try:
+        parsed = SQLGenerationPayload.model_validate(payload)
+    except ValidationError as error:
+        field_paths, error_codes = _safe_validation_metadata(error)
+        diagnostic = _boundary_diagnostic(
+            logical_stage=logical_stage,
+            stage="sql_field_invalid",
+            top_level_keys=top_level_keys,
+            result_contract_keys=result_contract_keys,
+            sql_key_present=True,
+            sql_is_string=True,
+            sql_length=sql_length,
+            field_paths=field_paths or ("sql",),
+            error_codes=error_codes or ("invalid",),
+        )
+        observation = field_observation.model_copy(
+            update={
+                "result_contract_schema_status": "passed",
+                "sql_field_status": "failed",
+                "diagnostic": diagnostic,
+            }
+        )
+        raise StructuredOutputError(
+            ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT,
+            "LLM returned malformed NL2SQL output",
+            output_category="structured_output_schema_error",
+            diagnostic=diagnostic,
+            boundary_observation=observation,
+        ) from None
+    return parsed, field_observation.model_copy(
+        update={
+            "result_contract_schema_status": "passed",
+            "sql_field_status": "passed",
+        }
+    )
+
+
+def _parse_generation_payload(text: str) -> SQLGenerationPayload:
+    payload, _observation = _parse_generation_payload_with_observation(
+        text,
+        logical_stage="generation",
+    )
+    return payload
+
+
+def _with_boundary_failure(
+    observation: StructuredOutputBoundaryObservation,
+    *,
+    stage: str,
+    field_paths: tuple[str, ...],
+    error_codes: tuple[str, ...],
+) -> StructuredOutputBoundaryObservation:
+    diagnostic = _boundary_diagnostic(
+        logical_stage=observation.logical_stage,
+        stage=stage,
+        top_level_keys=observation.top_level_keys,
+        result_contract_keys=observation.result_contract_keys,
+        sql_key_present=observation.sql_key_present,
+        sql_is_string=observation.sql_is_string,
+        sql_length=observation.sql_length,
+        field_paths=field_paths,
+        error_codes=error_codes,
+    )
+    return observation.model_copy(update={"diagnostic": diagnostic})
 
 
 def build_nl2sql_messages(request: _NL2SQLRequest) -> list[LLMMessage]:
     """Build a versioned prompt using structural, comment-free schema JSON."""
+    contract_example = json.dumps(
+        build_result_contract_prompt_example(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     system = (
         f"KnowledgeScope NL2SQL contract {NL2SQL_PROMPT_VERSION}.\n"
         "Generate one bounded, read-only PostgreSQL query and its semantic result contract "
         "from the approved schema JSON. Use only discovered tables and columns.\n"
-        "The result contract must state the intended row_grain (scalar, detail, or grouped), "
-        "stable grain_keys, the exact ordered output_columns, structural group_by and order_by "
-        "terms, and an explicit limit only when the question requires one. Grain keys describe "
-        "identity and need not be selected, but grouped contracts must retain them in group_by.\n"
-        "Use output_columns with kind source, aggregate, or derived. Source references are "
-        "schema.relation.column; aggregate uses count/sum/avg/min/max; derived includes its "
-        "expression and source_columns. Never use SELECT * or add unrequested columns.\n"
+        "Use exactly the result-contract field names and shapes shown in the structural example; "
+        "do not use synonyms such as name, reference, term, sort, or column.\n"
+        "The result_contract must state the intended row_grain (scalar, detail, or grouped), "
+        "stable grain_keys, and the exact ordered output_columns. It must contain "
+        'contract_version="1.0", group_by, order_by, and limit as well. Emit grain_keys, '
+        "group_by, and order_by as arrays; use [] when empty. output_columns must be non-empty. "
+        "Use limit as an integer when required and explicit null otherwise.\n"
+        "Source output-column objects have exactly kind=source and source, plus optional alias. "
+        "Aggregate objects have kind=aggregate and function=count|sum|avg|min|max, plus optional "
+        "source and alias; only count may omit source. Derived objects have kind=derived, "
+        "expression, source_columns, and optional alias.\n"
+        "Each order_by entry has exactly key and direction=asc|desc; use one entry per "
+        "ordering term and [] when there is no ordering. Grain keys need not be selected, but "
+        "grouped contracts must retain them in group_by. Never use SELECT * or add unrequested "
+        "columns.\n"
+        "Exact structural example below uses placeholder schema names; use only approved values "
+        "from the schema context in the actual response.\n"
+        "<result_contract_example_json>\n"
+        f"{contract_example}\n"
+        "</result_contract_example_json>\n"
         'Return exactly {"result_contract":{...},"sql":"..."}. Do not return explanations, '
         "confidence, safety claims, markdown, chain-of-thought, or extra fields. If the schema "
         "cannot answer the question safely, return no invented objects."
@@ -356,8 +740,17 @@ class NL2SQLService:
                 "LLM returned an invalid normalized result",
             )
         usage = LLMUsageMetadata.from_result(result)
+        logical_stage: Literal["generation", "repair_generation"] = (
+            "repair_generation" if repair_context is not None else "generation"
+        )
         try:
-            payload = _parse_generation_payload(result.text)
+            payload, boundary_observation = _parse_generation_payload_with_observation(
+                result.text,
+                logical_stage=logical_stage,
+            )
+            result = result.model_copy(
+                update={"structured_output_observation": boundary_observation}
+            )
             candidate = SQLCandidate(
                 datasource_id=request.datasource_id,
                 dialect=request.dialect,
@@ -376,6 +769,32 @@ class NL2SQLService:
                     semantic_context=request.semantic_context,
                     policy=request.policy,
                 )
+            except ChatBIError as error:
+                boundary_observation = boundary_observation.model_copy(
+                    update={
+                        "semantic_contract_validation_status": "failed",
+                        "diagnostic": _with_boundary_failure(
+                            boundary_observation,
+                            stage="result_contract_semantic_validation_failed",
+                            field_paths=("result_contract",),
+                            error_codes=(error.category.value,),
+                        ).diagnostic,
+                    }
+                )
+                result = result.model_copy(
+                    update={"structured_output_observation": boundary_observation}
+                )
+                raise NL2SQLGenerationError(
+                    error.category,
+                    error.safe_message,
+                    usage=usage,
+                    candidate_sql=payload.sql,
+                    result_contract=payload.result_contract,
+                    response_parse_outcome="structured_output_schema_error",
+                    diagnostic=boundary_observation.diagnostic,
+                    boundary_observation=boundary_observation,
+                ) from None
+            try:
                 validate_sql_result_contract(
                     payload.sql,
                     contract,
@@ -384,6 +803,21 @@ class NL2SQLService:
                     policy=request.policy,
                 )
             except ChatBIError as error:
+                boundary_observation = boundary_observation.model_copy(
+                    update={
+                        "semantic_contract_validation_status": "passed",
+                        "sql_contract_consistency_status": "failed",
+                        "diagnostic": _with_boundary_failure(
+                            boundary_observation,
+                            stage="sql_contract_consistency_failed",
+                            field_paths=("sql", "result_contract"),
+                            error_codes=(error.category.value,),
+                        ).diagnostic,
+                    }
+                )
+                result = result.model_copy(
+                    update={"structured_output_observation": boundary_observation}
+                )
                 raise NL2SQLGenerationError(
                     error.category,
                     error.safe_message,
@@ -391,8 +825,19 @@ class NL2SQLService:
                     candidate_sql=payload.sql,
                     result_contract=payload.result_contract,
                     response_parse_outcome="structured_output_schema_error",
+                    diagnostic=boundary_observation.diagnostic,
+                    boundary_observation=boundary_observation,
                 ) from None
             candidate = candidate.model_copy(update={"result_contract": contract})
+            boundary_observation = boundary_observation.model_copy(
+                update={
+                    "semantic_contract_validation_status": "passed",
+                    "sql_contract_consistency_status": "passed",
+                }
+            )
+            result = result.model_copy(
+                update={"structured_output_observation": boundary_observation}
+            )
             return candidate, result
         except StructuredOutputError as error:
             raise NL2SQLGenerationError(
@@ -400,6 +845,8 @@ class NL2SQLService:
                 error.safe_message,
                 usage=usage,
                 response_parse_outcome=error.output_category,
+                diagnostic=error.diagnostic,
+                boundary_observation=error.boundary_observation,
             ) from None
         except ChatBIError as error:
             if isinstance(error, NL2SQLGenerationError):

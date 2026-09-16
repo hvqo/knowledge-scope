@@ -24,8 +24,14 @@ from knowledge_scope.chatbi import (
     SQLGenerationPayload,
     build_nl2sql_messages,
     build_nl2sql_repair_messages,
+    build_result_contract_prompt_example,
     build_semantic_schema_context,
     policy_fingerprint,
+)
+from knowledge_scope.chatbi.errors import StructuredOutputError
+from knowledge_scope.chatbi.nl2sql import (
+    NL2SQLGenerationError,
+    _parse_generation_payload_with_observation,
 )
 from knowledge_scope.chatbi.nl2sql_models import ValidatedSQL, _NL2SQLRequest
 from knowledge_scope.chatbi.sql_validation import _SQLSafetyValidator, _validate_sql_candidate
@@ -128,6 +134,63 @@ def _generation_payload(sql: str, *, expression: str = "1") -> str:
     return json.dumps({"result_contract": contract, "sql": sql}, ensure_ascii=False)
 
 
+def _structured_payload(contract: dict[str, object], sql: object) -> str:
+    return json.dumps(
+        {"result_contract": contract, "sql": sql},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _scalar_contract() -> dict[str, object]:
+    return {
+        "row_grain": "scalar",
+        "grain_keys": [],
+        "output_columns": [
+            {
+                "kind": "aggregate",
+                "function": "sum",
+                "source": "public.sales.amount",
+                "alias": "total",
+            }
+        ],
+        "group_by": [],
+        "order_by": [],
+        "limit": None,
+    }
+
+
+def _detail_contract() -> dict[str, object]:
+    return {
+        "row_grain": "detail",
+        "grain_keys": ["public.sales.id"],
+        "output_columns": [{"kind": "source", "source": "public.sales.amount"}],
+        "group_by": [],
+        "order_by": [],
+        "limit": None,
+    }
+
+
+def _grouped_contract() -> dict[str, object]:
+    return {
+        "row_grain": "grouped",
+        "grain_keys": ["public.customers.id"],
+        "output_columns": [
+            {"kind": "source", "source": "public.customers.name"},
+            {
+                "kind": "aggregate",
+                "function": "sum",
+                "source": "public.sales.amount",
+                "alias": "total",
+            },
+        ],
+        "group_by": ["public.customers.id", "public.customers.name"],
+        "order_by": [{"key": "public.customers.name", "direction": "asc"}],
+        "limit": None,
+    }
+
+
 def _data_source() -> DataSource:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     return DataSource(
@@ -185,6 +248,7 @@ async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens(
     with pytest.raises(ChatBIError) as error:
         await service._generate_with_result(request)
     assert error.value.category is ChatBIErrorCategory.MALFORMED_MODEL_OUTPUT
+    assert error.value.boundary_observation.logical_stage == "generation"
 
     candidate, _result = await service._generate_with_result(
         request,
@@ -195,6 +259,160 @@ async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens(
     assert [item.max_tokens for item in gateway.requests] == [1024, 1024]
     assert [item.reasoning for item in gateway.requests] == ["disabled", "disabled"]
     assert gateway.requests[0].messages[0] == gateway.requests[1].messages[0]
+    assert _result.structured_output_observation.logical_stage == "repair_generation"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "contract", "sql"),
+    (
+        ("scalar", _scalar_contract(), "SELECT SUM(amount) FROM public.sales"),
+        ("detail", _detail_contract(), "SELECT amount FROM public.sales"),
+        (
+            "grouped",
+            _grouped_contract(),
+            "SELECT c.name, SUM(s.amount) AS total FROM public.sales AS s "
+            "JOIN public.customers AS c ON s.customer_id = c.id "
+            "GROUP BY c.id, c.name ORDER BY c.name",
+        ),
+    ),
+)
+async def test_structured_output_boundary_accepts_supported_contracts(
+    name: str,
+    contract: dict[str, object],
+    sql: str,
+) -> None:
+    gateway = _FakeGateway(_structured_payload(contract, sql))
+
+    candidate, result = await NL2SQLService(gateway)._generate_with_result(_request())
+
+    assert candidate.sql == sql, name
+    assert result.structured_output_observation is not None
+    observation = result.structured_output_observation
+    assert observation.json_decode_status == "passed"
+    assert observation.top_level_shape_status == "passed"
+    assert observation.result_contract_schema_status == "passed"
+    assert observation.sql_field_status == "passed"
+    assert observation.semantic_contract_validation_status == "passed"
+    assert observation.sql_contract_consistency_status == "passed"
+    assert observation.diagnostic is None
+
+
+def test_prompt_structural_example_matches_production_parser() -> None:
+    example = build_result_contract_prompt_example()
+    encoded_example = json.dumps(
+        example,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    prompt = build_nl2sql_messages(_request())[0].content
+
+    assert encoded_example in prompt
+    payload, observation = _parse_generation_payload_with_observation(
+        encoded_example,
+        logical_stage="generation",
+    )
+    assert [column.kind.value for column in payload.result_contract.output_columns] == [
+        "source",
+        "aggregate",
+        "derived",
+    ]
+    assert [term.direction.value for term in payload.result_contract.order_by] == ["asc", "desc"]
+    assert payload.result_contract.contract_version == "1.0"
+    assert payload.result_contract.limit is None
+    assert observation.result_contract_schema_status == "passed"
+    assert observation.sql_field_status == "passed"
+
+
+@pytest.mark.parametrize(
+    ("text", "stage"),
+    (
+        ("", "provider_content_missing"),
+        ("not json", "json_decode_failed"),
+        ("[]", "top_level_shape_invalid"),
+        (json.dumps({"sql": "SELECT 1"}), "required_top_level_field_missing"),
+        (
+            _structured_payload({"row_grain": "scalar"}, "SELECT 1"),
+            "result_contract_schema_invalid",
+        ),
+        (
+            _structured_payload(_scalar_contract(), 1),
+            "sql_field_invalid",
+        ),
+        (
+            _structured_payload(
+                {
+                    **_scalar_contract(),
+                    "\n<instruction-like-key>": "ignored by schema",
+                },
+                "SELECT SUM(amount) FROM public.sales",
+            ),
+            "result_contract_schema_invalid",
+        ),
+    ),
+)
+def test_structured_output_boundary_reports_safe_parse_diagnostics(
+    text: str,
+    stage: str,
+) -> None:
+    with pytest.raises(StructuredOutputError) as error:
+        _parse_generation_payload_with_observation(text, logical_stage="generation")
+
+    diagnostic = error.value.diagnostic
+    observation = error.value.boundary_observation
+    assert diagnostic is not None
+    assert observation is not None
+    assert diagnostic.stage == stage
+    assert observation.diagnostic == diagnostic
+    assert "ignored by schema" not in observation.model_dump_json()
+    assert "SELECT" not in observation.model_dump_json()
+
+
+def test_structured_output_boundary_sanitizes_hostile_field_paths() -> None:
+    text = _structured_payload(
+        {
+            **_scalar_contract(),
+            "<instruction\nlike-key>": "ignored by schema",
+        },
+        "SELECT SUM(amount) FROM public.sales",
+    )
+
+    with pytest.raises(StructuredOutputError) as error:
+        _parse_generation_payload_with_observation(text, logical_stage="generation")
+
+    observation = error.value.boundary_observation
+    assert observation is not None
+    serialized = observation.model_dump_json()
+    assert "<instruction\nlike-key>" not in serialized
+    assert "<instruction?like-key>" in serialized
+    assert "ignored by schema" not in serialized
+    assert "SELECT" not in serialized
+
+
+@pytest.mark.anyio
+async def test_structured_output_boundary_separates_semantic_and_consistency_failures() -> None:
+    semantic_contract = {
+        **_detail_contract(),
+        "output_columns": [{"kind": "source", "source": "public.missing.value"}],
+    }
+    with pytest.raises(NL2SQLGenerationError) as semantic_error:
+        await NL2SQLService(
+            _FakeGateway(_structured_payload(semantic_contract, "SELECT amount FROM public.sales"))
+        )._generate_with_result(_request())
+    assert semantic_error.value.diagnostic.stage == "result_contract_semantic_validation_failed"
+    assert semantic_error.value.boundary_observation.semantic_contract_validation_status == (
+        "failed"
+    )
+
+    with pytest.raises(NL2SQLGenerationError) as consistency_error:
+        await NL2SQLService(
+            _FakeGateway(_structured_payload(_detail_contract(), "SELECT id FROM public.sales"))
+        )._generate_with_result(_request())
+    assert consistency_error.value.diagnostic.stage == "sql_contract_consistency_failed"
+    assert consistency_error.value.boundary_observation.sql_contract_consistency_status == (
+        "failed"
+    )
 
 
 def test_nl2sql_models_are_strict_and_request_context_is_bound() -> None:

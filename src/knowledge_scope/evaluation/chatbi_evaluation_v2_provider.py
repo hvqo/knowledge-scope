@@ -98,7 +98,10 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
 )
 from knowledge_scope.llm import LLMGateway, create_llm_provider
 from knowledge_scope.llm.observability import provider_observation_context
-from knowledge_scope.llm.schemas import LLMProviderInvocation
+from knowledge_scope.llm.schemas import (
+    LLMProviderInvocation,
+    StructuredOutputBoundaryObservation,
+)
 from knowledge_scope.llm.usage import (
     CompositeProviderInvocationRecorder,
     DatabaseUsageRecorder,
@@ -110,6 +113,8 @@ from knowledge_scope.shared.database import create_database_engine, create_sessi
 
 CHATBI_EVALUATION_V2_PROVIDER_VERSION = "a5.7b"
 CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION = "a5.7b-provider-run-v1"
+CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION = "a5.7e2a"
+CHATBI_EVALUATION_V2_DIAGNOSTIC_SCHEMA_VERSION = "a5.7e2a-provider-diagnostic-v1"
 CHATBI_EVALUATION_V2_DATASOURCE_ID = uuid5(
     NAMESPACE_URL, "https://knowledgescope.local/evaluation/chatbi-demo-v2"
 )
@@ -120,6 +125,9 @@ CHATBI_EVALUATION_V2_CREDENTIAL_ENV = "KNOWLEDGE_SCOPE_CHATBI_EVALUATION_V2_DATA
 CHATBI_EVALUATION_V2_CONNECTION_REF = f"env:{CHATBI_EVALUATION_V2_CREDENTIAL_ENV}"
 CHATBI_EVALUATION_V2_SCHEMA = "chatbi_demo"
 DEFAULT_PROVIDER_OUTPUT_V2 = Path("data/evaluation/a5-7/provider/chatbi-eval-v2-dev.json")
+DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2 = Path(
+    "data/evaluation/a5-7/provider/chatbi-eval-v2-structured-output-diagnostic.json"
+)
 EXPECTED_DATASET_FINGERPRINT_V2 = "60c75c597da8fc71a0fa5b25d335b63410b44a4ab3a403da40ca72c5ae375ab3"
 EXPECTED_FIXTURE_FINGERPRINT_V2 = "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d"
 EXPECTED_FIXTURE_DATA_FINGERPRINT_V2 = (
@@ -197,10 +205,139 @@ class V2ProviderCaseRecord(_EvaluationModel):
     latency: ChatBIStageTimings
     usage: ChatBIUsageSummary
     provider_invocations: list[LLMProviderInvocation] = Field(default_factory=list)
+    structured_output_observations: list[StructuredOutputBoundaryObservation] = Field(
+        default_factory=list
+    )
     analysis_parse_outcome: StrictStr | None = Field(default=None, max_length=48)
     analysis_token_limit_status: StrictStr | None = Field(default=None, max_length=16)
     redacted_sql: StrictStr | None = Field(default=None, max_length=100_000)
     trace_events: list[StrictStr] = Field(default_factory=list)
+
+
+class V2ProviderDiagnosticCaseRecord(_EvaluationModel):
+    """Safe Layer 0 observations for one explicitly selected DEV control case."""
+
+    case_id: StrictStr
+    split: Literal["dev"] = "dev"
+    positive: StrictBool
+    category: ChatBIEvaluationV2Category
+    difficulty: ChatBIEvaluationV2Difficulty
+    initial_observation: StructuredOutputBoundaryObservation | None = None
+    repair_observation: StructuredOutputBoundaryObservation | None = None
+    initial_generation_parseable: StrictBool
+    repair_attempted: StrictBool
+    repair_generation_parseable: StrictBool | None = None
+    eventual_sql_candidate_available: StrictBool
+    validation_accepted: StrictBool
+    sql_contract_consistency_reached: StrictBool
+    a5_3_validation_reached: StrictBool
+    result_status: QueryLifecycleState
+    failure_category: ChatBIEvaluationFailureCategory | None = None
+    latency: ChatBIStageTimings
+    usage: ChatBIUsageSummary
+    provider_invocations: list[LLMProviderInvocation] = Field(default_factory=list)
+    trace_events: list[StrictStr] = Field(default_factory=list)
+
+
+class V2ProviderDiagnosticAggregate(_EvaluationModel):
+    """Bounded structural counts for the three-case provider diagnostic."""
+
+    case_count: StrictInt = Field(ge=0)
+    provider_invocation_count: StrictInt = Field(ge=0)
+    initial_parseable_count: StrictInt = Field(ge=0)
+    initial_json_decode_failure_count: StrictInt = Field(ge=0)
+    result_contract_schema_failure_count: StrictInt = Field(ge=0)
+    semantic_contract_failure_count: StrictInt = Field(ge=0)
+    sql_contract_consistency_failure_count: StrictInt = Field(ge=0)
+    a5_3_validation_reached_count: StrictInt = Field(ge=0)
+    repair_attempt_count: StrictInt = Field(ge=0)
+    repair_parseable_count: StrictInt = Field(ge=0)
+    diagnostic_stage_counts: dict[str, StrictInt] = Field(default_factory=dict)
+
+
+class V2ProviderDiagnosticProvenance(_EvaluationModel):
+    """Reproducibility metadata for a small provider diagnostic, without secrets."""
+
+    benchmark_version: Literal["a5.7e2a"] = CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION
+    benchmark_mode: Literal["provider_diagnostic"] = "provider_diagnostic"
+    dataset_version: Literal["a5.7-v2"] = CHATBI_EVALUATION_V2_DATASET_VERSION
+    dataset_status: Literal["human_reviewed_frozen"] = CHATBI_EVALUATION_V2_STATUS
+    dataset_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_version: Literal["chatbi-demo-v2"] = CHATBI_DEMO_FIXTURE_VERSION_V2
+    fixture_path: StrictStr = Field(min_length=1, max_length=500)
+    fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_data_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    datasource_id: UUID
+    datasource_identity: Literal["chatbi-demo-v2-authoritative"] = (
+        CHATBI_EVALUATION_V2_DATASOURCE_IDENTITY
+    )
+    split: Literal["dev"] = "dev"
+    case_ids: list[StrictStr] = Field(min_length=3, max_length=3)
+    git_revision: StrictStr = Field(pattern=r"^[0-9a-f]{40}$")
+    git_dirty: StrictBool
+    provider: StrictStr = Field(min_length=1, max_length=64)
+    model: StrictStr = Field(min_length=1, max_length=255)
+    temperature: float = Field(ge=0, le=2)
+    response_format: Literal["json_object"]
+    configuration: EvaluationRuntimeConfiguration
+    started_at: datetime
+    completed_at: datetime
+
+    @field_validator("fixture_path")
+    @classmethod
+    def require_relative_fixture_path(cls, value: str) -> str:
+        if Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
+            raise ValueError("provider fixture path must be repository-relative")
+        return value
+
+
+class V2ProviderDiagnosticRun(_EvaluationModel):
+    """Repository-safe artifact for exactly the three selected DEV controls."""
+
+    run_id: UUID
+    artifact_schema_version: Literal["a5.7e2a-provider-diagnostic-v1"] = (
+        CHATBI_EVALUATION_V2_DIAGNOSTIC_SCHEMA_VERSION
+    )
+    started_at: datetime
+    completed_at: datetime
+    benchmark_version: Literal["a5.7e2a"] = CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION
+    mode: Literal["provider_diagnostic"] = "provider_diagnostic"
+    split: Literal["dev"] = "dev"
+    dataset_version: Literal["a5.7-v2"] = CHATBI_EVALUATION_V2_DATASET_VERSION
+    dataset_status: Literal["human_reviewed_frozen"] = CHATBI_EVALUATION_V2_STATUS
+    dataset_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    datasource_id: UUID
+    case_count: Literal[3] = 3
+    records: list[V2ProviderDiagnosticCaseRecord] = Field(min_length=3, max_length=3)
+    aggregates: V2ProviderDiagnosticAggregate
+    provenance: V2ProviderDiagnosticProvenance
+    quality_claim: Literal["diagnostic_only"] = "diagnostic_only"
+
+    @model_validator(mode="after")
+    def validate_diagnostic_contract(self) -> V2ProviderDiagnosticRun:
+        if self.case_count != len(self.records) or len(self.records) != 3:
+            raise ValueError("structured-output diagnostic artifacts require exactly 3 cases")
+        record_ids = [record.case_id for record in self.records]
+        if len(set(record_ids)) != 3 or set(record_ids) != set(self.provenance.case_ids):
+            raise ValueError("diagnostic records and provenance case IDs must match")
+        if self.datasource_id != self.provenance.datasource_id:
+            raise ValueError("diagnostic datasource identities must match")
+        if self.dataset_fingerprint != self.provenance.dataset_fingerprint:
+            raise ValueError("diagnostic dataset fingerprints must match")
+        if self.fixture_fingerprint != self.provenance.fixture_sha256:
+            raise ValueError("diagnostic fixture fingerprints must match")
+        if self.fixture_schema_fingerprint != self.provenance.fixture_schema_fingerprint:
+            raise ValueError("diagnostic schema fingerprints must match")
+        if self.aggregates.case_count != self.case_count:
+            raise ValueError("diagnostic aggregate case count must match")
+        if self.aggregates.provider_invocation_count != sum(
+            len(record.provider_invocations) for record in self.records
+        ):
+            raise ValueError("diagnostic aggregate invocation count must match")
+        return self
 
 
 class V2ProviderAggregate(_EvaluationModel):
@@ -526,6 +663,40 @@ def select_v2_provider_cases(
     return selected
 
 
+_STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS: tuple[str, ...] = (
+    "aggregation-01",
+    "join-02",
+    "group-by-02",
+)
+
+
+def select_v2_provider_diagnostic_cases(
+    dataset: ChatBIEvaluationDatasetV2,
+    split: str,
+    case_ids: Sequence[str] = _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS,
+) -> list[ChatBIEvaluationCaseV2]:
+    """Select only the three frozen DEV controls used by A5.7e2a."""
+    if split != V2ProviderSplit.DEV.value:
+        raise V2ProviderBenchmarkError("structured-output diagnostics permit only --split dev")
+    supplied_ids = tuple(case_ids)
+    if len(supplied_ids) != len(set(supplied_ids)) or set(supplied_ids) != set(
+        _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS
+    ):
+        raise V2ProviderBenchmarkError(
+            "structured-output diagnostics require aggregation-01, join-02, and group-by-02"
+        )
+    cases_by_id = {case.case_id: case for case in dataset.cases}
+    try:
+        selected = [cases_by_id[case_id] for case_id in _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS]
+    except KeyError as error:
+        raise V2ProviderBenchmarkError(
+            "structured-output diagnostic case is missing from the frozen dataset"
+        ) from error
+    if any(case.split != V2ProviderSplit.DEV.value for case in selected):
+        raise V2ProviderBenchmarkError("structured-output diagnostic cases must be on DEV")
+    return selected
+
+
 def _validate_frozen_dev_cases(
     cases: Sequence[ChatBIEvaluationCaseV2],
 ) -> tuple[ChatBIEvaluationCaseV2, ...]:
@@ -549,6 +720,31 @@ def _validate_frozen_dev_cases(
     if any(case != expected_cases[case.case_id] for case in cases):
         raise V2ProviderBenchmarkError("v2 provider cases do not match the frozen DEV dataset")
     return tuple(cases)
+
+
+def _validate_frozen_diagnostic_cases(
+    cases: Sequence[ChatBIEvaluationCaseV2],
+) -> tuple[ChatBIEvaluationCaseV2, ...]:
+    """Validate the exact three frozen DEV controls before provider calls."""
+    try:
+        dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+    except ChatBIEvaluationError as error:
+        raise V2ProviderBenchmarkError("the frozen v2 provider dataset is unavailable") from error
+    if dataset.fingerprint != EXPECTED_DATASET_FINGERPRINT_V2:
+        raise V2ProviderBenchmarkError("the frozen v2 provider dataset identity does not match")
+    expected = {
+        case.case_id: case
+        for case in select_v2_provider_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+        )
+    }
+    supplied_ids = [case.case_id for case in cases]
+    if len(supplied_ids) != len(set(supplied_ids)) or set(supplied_ids) != set(expected):
+        raise V2ProviderBenchmarkError("diagnostic cases must be the exact three frozen controls")
+    if any(case != expected[case.case_id] for case in cases):
+        raise V2ProviderBenchmarkError("diagnostic cases do not match the frozen dataset")
+    return tuple(expected[case_id] for case_id in _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS)
 
 
 def _verify_v2_dataset_and_fixture(
@@ -1248,6 +1444,7 @@ async def _prepare_v2_preflight(
     dataset_path: Path,
     fixture_path: Path,
     output_path: Path | None,
+    diagnostic_case_ids: Sequence[str] | None = None,
 ) -> _V2PreflightContext:
     # Capture the repository state before any validation/bootstrap step can
     # create directories or other local artifacts.
@@ -1256,7 +1453,11 @@ async def _prepare_v2_preflight(
         raise V2ProviderBenchmarkError("could not determine the current Git revision")
     dirty = current_git_dirty()
     dataset, fixture_fingerprint = _verify_v2_dataset_and_fixture(dataset_path, fixture_path)
-    selected = tuple(select_v2_provider_cases(dataset, split))
+    selected = tuple(
+        select_v2_provider_diagnostic_cases(dataset, split, diagnostic_case_ids)
+        if diagnostic_case_ids is not None
+        else select_v2_provider_cases(dataset, split)
+    )
     _check_provider_configuration(settings)
     bootstrap = await ensure_authoritative_v2_datasource(settings, fixture_path=fixture_path)
     app_engine = create_database_engine(settings)
@@ -1299,6 +1500,7 @@ async def preflight_v2_provider_benchmark(
     dataset_path: Path = DEFAULT_DATASET_V2,
     fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
     output_path: Path | None = None,
+    diagnostic_case_ids: Sequence[str] | None = None,
 ) -> V2ProviderPreflightReport:
     """Run all provider-free gates and make zero provider calls."""
     environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
@@ -1309,6 +1511,7 @@ async def preflight_v2_provider_benchmark(
             dataset_path=dataset_path,
             fixture_path=fixture_path,
             output_path=output_path,
+            diagnostic_case_ids=diagnostic_case_ids,
         )
         return V2ProviderPreflightReport(
             dataset_fingerprint=context.dataset.fingerprint,
@@ -1439,10 +1642,121 @@ def _v2_record(
         latency=observation.timings,
         usage=result.usage,
         provider_invocations=observation.provider_invocations,
+        structured_output_observations=result.structured_output_observations,
         analysis_parse_outcome=result.analysis_parse_outcome,
         analysis_token_limit_status=analysis_token_limit_status,
         redacted_sql=result.redacted_sql,
         trace_events=[event.event for event in result.trace],
+    )
+
+
+def _boundary_parseable(
+    observation: StructuredOutputBoundaryObservation | None,
+) -> bool:
+    return observation is not None and all(
+        status == "passed"
+        for status in (
+            observation.json_decode_status,
+            observation.top_level_shape_status,
+            observation.result_contract_schema_status,
+            observation.sql_field_status,
+        )
+    )
+
+
+def _diagnostic_case_record(record: V2ProviderCaseRecord) -> V2ProviderDiagnosticCaseRecord:
+    observations = record.structured_output_observations
+    initial_observation = next(
+        (observation for observation in observations if observation.logical_stage == "generation"),
+        None,
+    )
+    repair_observation = next(
+        (
+            observation
+            for observation in observations
+            if observation.logical_stage == "repair_generation"
+        ),
+        None,
+    )
+    return V2ProviderDiagnosticCaseRecord(
+        case_id=record.case_id,
+        positive=record.positive,
+        category=record.category,
+        difficulty=record.difficulty,
+        initial_observation=initial_observation,
+        repair_observation=repair_observation,
+        initial_generation_parseable=_boundary_parseable(initial_observation),
+        repair_attempted=record.repair_attempted,
+        repair_generation_parseable=(
+            _boundary_parseable(repair_observation) if repair_observation is not None else None
+        ),
+        eventual_sql_candidate_available=record.eventual_sql_candidate_available,
+        validation_accepted=record.validation_accepted,
+        sql_contract_consistency_reached=(
+            initial_observation is not None
+            and initial_observation.sql_contract_consistency_status != "not_attempted"
+        )
+        or (
+            repair_observation is not None
+            and repair_observation.sql_contract_consistency_status != "not_attempted"
+        ),
+        a5_3_validation_reached=any(
+            observation.a5_3_validation_status != "not_attempted" for observation in observations
+        ),
+        result_status=record.result_status,
+        failure_category=record.failure_category,
+        latency=record.latency,
+        usage=record.usage,
+        provider_invocations=record.provider_invocations,
+        trace_events=record.trace_events,
+    )
+
+
+def _build_v2_diagnostic_aggregate(
+    records: Sequence[V2ProviderDiagnosticCaseRecord],
+) -> V2ProviderDiagnosticAggregate:
+    observations = [
+        observation
+        for record in records
+        for observation in (record.initial_observation, record.repair_observation)
+        if observation is not None
+    ]
+    diagnostic_stage_counts = Counter(
+        observation.diagnostic.stage
+        for observation in observations
+        if observation.diagnostic is not None
+    )
+    return V2ProviderDiagnosticAggregate(
+        case_count=len(records),
+        provider_invocation_count=sum(len(record.provider_invocations) for record in records),
+        initial_parseable_count=sum(record.initial_generation_parseable for record in records),
+        initial_json_decode_failure_count=sum(
+            observation.diagnostic is not None
+            and observation.diagnostic.stage == "json_decode_failed"
+            and observation.logical_stage == "generation"
+            for observation in observations
+        ),
+        result_contract_schema_failure_count=sum(
+            observation.diagnostic is not None
+            and observation.diagnostic.stage == "result_contract_schema_invalid"
+            for observation in observations
+        ),
+        semantic_contract_failure_count=sum(
+            observation.diagnostic is not None
+            and observation.diagnostic.stage == "result_contract_semantic_validation_failed"
+            for observation in observations
+        ),
+        sql_contract_consistency_failure_count=sum(
+            observation.diagnostic is not None
+            and observation.diagnostic.stage == "sql_contract_consistency_failed"
+            for observation in observations
+        ),
+        a5_3_validation_reached_count=sum(record.a5_3_validation_reached for record in records),
+        repair_attempt_count=sum(record.repair_attempted for record in records),
+        repair_parseable_count=sum(
+            record.repair_generation_parseable is True for record in records
+        ),
+        diagnostic_stage_counts=dict(sorted(diagnostic_stage_counts.items())),
     )
 
 
@@ -1458,6 +1772,23 @@ async def evaluate_v2_provider_cases(
         if not isinstance(observation, ChatBIEvaluationObservation):
             raise V2ProviderBenchmarkError(
                 "v2 provider case runner returned an invalid observation"
+            )
+        records.append(_v2_record(case, observation))
+    return records
+
+
+async def evaluate_v2_provider_diagnostic_cases(
+    cases: Sequence[ChatBIEvaluationCaseV2],
+    runner: V2ProviderCaseRunner,
+) -> list[V2ProviderCaseRecord]:
+    """Evaluate only the three frozen controls used by the Layer 0 probe."""
+    validated_cases = _validate_frozen_diagnostic_cases(cases)
+    records: list[V2ProviderCaseRecord] = []
+    for case in validated_cases:
+        observation = await runner.run(case)
+        if not isinstance(observation, ChatBIEvaluationObservation):
+            raise V2ProviderBenchmarkError(
+                "v2 provider diagnostic runner returned an invalid observation"
             )
         records.append(_v2_record(case, observation))
     return records
@@ -1523,33 +1854,57 @@ class _V2AgentRunner:
         finally:
             self._timing.total_ms = (perf_counter() - started) * 1_000
         invocations = list(self._invocation_recorder.records[invocation_start:])
+        observation_positions = {"generation": 0, "repair_generation": 0}
         for invocation in invocations:
             if invocation.outcome != "success":
                 continue
-            if invocation.logical_stage == "generation":
+            boundary_observation = None
+            if invocation.logical_stage in {"generation", "repair_generation"}:
+                position = observation_positions[invocation.logical_stage]
+                observation_positions[invocation.logical_stage] += 1
+                stage_observations = [
+                    item
+                    for item in result.structured_output_observations
+                    if item.logical_stage == invocation.logical_stage
+                ]
+                if position < len(stage_observations):
+                    boundary_observation = stage_observations[position]
+            if boundary_observation is not None and boundary_observation.diagnostic is not None:
+                failure_stage = boundary_observation.diagnostic.stage
+                parse_outcome = (
+                    "structured_output_parse_error"
+                    if failure_stage in {"provider_content_missing", "json_decode_failed"}
+                    else "structured_output_schema_error"
+                )
+                error_category = failure_stage
+            elif invocation.logical_stage == "generation":
                 parse_outcome = (
                     "parsed"
                     if self._timing.stages.generation == "passed"
                     else "structured_output_schema_error"
                 )
+                error_category = None if parse_outcome == "parsed" else parse_outcome
             elif invocation.logical_stage == "repair_generation":
                 parse_outcome = (
                     "parsed"
                     if self._timing.stages.repair_generation == "passed"
                     else "structured_output_schema_error"
                 )
+                error_category = None if parse_outcome == "parsed" else parse_outcome
             elif invocation.logical_stage == "analysis":
                 parse_outcome = result.analysis_parse_outcome or (
                     "parsed"
                     if self._timing.stages.analysis == "passed"
                     else "structured_output_schema_error"
                 )
+                error_category = None if parse_outcome == "parsed" else parse_outcome
             else:
                 parse_outcome = "provider_success"
+                error_category = None
             await self._invocation_updater.update_invocation(
                 invocation.id,
                 response_parse_outcome=parse_outcome,
-                error_category=None if parse_outcome == "parsed" else parse_outcome,
+                error_category=error_category,
             )
         invocations = list(self._invocation_recorder.records[invocation_start:])
         return ChatBIEvaluationObservation(
@@ -1559,6 +1914,85 @@ class _V2AgentRunner:
             stages=self._timing.stage_snapshot(),
             provider_invocations=invocations,
         )
+
+
+async def _execute_v2_provider_cases(
+    settings: Settings,
+    context: _V2PreflightContext,
+    *,
+    diagnostic: bool,
+) -> list[V2ProviderCaseRecord]:
+    """Run a preflight-approved case selection through the production Agent path."""
+    app_engine = create_database_engine(settings)
+    provider = None
+    try:
+        session_factory = create_session_factory(app_engine)
+        registry = DatabaseDataSourceProvider(session_factory)
+        registered = await registry.get(CHATBI_EVALUATION_V2_DATASOURCE_ID)
+        if registered is None:
+            raise V2ProviderBenchmarkError(
+                "authoritative v2 datasource disappeared after preflight"
+            )
+
+        # Provider construction is intentionally after the provider-free gate.
+        provider = create_llm_provider(settings)
+        timing = _TimingState()
+        usage_recorder = DatabaseUsageRecorder(session_factory)
+        invocation_recorder = InMemoryProviderInvocationRecorder()
+        invocation_sink = CompositeProviderInvocationRecorder(usage_recorder, invocation_recorder)
+        discovery = create_postgres_schema_discovery_service(
+            connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+            statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+        )
+        gateway = LLMGateway(
+            provider,
+            usage_recorder,
+            settings,
+            invocation_sink,
+        )
+        timed_discovery = _TimedDiscovery(discovery, timing)
+        generation = NL2SQLService(
+            _TimedGenerationGateway(gateway, timing),
+            schema_discovery=timed_discovery,
+            data_source_provider=registry,
+            max_tokens=settings.chatbi_nl2sql_max_tokens,
+        )
+        timed_generation = _TimedGeneration(generation, timing)
+        policy = _v2_query_policy(settings)
+        execution = SQLExecutionService(
+            _TimedValidation(generation, timing),
+            EnvironmentCredentialResolver(),
+            _TimedExecutionAdapter(
+                PostgresExecutionAdapter(
+                    connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
+                    statement_timeout_ms=settings.chatbi_statement_timeout_ms,
+                ),
+                timing,
+            ),
+        )
+        timed_execution = _TimedExecutionService(execution, timing)
+        agent = ChatBIAgentService(
+            timed_generation,
+            timed_execution,
+            _TimedAnalysisGateway(gateway, timing),
+            limits=ChatBIAgentLimits.from_settings(settings),
+        )
+        runner = _V2AgentRunner(
+            agent,
+            timing,
+            CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            policy,
+            settings.chatbi_schema_context_max_chars,
+            invocation_recorder,
+            invocation_sink,
+        )
+        if diagnostic:
+            return await evaluate_v2_provider_diagnostic_cases(context.selected_cases, runner)
+        return await evaluate_v2_provider_cases(context.selected_cases, runner)
+    finally:
+        if provider is not None:
+            await provider.aclose()
+        await app_engine.dispose()
 
 
 async def run_v2_provider_benchmark(
@@ -1585,118 +2019,115 @@ async def run_v2_provider_benchmark(
             fixture_path=fixture_path,
             output_path=output_path,
         )
-        app_engine = create_database_engine(settings)
-        provider = None
-        try:
-            session_factory = create_session_factory(app_engine)
-            registry = DatabaseDataSourceProvider(session_factory)
-            registered = await registry.get(CHATBI_EVALUATION_V2_DATASOURCE_ID)
-            if registered is None:
-                raise V2ProviderBenchmarkError(
-                    "authoritative v2 datasource disappeared after preflight"
-                )
-
-            # Provider construction is intentionally after the provider-free gate.
-            provider = create_llm_provider(settings)
-            timing = _TimingState()
-            usage_recorder = DatabaseUsageRecorder(session_factory)
-            invocation_recorder = InMemoryProviderInvocationRecorder()
-            durable_invocation_recorder = usage_recorder
-            invocation_sink = CompositeProviderInvocationRecorder(
-                durable_invocation_recorder, invocation_recorder
-            )
-            discovery = create_postgres_schema_discovery_service(
-                connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
-                statement_timeout_ms=settings.chatbi_statement_timeout_ms,
-            )
-            gateway = LLMGateway(
-                provider,
-                usage_recorder,
+        records = await _execute_v2_provider_cases(settings, context, diagnostic=False)
+        completed_at = datetime.now(UTC)
+        policy = _v2_query_policy(settings)
+        provenance = V2ProviderRunProvenance(
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
+            fixture_sha256=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_data_fingerprint=context.fixture_data_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            case_count=len(records),
+            git_revision=context.git_revision,
+            git_dirty=context.git_dirty,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            temperature=0.0,
+            response_format="json_object",
+            configuration=_v2_configuration(
                 settings,
-                invocation_sink,
-            )
-            timed_discovery = _TimedDiscovery(discovery, timing)
-            generation = NL2SQLService(
-                _TimedGenerationGateway(gateway, timing),
-                schema_discovery=timed_discovery,
-                data_source_provider=registry,
-                max_tokens=settings.chatbi_nl2sql_max_tokens,
-            )
-            timed_generation = _TimedGeneration(generation, timing)
-            policy = _v2_query_policy(settings)
-            execution = SQLExecutionService(
-                _TimedValidation(generation, timing),
-                EnvironmentCredentialResolver(),
-                _TimedExecutionAdapter(
-                    PostgresExecutionAdapter(
-                        connection_timeout_seconds=settings.chatbi_schema_connection_timeout_seconds,
-                        statement_timeout_ms=settings.chatbi_statement_timeout_ms,
-                    ),
-                    timing,
-                ),
-            )
-            timed_execution = _TimedExecutionService(execution, timing)
-            agent = ChatBIAgentService(
-                timed_generation,
-                timed_execution,
-                _TimedAnalysisGateway(gateway, timing),
-                limits=ChatBIAgentLimits.from_settings(settings),
-            )
-            records = await evaluate_v2_provider_cases(
-                context.selected_cases,
-                _V2AgentRunner(
-                    agent,
-                    timing,
-                    CHATBI_EVALUATION_V2_DATASOURCE_ID,
-                    policy,
-                    settings.chatbi_schema_context_max_chars,
-                    invocation_recorder,
-                    invocation_sink,
-                ),
-            )
-            completed_at = datetime.now(UTC)
-            provenance = V2ProviderRunProvenance(
-                started_at=started_at,
-                completed_at=completed_at,
-                dataset_fingerprint=context.dataset.fingerprint,
-                fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
-                fixture_sha256=context.fixture_fingerprint,
-                fixture_schema_fingerprint=context.fixture_schema_fingerprint,
-                fixture_data_fingerprint=context.fixture_data_fingerprint,
-                datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
-                case_count=len(records),
-                git_revision=context.git_revision,
-                git_dirty=context.git_dirty,
-                provider=settings.llm_provider,
-                model=settings.llm_model,
-                temperature=0.0,
-                response_format="json_object",
-                configuration=_v2_configuration(
-                    settings,
-                    policy,
-                    settings.chatbi_schema_context_max_chars,
-                ),
-            )
-            run = V2ProviderRun(
-                run_id=uuid4(),
-                started_at=started_at,
-                completed_at=completed_at,
-                dataset_fingerprint=context.dataset.fingerprint,
-                fixture_fingerprint=context.fixture_fingerprint,
-                fixture_schema_fingerprint=context.fixture_schema_fingerprint,
-                datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
-                case_count=len(records),
-                records=records,
-                aggregates=_build_v2_aggregate(records),
-                provenance=provenance,
-            )
-            if output_path is not None:
-                write_v2_provider_run(output_path, run)
-            return run
-        finally:
-            if provider is not None:
-                await provider.aclose()
-            await app_engine.dispose()
+                policy,
+                settings.chatbi_schema_context_max_chars,
+            ),
+        )
+        run = V2ProviderRun(
+            run_id=uuid4(),
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_fingerprint=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            case_count=len(records),
+            records=records,
+            aggregates=_build_v2_aggregate(records),
+            provenance=provenance,
+        )
+        if output_path is not None:
+            write_v2_provider_run(output_path, run)
+        return run
+    finally:
+        if not environment_was_present:
+            os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
+
+
+async def run_v2_provider_diagnostic(
+    settings: Settings,
+    *,
+    split: str = "dev",
+    case_ids: Sequence[str] = _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS,
+    dataset_path: Path = DEFAULT_DATASET_V2,
+    fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
+    output_path: Path | None = DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2,
+) -> V2ProviderDiagnosticRun:
+    """Run the bounded Layer 0 probe for the three frozen DEV controls."""
+    environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
+    started_at = datetime.now(UTC)
+    try:
+        context = await _prepare_v2_preflight(
+            settings,
+            split=split,
+            dataset_path=dataset_path,
+            fixture_path=fixture_path,
+            output_path=output_path,
+            diagnostic_case_ids=case_ids,
+        )
+        records = await _execute_v2_provider_cases(settings, context, diagnostic=True)
+        completed_at = datetime.now(UTC)
+        policy = _v2_query_policy(settings)
+        selected_case_ids = [case.case_id for case in context.selected_cases]
+        provenance = V2ProviderDiagnosticProvenance(
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
+            fixture_sha256=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_data_fingerprint=context.fixture_data_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            case_ids=selected_case_ids,
+            git_revision=context.git_revision,
+            git_dirty=context.git_dirty,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            temperature=0.0,
+            response_format="json_object",
+            configuration=_v2_configuration(
+                settings,
+                policy,
+                settings.chatbi_schema_context_max_chars,
+            ),
+        )
+        diagnostic_records = [_diagnostic_case_record(record) for record in records]
+        run = V2ProviderDiagnosticRun(
+            run_id=uuid4(),
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_fingerprint=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            records=diagnostic_records,
+            aggregates=_build_v2_diagnostic_aggregate(diagnostic_records),
+            provenance=provenance,
+        )
+        if output_path is not None:
+            write_v2_provider_diagnostic_run(output_path, run)
+        return run
     finally:
         if not environment_was_present:
             os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
@@ -1720,11 +2151,32 @@ def write_v2_provider_run(path: Path, run: V2ProviderRun) -> None:
         raise V2ProviderBenchmarkError("could not write v2 provider benchmark output") from error
 
 
+def write_v2_provider_diagnostic_run(path: Path, run: V2ProviderDiagnosticRun) -> None:
+    """Write the bounded, repository-safe Layer 0 diagnostic artifact."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                run.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise V2ProviderBenchmarkError(
+            "could not write v2 structured-output diagnostic output"
+        ) from error
+
+
 __all__ = [
     "CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME",
     "CHATBI_EVALUATION_V2_DATASOURCE_ID",
     "CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION",
     "CHATBI_EVALUATION_V2_PROVIDER_VERSION",
+    "DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2",
     "DEFAULT_PROVIDER_OUTPUT_V2",
     "EXPECTED_DATASET_FINGERPRINT_V2",
     "EXPECTED_FIXTURE_DATA_FINGERPRINT_V2",
@@ -1733,14 +2185,22 @@ __all__ = [
     "V2ProviderAggregate",
     "V2ProviderBenchmarkError",
     "V2ProviderCaseRecord",
+    "V2ProviderDiagnosticAggregate",
+    "V2ProviderDiagnosticCaseRecord",
+    "V2ProviderDiagnosticProvenance",
+    "V2ProviderDiagnosticRun",
     "V2ProviderPreflightReport",
     "V2ProviderRun",
     "V2ProviderRunProvenance",
     "V2ProviderSplit",
     "ensure_authoritative_v2_datasource",
     "evaluate_v2_provider_cases",
+    "evaluate_v2_provider_diagnostic_cases",
     "preflight_v2_provider_benchmark",
     "run_v2_provider_benchmark",
+    "run_v2_provider_diagnostic",
     "select_v2_provider_cases",
+    "select_v2_provider_diagnostic_cases",
+    "write_v2_provider_diagnostic_run",
     "write_v2_provider_run",
 ]

@@ -21,7 +21,13 @@ from pydantic import (
 )
 
 from knowledge_scope.llm.errors import LLMError
-from knowledge_scope.llm.schemas import LLMMessage, LLMRequest, LLMResponseFormat, LLMResult
+from knowledge_scope.llm.schemas import (
+    LLMMessage,
+    LLMRequest,
+    LLMResponseFormat,
+    LLMResult,
+    StructuredOutputBoundaryObservation,
+)
 from knowledge_scope.shared.config import DEFAULT_CHATBI_ANALYSIS_MAX_TOKENS
 
 from .errors import ChatBIError, ChatBIErrorCategory, StructuredOutputError
@@ -168,6 +174,9 @@ class ChatBIResult(_AgentModel):
     analysis_parse_outcome: (
         Literal["parsed", "structured_output_parse_error", "structured_output_schema_error"] | None
     ) = None
+    structured_output_observations: list[StructuredOutputBoundaryObservation] = Field(
+        default_factory=list
+    )
     trace: list[ChatBITraceEvent] = Field(default_factory=list)
 
     @classmethod
@@ -385,6 +394,7 @@ class ChatBIAgentService:
         usage: ChatBIUsageSummary,
         warnings: Sequence[str],
         trace: Sequence[ChatBITraceEvent],
+        structured_output_observations: Sequence[StructuredOutputBoundaryObservation] = (),
         analysis_parse_outcome: Literal[
             "parsed", "structured_output_parse_error", "structured_output_schema_error"
         ]
@@ -424,6 +434,7 @@ class ChatBIAgentService:
             error_category=error_category,
             error_message=error_message,
             analysis_parse_outcome=analysis_parse_outcome,
+            structured_output_observations=list(structured_output_observations),
             trace=list(trace),
         )
 
@@ -470,6 +481,8 @@ class ChatBIAgentService:
         input_tokens_seen = False
         output_tokens_seen = False
         provider_attempts = 0
+        generation_observations: list[StructuredOutputBoundaryObservation] = []
+        active_generation_observation_index: int | None = None
 
         def usage_summary() -> ChatBIUsageSummary:
             return ChatBIUsageSummary(
@@ -495,6 +508,24 @@ class ChatBIAgentService:
             if result.output_tokens is not None:
                 output_tokens += result.output_tokens
                 output_tokens_seen = True
+
+        def add_generation_observation(
+            observation: StructuredOutputBoundaryObservation | None,
+        ) -> None:
+            nonlocal active_generation_observation_index
+            if observation is None:
+                active_generation_observation_index = None
+                return
+            generation_observations.append(observation)
+            active_generation_observation_index = len(generation_observations) - 1
+
+        def mark_generation_validation(status: Literal["passed", "failed"]) -> None:
+            if active_generation_observation_index is None:
+                return
+            observation = generation_observations[active_generation_observation_index]
+            generation_observations[active_generation_observation_index] = observation.model_copy(
+                update={"a5_3_validation_status": status}
+            )
 
         def add_trace(
             event: ChatBITraceName,
@@ -537,6 +568,7 @@ class ChatBIAgentService:
                 usage=usage_summary(),
                 warnings=warnings,
                 trace=trace,
+                structured_output_observations=generation_observations,
             )
 
         while True:
@@ -551,6 +583,7 @@ class ChatBIAgentService:
             outcome = None
             sql_attempts += 1
             llm_calls += 1
+            active_generation_observation_index = None
             try:
                 (
                     generated,
@@ -568,6 +601,7 @@ class ChatBIAgentService:
                     )
                 )
                 add_usage(generation_result)
+                add_generation_observation(generation_result.structured_output_observation)
                 candidate = generated
                 repair_sql = None
                 repair_error = None
@@ -584,6 +618,7 @@ class ChatBIAgentService:
             except ChatBIError as error:
                 if isinstance(error, NL2SQLGenerationError):
                     add_usage(error.usage)
+                    add_generation_observation(error.boundary_observation)
                 add_trace("generation_failed", attempt=sql_attempts, error_category=error.category)
                 if (
                     error.category in _REPAIRABLE_CATEGORIES
@@ -617,6 +652,7 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
             except Exception:
                 error = ChatBIError(
@@ -636,6 +672,7 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
 
             if not reserve_step():
@@ -669,6 +706,7 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
             except Exception:
                 error = ChatBIError(
@@ -688,6 +726,7 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
 
             if not isinstance(outcome, SQLExecutionOutcome):
@@ -708,10 +747,12 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
 
             execution_result = outcome.result
             if execution_result.state is QueryLifecycleState.REJECTED:
+                mark_generation_validation("failed")
                 rejection_category = execution_result.error_category
                 add_trace(
                     "validation_rejected",
@@ -745,6 +786,7 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
             if execution_result.state is not QueryLifecycleState.SUCCEEDED:
                 add_trace(
@@ -764,9 +806,11 @@ class ChatBIAgentService:
                     usage=usage_summary(),
                     warnings=warnings,
                     trace=trace,
+                    structured_output_observations=generation_observations,
                 )
 
             add_trace("validation_accepted", attempt=sql_attempts)
+            mark_generation_validation("passed")
             add_trace("sql_executed", attempt=sql_attempts)
             add_trace("result_normalized", attempt=sql_attempts)
             break
@@ -827,6 +871,7 @@ class ChatBIAgentService:
                 usage=usage_summary(),
                 warnings=warnings,
                 trace=trace,
+                structured_output_observations=generation_observations,
                 analysis_parse_outcome=analysis_parse_outcome,
             )
         except StructuredOutputError as error:
@@ -844,6 +889,7 @@ class ChatBIAgentService:
                 usage=usage_summary(),
                 warnings=warnings,
                 trace=trace,
+                structured_output_observations=generation_observations,
                 analysis_parse_outcome=analysis_parse_outcome,
             )
         except ChatBIError as error:
@@ -860,6 +906,7 @@ class ChatBIAgentService:
                 usage=usage_summary(),
                 warnings=warnings,
                 trace=trace,
+                structured_output_observations=generation_observations,
                 analysis_parse_outcome=analysis_parse_outcome,
             )
         except Exception:
@@ -880,6 +927,7 @@ class ChatBIAgentService:
                 usage=usage_summary(),
                 warnings=warnings,
                 trace=trace,
+                structured_output_observations=generation_observations,
                 analysis_parse_outcome=analysis_parse_outcome,
             )
 
@@ -898,6 +946,7 @@ class ChatBIAgentService:
             usage=usage_summary(),
             warnings=warnings,
             trace=trace,
+            structured_output_observations=generation_observations,
             analysis_parse_outcome=analysis_parse_outcome,
         )
 

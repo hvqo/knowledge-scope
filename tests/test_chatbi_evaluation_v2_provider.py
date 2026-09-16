@@ -67,6 +67,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     _V2AgentRunner,
     evaluate_v2_provider_cases,
     select_v2_provider_cases,
+    select_v2_provider_diagnostic_cases,
 )
 from knowledge_scope.llm import LLMProviderInvocation, LLMRequest, LLMResult
 from knowledge_scope.llm.usage import (
@@ -85,6 +86,26 @@ def test_v2_provider_selects_only_the_frozen_dev_split() -> None:
     assert {case.split for case in selected} == {"dev"}
     with pytest.raises(V2ProviderBenchmarkError, match="permits only"):
         select_v2_provider_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_v2_structured_output_diagnostic_selects_exact_frozen_controls() -> None:
+    dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+
+    selected = select_v2_provider_diagnostic_cases(dataset, V2ProviderSplit.DEV.value)
+
+    assert [case.case_id for case in selected] == [
+        "aggregation-01",
+        "join-02",
+        "group-by-02",
+    ]
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+            ("aggregation-01", "join-02"),
+        )
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_diagnostic_cases(dataset, V2ProviderSplit.TEST.value)
 
 
 def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:

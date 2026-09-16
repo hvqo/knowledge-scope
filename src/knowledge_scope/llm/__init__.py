@@ -11,6 +11,8 @@ from knowledge_scope.llm.schemas import (
     LLMResult,
     LLMStreamEvent,
     LLMTaskType,
+    StructuredOutputBoundaryDiagnostic,
+    StructuredOutputBoundaryObservation,
 )
 
 __all__ = [
@@ -24,5 +26,7 @@ __all__ = [
     "LLMResult",
     "LLMStreamEvent",
     "LLMTaskType",
+    "StructuredOutputBoundaryDiagnostic",
+    "StructuredOutputBoundaryObservation",
     "create_llm_provider",
 ]

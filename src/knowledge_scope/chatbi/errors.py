@@ -5,6 +5,11 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
+from knowledge_scope.llm.schemas import (
+    StructuredOutputBoundaryDiagnostic,
+    StructuredOutputBoundaryObservation,
+)
+
 
 class ChatBIErrorCategory(StrEnum):
     """Stable categories exposed to application-level error handling."""
@@ -52,6 +57,10 @@ class StructuredOutputError(ChatBIError):
         message: str,
         *,
         output_category: Literal["structured_output_parse_error", "structured_output_schema_error"],
+        diagnostic: StructuredOutputBoundaryDiagnostic | None = None,
+        boundary_observation: StructuredOutputBoundaryObservation | None = None,
     ) -> None:
         super().__init__(category, message)
         self.output_category = output_category
+        self.diagnostic = diagnostic
+        self.boundary_observation = boundary_observation

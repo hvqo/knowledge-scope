@@ -53,16 +53,33 @@ NL2SQL 的一次结构化响应使用 `a5.3-v4` contract：
 {
   "result_contract": {
     "contract_version": "1.0",
-    "row_grain": "scalar|detail|grouped",
-    "grain_keys": ["schema.relation.column"],
-    "output_columns": [],
-    "group_by": [],
-    "order_by": [],
+    "row_grain": "grouped",
+    "grain_keys": ["public.example.category"],
+    "output_columns": [
+      {"kind": "source", "source": "public.example.category", "alias": "category"},
+      {"kind": "aggregate", "function": "sum", "source": "public.example.amount", "alias": "total_amount"},
+      {"kind": "derived", "expression": "amount * 1.0", "source_columns": ["public.example.amount"], "alias": "normalized_amount"}
+    ],
+    "group_by": ["public.example.category"],
+    "order_by": [
+      {"key": "public.example.category", "direction": "asc"},
+      {"key": "total_amount", "direction": "desc"}
+    ],
     "limit": null
   },
   "sql": "SELECT ..."
 }
 ```
+
+`output_columns` 使用 `kind` discriminator。`source` 项使用 `source` 和可选 `alias`；
+`aggregate` 项使用 `function`（`count`、`sum`、`avg`、`min`、`max`）以及可选的
+`source`、`alias`，只有 `count` 可以省略 `source`；`derived` 项使用
+`expression`、`source_columns` 和可选 `alias`。来源引用是
+`schema.relation.column` 字符串，不是对象。`order_by` 项只能使用 `key` 和
+`direction`（`asc` 或 `desc`），没有排序时使用 `[]`。`grain_keys`、`group_by`、
+`order_by` 可为空，`output_columns` 至少一项，未指定上限时 `limit` 使用显式 `null`。
+`contract_version` 当前为 `"1.0"`；示例中的 schema 名称仅用于说明结构，实际输出只能
+使用受信任 discovery 结果中的对象。
 
 `grain_keys` 描述结果中行或实体的稳定身份，不要求出现在 SELECT 投影中；
 `output_columns` 则是有序的最终输出列。Contract 校验会根据当前受信任的
