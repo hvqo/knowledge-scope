@@ -32,13 +32,14 @@ Agent 不是无界 ReAct 循环。默认设置如下，均可通过 `Settings` �
 - `chatbi_agent_max_repair_attempts=1`：允许的修复次数；
 - `chatbi_agent_max_steps=6`：生成、执行和分析动作总数；
 - `chatbi_agent_max_llm_calls=3`：SQL 生成和结果分析的网关调用总数；
-- `chatbi_nl2sql_max_tokens=2048`：初次生成和有界修复共用的输出预算；
+- `chatbi_nl2sql_max_tokens=1024`：初次生成和有界修复共用的输出预算；
 - `chatbi_analysis_max_tokens=1024`：结果分析的输出预算。
 
-NL2SQL 初次生成和有界修复显式使用 provider-independent 的
-`reasoning="high"`；DeepSeek 适配器在请求边界将其映射为
-`thinking: {"type":"enabled"}` 与 `reasoning_effort: "high"`。结果分析仍显式关闭
-reasoning，预算保持独立，不受 NL2SQL 实验配置影响。
+当前保留配置中，NL2SQL 初次生成和有界修复显式使用 provider-independent 的
+`reasoning="disabled"`，DeepSeek 适配器在请求边界映射为
+`thinking: {"type":"disabled"}`。结果分析仍显式关闭 reasoning，预算保持独立，不受
+NL2SQL 实验配置影响。Settings 仍允许通过环境变量有意覆盖预算；provider 评测 provenance
+记录实际解析后的配置。
 
 只有 malformed model output、SQL parse error、unknown table 和 unknown column 会触发一次
 有界修复。修复提示中的上一候选和受控错误信息以 JSON 数据传入。安全策略拒绝、执行错误、

@@ -39,7 +39,7 @@ from .schema_models import (
 from .schemas import SQL_TEXT_MAX_LENGTH, DataSource
 from .sql_validation import _SQLSafetyValidator
 
-NL2SQL_REASONING_MODE: Final[LLMReasoningMode] = "high"
+NL2SQL_REASONING_MODE: Final[LLMReasoningMode] = "disabled"
 
 
 class CompletionGateway(Protocol):

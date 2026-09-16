@@ -130,7 +130,7 @@ class _FakeGateway:
 
 
 @pytest.mark.anyio
-async def test_default_nl2sql_and_repair_use_high_reasoning_and_2048_tokens() -> None:
+async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens() -> None:
     class SequenceGateway:
         def __init__(self) -> None:
             self.responses = ["not json", json.dumps({"sql": "SELECT 1"})]
@@ -161,8 +161,8 @@ async def test_default_nl2sql_and_repair_use_high_reasoning_and_2048_tokens() ->
     )
 
     assert candidate.sql == "SELECT 1"
-    assert [item.max_tokens for item in gateway.requests] == [2048, 2048]
-    assert [item.reasoning for item in gateway.requests] == ["high", "high"]
+    assert [item.max_tokens for item in gateway.requests] == [1024, 1024]
+    assert [item.reasoning for item in gateway.requests] == ["disabled", "disabled"]
     assert gateway.requests[0].messages[0] == gateway.requests[1].messages[0]
 
 
@@ -315,8 +315,8 @@ async def test_candidate_generation_exposes_usage_and_bounded_repair_context() -
     assert usage.input_tokens == 10
     assert usage.output_tokens == 5
     assert len(gateway.requests) == 1
-    assert gateway.requests[0].max_tokens == 2048
-    assert gateway.requests[0].reasoning == "high"
+    assert gateway.requests[0].max_tokens == 1024
+    assert gateway.requests[0].reasoning == "disabled"
     repair_content = gateway.requests[0].messages[1].content
     assert '"previous_sql":"SELECT * FROM public.missing"' in repair_content
     assert '"validation_error":"unknown table"' in repair_content

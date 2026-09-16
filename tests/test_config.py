@@ -62,7 +62,7 @@ def test_settings_have_safe_defaults() -> None:
     assert settings.chatbi_schema_context_max_chars == 24_000
     assert settings.chatbi_allowed_schemas == ["public"]
     assert settings.chatbi_allow_views is False
-    assert settings.chatbi_nl2sql_max_tokens == 2048
+    assert settings.chatbi_nl2sql_max_tokens == 1024
     assert settings.chatbi_agent_max_sql_attempts == 2
     assert settings.chatbi_agent_max_repair_attempts == 1
     assert settings.chatbi_agent_max_steps == 6

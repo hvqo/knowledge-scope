@@ -381,8 +381,8 @@ async def test_agent_uses_registered_nl2sql_discovery_path_before_execution() ->
     assert result.usage.provider_attempts == 2
     assert result.usage.input_tokens == 16
     assert result.usage.output_tokens == 8
-    assert gateway.requests[0].max_tokens == 2048
-    assert gateway.requests[0].reasoning == "high"
+    assert gateway.requests[0].max_tokens == 1024
+    assert gateway.requests[0].reasoning == "disabled"
     assert gateway.requests[1].max_tokens == 1024
     assert gateway.requests[1].reasoning == "disabled"
 

@@ -27,6 +27,7 @@ from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.evaluation.chatbi_evaluation import (
     ChatBIEvaluationObservation,
     ChatBIStageTimings,
+    EvaluationRuntimeConfiguration,
     EvaluationStageState,
     RepairOutcome,
 )
@@ -86,7 +87,7 @@ def test_v2_provider_selects_only_the_frozen_dev_split() -> None:
         select_v2_provider_cases(dataset, V2ProviderSplit.TEST.value)
 
 
-def test_v2_provenance_records_explicit_nl2sql_reasoning_mode() -> None:
+def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
     settings = Settings(_env_file=None)
 
     configuration = _v2_configuration(
@@ -95,10 +96,10 @@ def test_v2_provenance_records_explicit_nl2sql_reasoning_mode() -> None:
         max_chars=settings.chatbi_schema_context_max_chars,
     )
 
-    assert configuration.nl2sql_max_tokens == 2048
-    assert configuration.nl2sql_reasoning == "high"
-    assert configuration.nl2sql_thinking_type == "enabled"
-    assert configuration.nl2sql_reasoning_effort == "high"
+    assert configuration.nl2sql_max_tokens == 1024
+    assert configuration.nl2sql_reasoning == "disabled"
+    assert configuration.nl2sql_thinking_type == "disabled"
+    assert configuration.nl2sql_reasoning_effort is None
 
 
 def test_v2_provenance_uses_resolved_budgets() -> None:
@@ -116,6 +117,27 @@ def test_v2_provenance_uses_resolved_budgets() -> None:
 
     assert configuration.nl2sql_max_tokens == 3072
     assert configuration.agent_limits.analysis_max_tokens == 768
+
+
+def test_runtime_provenance_retains_historical_low_and_high_modes() -> None:
+    settings = Settings(_env_file=None)
+    baseline = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    for mode in ("low", "high"):
+        historical_payload = baseline.model_dump(mode="json")
+        historical_payload.update(
+            nl2sql_reasoning=mode,
+            nl2sql_thinking_type="enabled",
+            nl2sql_reasoning_effort=mode,
+        )
+        historical = EvaluationRuntimeConfiguration.model_validate(historical_payload)
+        assert historical.nl2sql_reasoning == mode
+        assert historical.nl2sql_thinking_type == "enabled"
+        assert historical.nl2sql_reasoning_effort == mode
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(
