@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from time import perf_counter
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
@@ -47,8 +47,12 @@ from knowledge_scope.chatbi import (
 from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
 from knowledge_scope.chatbi.errors import ChatBIErrorCategory
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
-from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE
-from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION
+from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE, NL2SQLGenerationError
+from knowledge_scope.chatbi.nl2sql_models import (
+    NL2SQL_PROMPT_VERSION,
+    ResultContract,
+    SQLCandidate,
+)
 from knowledge_scope.chatbi.policy import QueryPolicy, SQLDialect
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider, data_source_from_record
 from knowledge_scope.chatbi.schema_models import SchemaDiscoveryResult, SchemaObjectKind
@@ -66,6 +70,10 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
     EvaluationStageState,
     LatencyAggregate,
     RepairOutcome,
+    ResultContractDiagnostic,
+    ResultContractDiagnosticComparison,
+    ResultContractOrderDiagnostic,
+    ResultContractOutputColumnDiagnostic,
     UsageAggregate,
     _EvaluationModel,
     _map_failure_category,
@@ -79,6 +87,7 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
     _TimedGenerationGateway,
     _TimedValidation,
     _TimingState,
+    build_result_contract_diagnostic,
     compare_normalized_result,
     current_git_dirty,
     current_git_revision,
@@ -96,7 +105,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     load_chatbi_evaluation_dataset_v2,
     structured_result_facts_match,
 )
-from knowledge_scope.llm import LLMGateway, create_llm_provider
+from knowledge_scope.llm import LLMGateway, LLMResult, create_llm_provider
 from knowledge_scope.llm.observability import provider_observation_context
 from knowledge_scope.llm.schemas import (
     LLMProviderInvocation,
@@ -115,6 +124,8 @@ CHATBI_EVALUATION_V2_PROVIDER_VERSION = "a5.7b"
 CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION = "a5.7b-provider-run-v1"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION = "a5.7e2a"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_SCHEMA_VERSION = "a5.7e2a-provider-diagnostic-v1"
+CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_VERSION = "a5.7e2c"
+CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_SCHEMA_VERSION = "a5.7e2c-provider-contract-diagnostic-v1"
 CHATBI_EVALUATION_V2_DATASOURCE_ID = uuid5(
     NAMESPACE_URL, "https://knowledgescope.local/evaluation/chatbi-demo-v2"
 )
@@ -127,6 +138,9 @@ CHATBI_EVALUATION_V2_SCHEMA = "chatbi_demo"
 DEFAULT_PROVIDER_OUTPUT_V2 = Path("data/evaluation/a5-7/provider/chatbi-eval-v2-dev.json")
 DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2 = Path(
     "data/evaluation/a5-7/provider/chatbi-eval-v2-structured-output-diagnostic.json"
+)
+DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2 = Path(
+    "data/evaluation/a5-7/provider/chatbi-eval-v2-result-contract-diagnostic.json"
 )
 EXPECTED_DATASET_FINGERPRINT_V2 = "60c75c597da8fc71a0fa5b25d335b63410b44a4ab3a403da40ca72c5ae375ab3"
 EXPECTED_FIXTURE_FINGERPRINT_V2 = "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d"
@@ -208,6 +222,8 @@ class V2ProviderCaseRecord(_EvaluationModel):
     structured_output_observations: list[StructuredOutputBoundaryObservation] = Field(
         default_factory=list
     )
+    result_contract_diagnostics: list[ResultContractDiagnostic] = Field(default_factory=list)
+    result_contract_comparison: ResultContractDiagnosticComparison | None = None
     analysis_parse_outcome: StrictStr | None = Field(default=None, max_length=48)
     analysis_token_limit_status: StrictStr | None = Field(default=None, max_length=16)
     redacted_sql: StrictStr | None = Field(default=None, max_length=100_000)
@@ -669,6 +685,349 @@ _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS: tuple[str, ...] = (
     "group-by-02",
 )
 
+_RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS: tuple[str, ...] = (
+    "join-04",
+    "join-05",
+    "empty-02",
+    "simple-04",
+    "group-by-01",
+    "top-k-02",
+    "top-k-03",
+    "null-02",
+    "join-06",
+    "multi-join-01",
+    "multi-join-03",
+)
+
+
+def _diagnostic_source(source: str) -> ResultContractOutputColumnDiagnostic:
+    return ResultContractOutputColumnDiagnostic(kind="source", source=source)
+
+
+def _diagnostic_aggregate(
+    function: str,
+    source: str | None = None,
+) -> ResultContractOutputColumnDiagnostic:
+    return ResultContractOutputColumnDiagnostic(
+        kind="aggregate",
+        function=function,
+        source=source,
+    )
+
+
+def _diagnostic_derived(
+    source_columns: tuple[str, ...],
+    expression_classification: Literal[
+        "column", "literal", "arithmetic", "conditional", "cast", "function", "other", "unknown"
+    ],
+) -> ResultContractOutputColumnDiagnostic:
+    return ResultContractOutputColumnDiagnostic(
+        kind="derived",
+        source_columns=source_columns,
+        expression_classification=expression_classification,
+    )
+
+
+def _expected_result_contract_diagnostic(
+    case_id: str,
+) -> ResultContractDiagnostic | None:
+    """Return an evaluator-only semantic oracle for the selected DEV cases.
+
+    These expectations are derived from the frozen reference SQL and remain
+    outside the frozen dataset and all provider prompts.  They are deliberately
+    safe summaries rather than executable SQL or raw business values.
+    """
+    customer_id = "chatbi_demo.customers.customer_id"
+    customer_name = "chatbi_demo.customers.customer_name"
+    region_code = "chatbi_demo.regions.region_code"
+    region_name = "chatbi_demo.regions.region_name"
+    sale_id = "chatbi_demo.sales.sale_id"
+    sold_on = "chatbi_demo.sales.sold_on"
+    amount = "chatbi_demo.sales.amount"
+
+    detail: dict[str, tuple[tuple[str, ...], tuple[ResultContractOutputColumnDiagnostic, ...]]] = {
+        "simple-04": ((customer_id,), (_diagnostic_source(customer_name),)),
+        "empty-02": (
+            (customer_id,),
+            (_diagnostic_source(customer_id), _diagnostic_source(customer_name)),
+        ),
+        "join-04": (
+            (sale_id,),
+            (
+                _diagnostic_source(sale_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_source(sold_on),
+            ),
+        ),
+        "join-06": (
+            (sale_id,),
+            (
+                _diagnostic_source(sale_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_source(amount),
+            ),
+        ),
+        "top-k-02": (
+            (sale_id,),
+            (
+                _diagnostic_source(sale_id),
+                _diagnostic_source(sold_on),
+                _diagnostic_source(amount),
+            ),
+        ),
+        "top-k-03": (
+            (sale_id,),
+            (
+                _diagnostic_source(sale_id),
+                _diagnostic_source(sold_on),
+                _diagnostic_source(amount),
+            ),
+        ),
+    }
+    order_by: dict[str, tuple[ResultContractOrderDiagnostic, ...]] = {
+        "join-04": (ResultContractOrderDiagnostic(key=sale_id, direction="asc"),),
+        "join-06": (ResultContractOrderDiagnostic(key=sale_id, direction="asc"),),
+        "top-k-02": (
+            ResultContractOrderDiagnostic(key=sold_on, direction="asc"),
+            ResultContractOrderDiagnostic(key=sale_id, direction="asc"),
+        ),
+        "top-k-03": (
+            ResultContractOrderDiagnostic(key=sold_on, direction="desc"),
+            ResultContractOrderDiagnostic(key=sale_id, direction="desc"),
+        ),
+    }
+    if case_id in detail:
+        grain_keys, columns = detail[case_id]
+        return ResultContractDiagnostic(
+            logical_stage="generation",
+            validation_status="accepted",
+            contract_version="1.0",
+            row_grain="detail",
+            grain_keys=grain_keys,
+            output_columns=columns,
+            order_by=order_by.get(case_id, ()),
+        )
+
+    grouped: dict[
+        str,
+        tuple[
+            tuple[str, ...],
+            tuple[ResultContractOutputColumnDiagnostic, ...],
+            tuple[str, ...],
+            tuple[ResultContractOrderDiagnostic, ...],
+        ],
+    ] = {
+        "group-by-01": (
+            (region_code,),
+            (
+                _diagnostic_source(region_name),
+                _diagnostic_aggregate("count", sale_id),
+                _diagnostic_aggregate("sum", amount),
+            ),
+            (region_code, region_name),
+            (ResultContractOrderDiagnostic(key=region_code, direction="asc"),),
+        ),
+        "join-05": (
+            (customer_id,),
+            (
+                _diagnostic_source(customer_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_aggregate("min", sold_on),
+            ),
+            (customer_id, customer_name),
+            (ResultContractOrderDiagnostic(key=customer_id, direction="asc"),),
+        ),
+        "multi-join-01": (
+            (customer_id, region_code),
+            (
+                _diagnostic_source(customer_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_source(region_name),
+                _diagnostic_aggregate("count", sale_id),
+                _diagnostic_aggregate("sum", amount),
+            ),
+            (customer_id, customer_name, region_code, region_name),
+            (
+                ResultContractOrderDiagnostic(key=customer_id, direction="asc"),
+                ResultContractOrderDiagnostic(key=region_code, direction="asc"),
+            ),
+        ),
+        "multi-join-03": (
+            (region_code, customer_id),
+            (
+                _diagnostic_source(region_name),
+                _diagnostic_source(customer_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_aggregate("count"),
+            ),
+            (region_code, region_name, customer_id, customer_name),
+            (
+                ResultContractOrderDiagnostic(key=region_code, direction="asc"),
+                ResultContractOrderDiagnostic(key=customer_id, direction="asc"),
+            ),
+        ),
+        "null-02": (
+            (customer_id,),
+            (
+                _diagnostic_source(customer_id),
+                _diagnostic_source(customer_name),
+                _diagnostic_aggregate("count", sale_id),
+                # COALESCE is represented as a bounded function category by
+                # the AST classifier; its source column remains explicit.
+                _diagnostic_derived((amount,), "function"),
+            ),
+            (customer_id, customer_name),
+            (ResultContractOrderDiagnostic(key=customer_id, direction="asc"),),
+        ),
+    }
+    if case_id not in grouped:
+        return None
+    grain_keys, columns, group_by, case_order = grouped[case_id]
+    return ResultContractDiagnostic(
+        logical_stage="generation",
+        validation_status="accepted",
+        contract_version="1.0",
+        row_grain="grouped",
+        grain_keys=grain_keys,
+        output_columns=columns,
+        group_by=group_by,
+        order_by=case_order,
+    )
+
+
+def _compare_result_contract_diagnostic(
+    actual: ResultContractDiagnostic | None,
+    expected: ResultContractDiagnostic,
+) -> ResultContractDiagnosticComparison:
+    """Compare only safe semantic components; never influence execution."""
+    if actual is None:
+        status = "unavailable"
+        return ResultContractDiagnosticComparison(
+            overall="unavailable",
+            row_grain=status,
+            grain_keys=status,
+            output_columns=status,
+            group_by=status,
+            order_by=status,
+            limit=status,
+        )
+    fields = (
+        "row_grain",
+        "grain_keys",
+        "output_columns",
+        "group_by",
+        "order_by",
+        "limit",
+    )
+    statuses = {
+        field: ("correct" if getattr(actual, field) == getattr(expected, field) else "incorrect")
+        for field in fields
+    }
+    correct_count = sum(status == "correct" for status in statuses.values())
+    overall = (
+        "exact" if correct_count == len(fields) else "partial" if correct_count else "incorrect"
+    )
+    return ResultContractDiagnosticComparison(overall=overall, **statuses)
+
+
+class V2ProviderContractDiagnosticProvenance(_EvaluationModel):
+    """Reproducibility metadata for the bounded eleven-case contract audit."""
+
+    benchmark_version: Literal["a5.7e2c"] = CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_VERSION
+    benchmark_mode: Literal["provider_contract_diagnostic"] = "provider_contract_diagnostic"
+    dataset_version: Literal["a5.7-v2"] = CHATBI_EVALUATION_V2_DATASET_VERSION
+    dataset_status: Literal["human_reviewed_frozen"] = CHATBI_EVALUATION_V2_STATUS
+    dataset_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_version: Literal["chatbi-demo-v2"] = CHATBI_DEMO_FIXTURE_VERSION_V2
+    fixture_path: StrictStr = Field(min_length=1, max_length=500)
+    fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_data_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    datasource_id: UUID
+    datasource_identity: Literal["chatbi-demo-v2-authoritative"] = (
+        CHATBI_EVALUATION_V2_DATASOURCE_IDENTITY
+    )
+    split: Literal["dev"] = "dev"
+    case_ids: list[StrictStr] = Field(min_length=11, max_length=11)
+    git_revision: StrictStr = Field(pattern=r"^[0-9a-f]{40}$")
+    git_dirty: StrictBool
+    provider: StrictStr = Field(min_length=1, max_length=64)
+    model: StrictStr = Field(min_length=1, max_length=255)
+    temperature: float = Field(ge=0, le=2)
+    response_format: Literal["json_object"]
+    configuration: EvaluationRuntimeConfiguration
+    started_at: datetime
+    completed_at: datetime
+
+    @field_validator("fixture_path")
+    @classmethod
+    def require_relative_fixture_path(cls, value: str) -> str:
+        if Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
+            raise ValueError("provider fixture path must be repository-relative")
+        return value
+
+
+class V2ProviderContractDiagnosticAggregate(_EvaluationModel):
+    """Safe aggregate counts for the eleven-case semantic contract audit."""
+
+    case_count: StrictInt = Field(ge=0)
+    provider_invocation_count: StrictInt = Field(ge=0)
+    contract_available_count: StrictInt = Field(ge=0)
+    exact_count: StrictInt = Field(ge=0)
+    partial_count: StrictInt = Field(ge=0)
+    incorrect_count: StrictInt = Field(ge=0)
+    unavailable_count: StrictInt = Field(ge=0)
+    component_status_counts: dict[str, dict[str, StrictInt]] = Field(default_factory=dict)
+
+
+class V2ProviderContractDiagnosticRun(_EvaluationModel):
+    """Repository-safe artifact for exactly the eleven selected DEV cases."""
+
+    run_id: UUID
+    artifact_schema_version: Literal["a5.7e2c-provider-contract-diagnostic-v1"] = (
+        CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_SCHEMA_VERSION
+    )
+    started_at: datetime
+    completed_at: datetime
+    benchmark_version: Literal["a5.7e2c"] = CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_VERSION
+    mode: Literal["provider_contract_diagnostic"] = "provider_contract_diagnostic"
+    split: Literal["dev"] = "dev"
+    dataset_version: Literal["a5.7-v2"] = CHATBI_EVALUATION_V2_DATASET_VERSION
+    dataset_status: Literal["human_reviewed_frozen"] = CHATBI_EVALUATION_V2_STATUS
+    dataset_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    datasource_id: UUID
+    case_count: Literal[11] = 11
+    records: list[V2ProviderCaseRecord] = Field(min_length=11, max_length=11)
+    aggregates: V2ProviderContractDiagnosticAggregate
+    provenance: V2ProviderContractDiagnosticProvenance
+    quality_claim: Literal["diagnostic_only"] = "diagnostic_only"
+
+    @model_validator(mode="after")
+    def validate_contract_diagnostic(self) -> V2ProviderContractDiagnosticRun:
+        if self.case_count != len(self.records):
+            raise ValueError("contract diagnostic case count must match its records")
+        record_ids = [record.case_id for record in self.records]
+        expected_ids = list(_RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS)
+        if record_ids != expected_ids or self.provenance.case_ids != expected_ids:
+            raise ValueError("contract diagnostic records must preserve selected case order")
+        if self.datasource_id != self.provenance.datasource_id:
+            raise ValueError("contract diagnostic datasource identities must match")
+        if self.dataset_fingerprint != self.provenance.dataset_fingerprint:
+            raise ValueError("contract diagnostic dataset fingerprints must match")
+        if self.fixture_fingerprint != self.provenance.fixture_sha256:
+            raise ValueError("contract diagnostic fixture fingerprints must match")
+        if self.fixture_schema_fingerprint != self.provenance.fixture_schema_fingerprint:
+            raise ValueError("contract diagnostic schema fingerprints must match")
+        if self.aggregates.case_count != self.case_count:
+            raise ValueError("contract diagnostic aggregate case count must match")
+        if self.aggregates.provider_invocation_count != sum(
+            len(record.provider_invocations) for record in self.records
+        ):
+            raise ValueError("contract diagnostic aggregate invocation count must match")
+        return self
+
 
 def select_v2_provider_diagnostic_cases(
     dataset: ChatBIEvaluationDatasetV2,
@@ -694,6 +1053,33 @@ def select_v2_provider_diagnostic_cases(
         ) from error
     if any(case.split != V2ProviderSplit.DEV.value for case in selected):
         raise V2ProviderBenchmarkError("structured-output diagnostic cases must be on DEV")
+    return selected
+
+
+def select_v2_provider_contract_diagnostic_cases(
+    dataset: ChatBIEvaluationDatasetV2,
+    split: str,
+    case_ids: Sequence[str] = _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS,
+) -> list[ChatBIEvaluationCaseV2]:
+    """Select exactly the eleven frozen DEV cases for semantic diagnosis."""
+    if split != V2ProviderSplit.DEV.value:
+        raise V2ProviderBenchmarkError("result-contract diagnostics permit only --split dev")
+    supplied_ids = tuple(case_ids)
+    if len(supplied_ids) != len(set(supplied_ids)) or set(supplied_ids) != set(
+        _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS
+    ):
+        raise V2ProviderBenchmarkError(
+            "result-contract diagnostics require the exact eleven frozen DEV cases"
+        )
+    cases_by_id = {case.case_id: case for case in dataset.cases}
+    try:
+        selected = [cases_by_id[case_id] for case_id in _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS]
+    except KeyError as error:
+        raise V2ProviderBenchmarkError(
+            "result-contract diagnostic case is missing from the frozen dataset"
+        ) from error
+    if any(case.split != V2ProviderSplit.DEV.value for case in selected):
+        raise V2ProviderBenchmarkError("result-contract diagnostic cases must be on DEV")
     return selected
 
 
@@ -745,6 +1131,35 @@ def _validate_frozen_diagnostic_cases(
     if any(case != expected[case.case_id] for case in cases):
         raise V2ProviderBenchmarkError("diagnostic cases do not match the frozen dataset")
     return tuple(expected[case_id] for case_id in _STRUCTURED_OUTPUT_DIAGNOSTIC_CASE_IDS)
+
+
+def _validate_frozen_contract_diagnostic_cases(
+    cases: Sequence[ChatBIEvaluationCaseV2],
+) -> tuple[ChatBIEvaluationCaseV2, ...]:
+    """Validate the exact eleven frozen DEV cases before provider calls."""
+    try:
+        dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+    except ChatBIEvaluationError as error:
+        raise V2ProviderBenchmarkError("the frozen v2 provider dataset is unavailable") from error
+    if dataset.fingerprint != EXPECTED_DATASET_FINGERPRINT_V2:
+        raise V2ProviderBenchmarkError("the frozen v2 provider dataset identity does not match")
+    expected = {
+        case.case_id: case
+        for case in select_v2_provider_contract_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+        )
+    }
+    supplied_ids = [case.case_id for case in cases]
+    if len(supplied_ids) != len(set(supplied_ids)) or set(supplied_ids) != set(expected):
+        raise V2ProviderBenchmarkError(
+            "result-contract diagnostic cases must be the exact eleven frozen controls"
+        )
+    if any(case != expected[case.case_id] for case in cases):
+        raise V2ProviderBenchmarkError(
+            "result-contract diagnostic cases do not match the frozen dataset"
+        )
+    return tuple(expected[case_id] for case_id in _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS)
 
 
 def _verify_v2_dataset_and_fixture(
@@ -1445,6 +1860,7 @@ async def _prepare_v2_preflight(
     fixture_path: Path,
     output_path: Path | None,
     diagnostic_case_ids: Sequence[str] | None = None,
+    contract_diagnostic: bool = False,
 ) -> _V2PreflightContext:
     # Capture the repository state before any validation/bootstrap step can
     # create directories or other local artifacts.
@@ -1453,11 +1869,22 @@ async def _prepare_v2_preflight(
         raise V2ProviderBenchmarkError("could not determine the current Git revision")
     dirty = current_git_dirty()
     dataset, fixture_fingerprint = _verify_v2_dataset_and_fixture(dataset_path, fixture_path)
-    selected = tuple(
-        select_v2_provider_diagnostic_cases(dataset, split, diagnostic_case_ids)
-        if diagnostic_case_ids is not None
-        else select_v2_provider_cases(dataset, split)
-    )
+    if contract_diagnostic:
+        selected = tuple(
+            select_v2_provider_contract_diagnostic_cases(
+                dataset,
+                split,
+                (
+                    diagnostic_case_ids
+                    if diagnostic_case_ids is not None
+                    else _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS
+                ),
+            )
+        )
+    elif diagnostic_case_ids is not None:
+        selected = tuple(select_v2_provider_diagnostic_cases(dataset, split, diagnostic_case_ids))
+    else:
+        selected = tuple(select_v2_provider_cases(dataset, split))
     _check_provider_configuration(settings)
     bootstrap = await ensure_authoritative_v2_datasource(settings, fixture_path=fixture_path)
     app_engine = create_database_engine(settings)
@@ -1501,6 +1928,7 @@ async def preflight_v2_provider_benchmark(
     fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
     output_path: Path | None = None,
     diagnostic_case_ids: Sequence[str] | None = None,
+    contract_diagnostic: bool = False,
 ) -> V2ProviderPreflightReport:
     """Run all provider-free gates and make zero provider calls."""
     environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
@@ -1512,6 +1940,7 @@ async def preflight_v2_provider_benchmark(
             fixture_path=fixture_path,
             output_path=output_path,
             diagnostic_case_ids=diagnostic_case_ids,
+            contract_diagnostic=contract_diagnostic,
         )
         return V2ProviderPreflightReport(
             dataset_fingerprint=context.dataset.fingerprint,
@@ -1594,6 +2023,16 @@ def _v2_record(
         repair_outcome = RepairOutcome.EXHAUSTED
 
     validation_failure_code, validation_failure_reason = _validation_failure_details(result)
+    contract_diagnostics = list(observation.result_contract_diagnostics)
+    expected_contract = _expected_result_contract_diagnostic(case.case_id)
+    contract_comparison = (
+        _compare_result_contract_diagnostic(
+            contract_diagnostics[-1] if contract_diagnostics else None,
+            expected_contract,
+        )
+        if expected_contract is not None
+        else None
+    )
     analysis_invocations = [
         invocation
         for invocation in observation.provider_invocations
@@ -1643,6 +2082,8 @@ def _v2_record(
         usage=result.usage,
         provider_invocations=observation.provider_invocations,
         structured_output_observations=result.structured_output_observations,
+        result_contract_diagnostics=contract_diagnostics,
+        result_contract_comparison=contract_comparison,
         analysis_parse_outcome=result.analysis_parse_outcome,
         analysis_token_limit_status=analysis_token_limit_status,
         redacted_sql=result.redacted_sql,
@@ -1760,6 +2201,57 @@ def _build_v2_diagnostic_aggregate(
     )
 
 
+def _build_v2_contract_diagnostic_aggregate(
+    records: Sequence[V2ProviderCaseRecord],
+) -> V2ProviderContractDiagnosticAggregate:
+    """Aggregate safe contract comparisons without making quality claims."""
+    comparisons = [record.result_contract_comparison for record in records]
+    component_names = (
+        "row_grain",
+        "grain_keys",
+        "output_columns",
+        "group_by",
+        "order_by",
+        "limit",
+    )
+    component_status_counts = {
+        name: dict(
+            sorted(
+                Counter(
+                    getattr(comparison, name)
+                    for comparison in comparisons
+                    if comparison is not None
+                ).items()
+            )
+        )
+        for name in component_names
+    }
+    exact_count = sum(
+        comparison is not None and comparison.overall == "exact" for comparison in comparisons
+    )
+    partial_count = sum(
+        comparison is not None and comparison.overall == "partial" for comparison in comparisons
+    )
+    incorrect_count = sum(
+        comparison is not None and comparison.overall == "incorrect" for comparison in comparisons
+    )
+    unavailable_count = sum(
+        comparison is None or comparison.overall == "unavailable" for comparison in comparisons
+    )
+    return V2ProviderContractDiagnosticAggregate(
+        case_count=len(records),
+        provider_invocation_count=sum(len(record.provider_invocations) for record in records),
+        contract_available_count=sum(
+            bool(record.result_contract_diagnostics) for record in records
+        ),
+        exact_count=exact_count,
+        partial_count=partial_count,
+        incorrect_count=incorrect_count,
+        unavailable_count=unavailable_count,
+        component_status_counts=component_status_counts,
+    )
+
+
 async def evaluate_v2_provider_cases(
     cases: Sequence[ChatBIEvaluationCaseV2],
     runner: V2ProviderCaseRunner,
@@ -1789,6 +2281,103 @@ async def evaluate_v2_provider_diagnostic_cases(
         if not isinstance(observation, ChatBIEvaluationObservation):
             raise V2ProviderBenchmarkError(
                 "v2 provider diagnostic runner returned an invalid observation"
+            )
+        records.append(_v2_record(case, observation))
+    return records
+
+
+class _ResultContractCapture:
+    """Collect safe contract summaries for one bounded diagnostic run."""
+
+    def __init__(self) -> None:
+        self.diagnostics: list[ResultContractDiagnostic] = []
+
+    def reset(self) -> None:
+        self.diagnostics.clear()
+
+    def capture_success(self, candidate: SQLCandidate, *, is_repair: bool) -> None:
+        if candidate.result_contract is None:
+            return
+        self.diagnostics.append(
+            build_result_contract_diagnostic(
+                candidate.result_contract,
+                logical_stage="repair_generation" if is_repair else "generation",
+                validation_status="accepted",
+            )
+        )
+
+    def capture_failure(self, error: NL2SQLGenerationError, *, is_repair: bool) -> None:
+        contract = error.result_contract
+        if contract is None:
+            return
+        observation = error.boundary_observation
+        if observation is not None and observation.semantic_contract_validation_status == "passed":
+            validation_status = "semantic_valid"
+        else:
+            validation_status = "structured_valid"
+        self.diagnostics.append(
+            build_result_contract_diagnostic(
+                contract,
+                logical_stage="repair_generation" if is_repair else "generation",
+                validation_status=validation_status,
+            )
+        )
+
+
+class _ContractObservingGeneration:
+    """Observe parsed contracts without changing production generation behavior."""
+
+    def __init__(self, inner: _TimedGeneration, capture: _ResultContractCapture) -> None:
+        self._inner = inner
+        self._capture = capture
+
+    async def generate_candidate_with_usage_for_registered_data_source(
+        self,
+        datasource_id: UUID,
+        query: Any,
+        *,
+        policy: QueryPolicy,
+        max_chars: int,
+        max_tokens: int | None = None,
+        previous_sql: str | None = None,
+        validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
+    ) -> tuple[SQLCandidate, LLMResult]:
+        is_repair = previous_sql is not None or validation_error is not None
+        try:
+            (
+                candidate,
+                result,
+            ) = await self._inner.generate_candidate_with_usage_for_registered_data_source(
+                datasource_id,
+                query,
+                policy=policy,
+                max_chars=max_chars,
+                max_tokens=max_tokens,
+                previous_sql=previous_sql,
+                validation_error=validation_error,
+                previous_contract=previous_contract,
+            )
+        except NL2SQLGenerationError as error:
+            self._capture.capture_failure(error, is_repair=is_repair)
+            raise
+        else:
+            self._capture.capture_success(candidate, is_repair=is_repair)
+            return candidate, result
+
+
+async def evaluate_v2_provider_contract_diagnostic_cases(
+    cases: Sequence[ChatBIEvaluationCaseV2],
+    runner: V2ProviderCaseRunner,
+) -> list[V2ProviderCaseRecord]:
+    """Evaluate exactly eleven DEV cases and retain only safe contract summaries."""
+    validated_cases = _validate_frozen_contract_diagnostic_cases(cases)
+    records: list[V2ProviderCaseRecord] = []
+    for case in validated_cases:
+        observation = await runner.run(case)
+        if not isinstance(observation, ChatBIEvaluationObservation):
+            raise V2ProviderBenchmarkError(
+                "v2 result-contract diagnostic runner returned an invalid observation"
             )
         records.append(_v2_record(case, observation))
     return records
@@ -1830,6 +2419,7 @@ class _V2AgentRunner:
         max_chars: int,
         invocation_recorder: InMemoryProviderInvocationRecorder,
         invocation_updater: ProviderInvocationRecorder,
+        contract_capture: _ResultContractCapture | None = None,
     ) -> None:
         self._agent = agent
         self._timing = timing
@@ -1838,9 +2428,12 @@ class _V2AgentRunner:
         self._max_chars = max_chars
         self._invocation_recorder = invocation_recorder
         self._invocation_updater = invocation_updater
+        self._contract_capture = contract_capture
 
     async def run(self, case: ChatBIEvaluationCaseV2) -> ChatBIEvaluationObservation:
         self._timing.reset()
+        if self._contract_capture is not None:
+            self._contract_capture.reset()
         started = perf_counter()
         invocation_start = len(self._invocation_recorder.records)
         try:
@@ -1913,6 +2506,11 @@ class _V2AgentRunner:
             timings=self._timing.snapshot(),
             stages=self._timing.stage_snapshot(),
             provider_invocations=invocations,
+            result_contract_diagnostics=(
+                list(self._contract_capture.diagnostics)
+                if self._contract_capture is not None
+                else []
+            ),
         )
 
 
@@ -1921,8 +2519,11 @@ async def _execute_v2_provider_cases(
     context: _V2PreflightContext,
     *,
     diagnostic: bool,
+    contract_diagnostic: bool = False,
 ) -> list[V2ProviderCaseRecord]:
     """Run a preflight-approved case selection through the production Agent path."""
+    if diagnostic and contract_diagnostic:
+        raise V2ProviderBenchmarkError("provider diagnostics cannot select two modes at once")
     app_engine = create_database_engine(settings)
     provider = None
     try:
@@ -1958,6 +2559,12 @@ async def _execute_v2_provider_cases(
             max_tokens=settings.chatbi_nl2sql_max_tokens,
         )
         timed_generation = _TimedGeneration(generation, timing)
+        contract_capture = _ResultContractCapture() if contract_diagnostic else None
+        observed_generation = (
+            _ContractObservingGeneration(timed_generation, contract_capture)
+            if contract_capture is not None
+            else timed_generation
+        )
         policy = _v2_query_policy(settings)
         execution = SQLExecutionService(
             _TimedValidation(generation, timing),
@@ -1972,7 +2579,7 @@ async def _execute_v2_provider_cases(
         )
         timed_execution = _TimedExecutionService(execution, timing)
         agent = ChatBIAgentService(
-            timed_generation,
+            observed_generation,
             timed_execution,
             _TimedAnalysisGateway(gateway, timing),
             limits=ChatBIAgentLimits.from_settings(settings),
@@ -1985,9 +2592,15 @@ async def _execute_v2_provider_cases(
             settings.chatbi_schema_context_max_chars,
             invocation_recorder,
             invocation_sink,
+            contract_capture,
         )
         if diagnostic:
             return await evaluate_v2_provider_diagnostic_cases(context.selected_cases, runner)
+        if contract_diagnostic:
+            return await evaluate_v2_provider_contract_diagnostic_cases(
+                context.selected_cases,
+                runner,
+            )
         return await evaluate_v2_provider_cases(context.selected_cases, runner)
     finally:
         if provider is not None:
@@ -2133,6 +2746,79 @@ async def run_v2_provider_diagnostic(
             os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
 
 
+async def run_v2_provider_contract_diagnostic(
+    settings: Settings,
+    *,
+    split: str = "dev",
+    case_ids: Sequence[str] = _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS,
+    dataset_path: Path = DEFAULT_DATASET_V2,
+    fixture_path: Path = DEFAULT_FIXTURE_PATH_V2,
+    output_path: Path | None = DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2,
+) -> V2ProviderContractDiagnosticRun:
+    """Run the bounded eleven-case semantic ResultContract diagnosis."""
+    environment_was_present = CHATBI_EVALUATION_V2_CREDENTIAL_ENV in os.environ
+    started_at = datetime.now(UTC)
+    try:
+        context = await _prepare_v2_preflight(
+            settings,
+            split=split,
+            dataset_path=dataset_path,
+            fixture_path=fixture_path,
+            output_path=output_path,
+            diagnostic_case_ids=case_ids,
+            contract_diagnostic=True,
+        )
+        records = await _execute_v2_provider_cases(
+            settings,
+            context,
+            diagnostic=False,
+            contract_diagnostic=True,
+        )
+        completed_at = datetime.now(UTC)
+        policy = _v2_query_policy(settings)
+        selected_case_ids = [case.case_id for case in context.selected_cases]
+        provenance = V2ProviderContractDiagnosticProvenance(
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
+            fixture_sha256=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_data_fingerprint=context.fixture_data_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            case_ids=selected_case_ids,
+            git_revision=context.git_revision,
+            git_dirty=context.git_dirty,
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            temperature=0.0,
+            response_format="json_object",
+            configuration=_v2_configuration(
+                settings,
+                policy,
+                settings.chatbi_schema_context_max_chars,
+            ),
+        )
+        run = V2ProviderContractDiagnosticRun(
+            run_id=uuid4(),
+            started_at=started_at,
+            completed_at=completed_at,
+            dataset_fingerprint=context.dataset.fingerprint,
+            fixture_fingerprint=context.fixture_fingerprint,
+            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
+            records=records,
+            aggregates=_build_v2_contract_diagnostic_aggregate(records),
+            provenance=provenance,
+        )
+        if output_path is not None:
+            write_v2_provider_contract_diagnostic_run(output_path, run)
+        return run
+    finally:
+        if not environment_was_present:
+            os.environ.pop(CHATBI_EVALUATION_V2_CREDENTIAL_ENV, None)
+
+
 def write_v2_provider_run(path: Path, run: V2ProviderRun) -> None:
     """Write a safe runtime artifact; the default path is gitignored."""
     try:
@@ -2171,11 +2857,35 @@ def write_v2_provider_diagnostic_run(path: Path, run: V2ProviderDiagnosticRun) -
         ) from error
 
 
+def write_v2_provider_contract_diagnostic_run(
+    path: Path,
+    run: V2ProviderContractDiagnosticRun,
+) -> None:
+    """Write the bounded, repository-safe semantic contract artifact."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                run.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise V2ProviderBenchmarkError(
+            "could not write v2 result-contract diagnostic output"
+        ) from error
+
+
 __all__ = [
     "CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME",
     "CHATBI_EVALUATION_V2_DATASOURCE_ID",
     "CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION",
     "CHATBI_EVALUATION_V2_PROVIDER_VERSION",
+    "DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2",
     "DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2",
     "DEFAULT_PROVIDER_OUTPUT_V2",
     "EXPECTED_DATASET_FINGERPRINT_V2",
@@ -2185,6 +2895,9 @@ __all__ = [
     "V2ProviderAggregate",
     "V2ProviderBenchmarkError",
     "V2ProviderCaseRecord",
+    "V2ProviderContractDiagnosticAggregate",
+    "V2ProviderContractDiagnosticProvenance",
+    "V2ProviderContractDiagnosticRun",
     "V2ProviderDiagnosticAggregate",
     "V2ProviderDiagnosticCaseRecord",
     "V2ProviderDiagnosticProvenance",
@@ -2195,12 +2908,16 @@ __all__ = [
     "V2ProviderSplit",
     "ensure_authoritative_v2_datasource",
     "evaluate_v2_provider_cases",
+    "evaluate_v2_provider_contract_diagnostic_cases",
     "evaluate_v2_provider_diagnostic_cases",
     "preflight_v2_provider_benchmark",
     "run_v2_provider_benchmark",
+    "run_v2_provider_contract_diagnostic",
     "run_v2_provider_diagnostic",
     "select_v2_provider_cases",
+    "select_v2_provider_contract_diagnostic_cases",
     "select_v2_provider_diagnostic_cases",
+    "write_v2_provider_contract_diagnostic_run",
     "write_v2_provider_diagnostic_run",
     "write_v2_provider_run",
 ]

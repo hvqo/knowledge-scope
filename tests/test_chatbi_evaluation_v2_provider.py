@@ -21,15 +21,24 @@ from knowledge_scope.chatbi import (
     SQLExecutionService,
 )
 from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
+from knowledge_scope.chatbi.errors import ChatBIErrorCategory
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
+from knowledge_scope.chatbi.nl2sql import LLMUsageMetadata, NL2SQLGenerationError
 from knowledge_scope.chatbi.policy import SQLDialect
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
+from knowledge_scope.chatbi.result_contract import (
+    OutputColumnKind,
+    ResultContract,
+    ResultGrain,
+    ResultOutputColumn,
+)
 from knowledge_scope.evaluation.chatbi_evaluation import (
     ChatBIEvaluationObservation,
     ChatBIStageTimings,
     EvaluationRuntimeConfiguration,
     EvaluationStageState,
     RepairOutcome,
+    build_result_contract_diagnostic,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     ChatBIEvaluationV2Category,
@@ -37,6 +46,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     load_chatbi_evaluation_dataset_v2,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
+    _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS,
     CHATBI_EVALUATION_V2_CONNECTION_REF,
     CHATBI_EVALUATION_V2_DATABASE_NAME,
     CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME,
@@ -44,6 +54,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     CHATBI_EVALUATION_V2_SCHEMA,
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
+    DEFAULT_PROVIDER_OUTPUT_V2,
     EXPECTED_DATASET_FINGERPRINT_V2,
     EXPECTED_FIXTURE_DATA_FINGERPRINT_V2,
     EXPECTED_FIXTURE_FINGERPRINT_V2,
@@ -51,14 +62,18 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     V2ProviderBenchmarkError,
     V2ProviderCaseRecord,
     V2ProviderPreflightReport,
+    V2ProviderRun,
     V2ProviderSplit,
     _authoritative_record_matches,
     _build_v2_aggregate,
+    _compare_result_contract_diagnostic,
+    _expected_result_contract_diagnostic,
     _fixture_data_fingerprint,
     _fixture_schema_fingerprint,
     _fixture_schema_payload,
     _local_postgres_urls,
     _prepare_v2_preflight,
+    _ResultContractCapture,
     _TimingState,
     _v2_configuration,
     _v2_query_policy,
@@ -67,6 +82,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     _V2AgentRunner,
     evaluate_v2_provider_cases,
     select_v2_provider_cases,
+    select_v2_provider_contract_diagnostic_cases,
     select_v2_provider_diagnostic_cases,
 )
 from knowledge_scope.llm import LLMProviderInvocation, LLMRequest, LLMResult
@@ -106,6 +122,125 @@ def test_v2_structured_output_diagnostic_selects_exact_frozen_controls() -> None
         )
     with pytest.raises(V2ProviderBenchmarkError):
         select_v2_provider_diagnostic_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_v2_result_contract_diagnostic_selects_exact_eleven_frozen_dev_cases() -> None:
+    dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+
+    selected = select_v2_provider_contract_diagnostic_cases(
+        dataset,
+        V2ProviderSplit.DEV.value,
+    )
+
+    assert [case.case_id for case in selected] == list(_RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS)
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_contract_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+            _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS[:-1],
+        )
+    with pytest.raises(V2ProviderBenchmarkError, match="only"):
+        select_v2_provider_contract_diagnostic_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_result_contract_diagnostic_omits_raw_expression_and_alias() -> None:
+    contract = ResultContract(
+        row_grain=ResultGrain.DETAIL,
+        grain_keys=("public.sales.sale_id",),
+        output_columns=(
+            ResultOutputColumn(
+                kind=OutputColumnKind.SOURCE,
+                source="public.sales.amount",
+                alias="sensitive_alias",
+            ),
+            ResultOutputColumn(
+                kind=OutputColumnKind.DERIVED,
+                expression="amount * 987654321",
+                source_columns=("public.sales.amount",),
+                alias="secret_total",
+            ),
+        ),
+    )
+
+    summary = build_result_contract_diagnostic(
+        contract,
+        logical_stage="generation",
+        validation_status="accepted",
+    )
+    encoded = json.dumps(summary.model_dump(mode="json"), ensure_ascii=False)
+
+    assert summary.output_columns[1].expression_classification == "arithmetic"
+    assert "987654321" not in encoded
+    assert "sensitive_alias" not in encoded
+    assert "secret_total" not in encoded
+
+
+def test_contract_capture_records_success_and_semantic_failure_without_raw_text() -> None:
+    contract = ResultContract(
+        row_grain=ResultGrain.DETAIL,
+        grain_keys=("public.sales.sale_id",),
+        output_columns=(
+            ResultOutputColumn(kind=OutputColumnKind.SOURCE, source="public.sales.amount"),
+        ),
+    )
+    capture = _ResultContractCapture()
+    candidate = SimpleNamespace(result_contract=contract)
+    capture.capture_success(candidate, is_repair=False)  # type: ignore[arg-type]
+    error = NL2SQLGenerationError(
+        ChatBIErrorCategory.RESULT_CONTRACT_INCONSISTENT,
+        "contract inconsistent",
+        usage=LLMUsageMetadata(
+            provider="fake",
+            model="fake",
+            input_tokens=1,
+            output_tokens=2,
+            provider_attempts=1,
+        ),
+        result_contract=contract,
+        boundary_observation=SimpleNamespace(semantic_contract_validation_status="passed"),
+    )
+    capture.capture_failure(error, is_repair=True)
+
+    assert [item.logical_stage for item in capture.diagnostics] == [
+        "generation",
+        "repair_generation",
+    ]
+    assert all(
+        "contract inconsistent" not in item.model_dump_json() for item in capture.diagnostics
+    )
+
+
+def test_result_contract_comparison_has_explicit_unavailable_and_exact_states() -> None:
+    expected = _expected_result_contract_diagnostic("simple-04")
+    assert expected is not None
+
+    unavailable = _compare_result_contract_diagnostic(None, expected)
+    assert unavailable.overall == "unavailable"
+    assert unavailable.output_columns == "unavailable"
+
+    exact = _compare_result_contract_diagnostic(expected, expected)
+    assert exact.overall == "exact"
+    assert all(
+        getattr(exact, name) == "correct"
+        for name in ("row_grain", "grain_keys", "output_columns", "group_by", "order_by", "limit")
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("chatbi-eval-v2-dev-run-6.json", "chatbi-eval-v2-dev-run-11.json"),
+)
+def test_historical_provider_artifacts_without_contract_diagnostics_remain_readable(
+    artifact_name: str,
+) -> None:
+    artifact = DEFAULT_PROVIDER_OUTPUT_V2.parent / artifact_name
+    if not artifact.is_file():
+        pytest.skip("historical provider artifact is not present in the local runtime")
+
+    run = V2ProviderRun.model_validate_json(artifact.read_text(encoding="utf-8"))
+
+    assert len(run.records) == 50
+    assert all(record.result_contract_diagnostics == [] for record in run.records)
 
 
 def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:

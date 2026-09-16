@@ -71,11 +71,13 @@ from knowledge_scope.evaluation.chatbi_evaluation import (
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
+    DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2,
     DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2,
     DEFAULT_PROVIDER_OUTPUT_V2,
     V2ProviderBenchmarkError,
     preflight_v2_provider_benchmark,
     run_v2_provider_benchmark,
+    run_v2_provider_contract_diagnostic,
     run_v2_provider_diagnostic,
 )
 from knowledge_scope.evaluation.embedding_benchmark import (
@@ -366,6 +368,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="diagnostic_cases",
         default=None,
         help="run the fixed three-DEV structured-output diagnostic cases only",
+    )
+    chatbi_eval_v2_provider.add_argument(
+        "--contract-diagnostic",
+        action="store_true",
+        help="run the fixed eleven-DEV ResultContract semantic diagnostic cases only",
     )
     mcp = subparsers.add_parser(
         "mcp",
@@ -1678,8 +1685,14 @@ async def _run_chatbi_eval_v2_provider_async(
 ) -> dict[str, object]:
     """Run the provider-free v2 preflight or the explicit DEV benchmark."""
     diagnostic_cases = args.diagnostic_cases
+    if args.contract_diagnostic and diagnostic_cases is not None:
+        raise V2ProviderBenchmarkError(
+            "--contract-diagnostic cannot be combined with --diagnostic-case"
+        )
     diagnostic_output = args.output
-    if diagnostic_cases is not None and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
+    if args.contract_diagnostic and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
+        diagnostic_output = DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2
+    elif diagnostic_cases is not None and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
         diagnostic_output = DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2
     if args.preflight:
         report = await preflight_v2_provider_benchmark(
@@ -1689,6 +1702,15 @@ async def _run_chatbi_eval_v2_provider_async(
             fixture_path=args.fixture,
             output_path=diagnostic_output,
             diagnostic_case_ids=diagnostic_cases,
+            contract_diagnostic=args.contract_diagnostic,
+        )
+    elif args.contract_diagnostic:
+        report = await run_v2_provider_contract_diagnostic(
+            settings,
+            split=args.split,
+            dataset_path=args.dataset,
+            fixture_path=args.fixture,
+            output_path=diagnostic_output,
         )
     elif diagnostic_cases is not None:
         report = await run_v2_provider_diagnostic(
