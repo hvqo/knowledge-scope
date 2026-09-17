@@ -36,6 +36,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlglot import exp, parse_one
+from sqlglot.errors import SqlglotError
 
 from knowledge_scope.chatbi.agent import (
     CHATBI_ANALYSIS_PROMPT_VERSION,
@@ -58,8 +60,12 @@ from knowledge_scope.chatbi.execution import (
     SQLExecutionOutcome,
     SQLExecutionService,
 )
-from knowledge_scope.chatbi.nl2sql import NL2SQLService
-from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION, SQLCandidate
+from knowledge_scope.chatbi.nl2sql import NL2SQL_REASONING_MODE, NL2SQLService
+from knowledge_scope.chatbi.nl2sql_models import (
+    NL2SQL_PROMPT_VERSION,
+    ResultContract,
+    SQLCandidate,
+)
 from knowledge_scope.chatbi.policy import QueryPolicy, SQLDialect, default_query_policy
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
 from knowledge_scope.chatbi.schema_models import SchemaDiscoveryResult, SchemaObjectKind
@@ -575,6 +581,128 @@ class EvaluationStageState(_EvaluationModel):
     repair_generation: EvaluationStageStatus = "not_attempted"
 
 
+class ResultContractOutputColumnDiagnostic(_EvaluationModel):
+    """Safe semantic shape for one generated result-contract output column.
+
+    This intentionally omits aliases and raw derived expressions.  Source
+    references are bounded identifiers from the already parsed contract, not
+    provider response text.
+    """
+
+    kind: Literal["source", "aggregate", "derived"]
+    source: StrictStr | None = Field(default=None, max_length=512)
+    function: StrictStr | None = Field(default=None, max_length=32)
+    source_columns: tuple[StrictStr, ...] = Field(default=(), max_length=32)
+    expression_classification: (
+        Literal[
+            "column", "literal", "arithmetic", "conditional", "cast", "function", "other", "unknown"
+        ]
+        | None
+    ) = None
+
+
+class ResultContractOrderDiagnostic(_EvaluationModel):
+    """Safe ordering term retained for semantic contract diagnosis."""
+
+    key: StrictStr = Field(max_length=512)
+    direction: Literal["asc", "desc"]
+
+
+class ResultContractDiagnostic(_EvaluationModel):
+    """Repository-safe structural summary of one generated ResultContract."""
+
+    logical_stage: Literal["generation", "repair_generation"]
+    validation_status: Literal["structured_valid", "semantic_valid", "accepted"]
+    contract_version: StrictStr = Field(max_length=32)
+    row_grain: Literal["scalar", "detail", "grouped"]
+    grain_keys: tuple[StrictStr, ...] = Field(default=(), max_length=32)
+    output_columns: tuple[ResultContractOutputColumnDiagnostic, ...] = Field(
+        min_length=1,
+        max_length=128,
+    )
+    group_by: tuple[StrictStr, ...] = Field(default=(), max_length=32)
+    order_by: tuple[ResultContractOrderDiagnostic, ...] = Field(default=(), max_length=32)
+    limit: StrictInt | None = Field(default=None, ge=0, le=100_000)
+
+
+ResultContractComponentStatus = Literal["correct", "incorrect", "unavailable"]
+
+
+class ResultContractDiagnosticComparison(_EvaluationModel):
+    """Evaluation-only component comparison against the frozen semantic oracle."""
+
+    overall: Literal["exact", "partial", "incorrect", "unavailable"]
+    row_grain: ResultContractComponentStatus
+    grain_keys: ResultContractComponentStatus
+    output_columns: ResultContractComponentStatus
+    group_by: ResultContractComponentStatus
+    order_by: ResultContractComponentStatus
+    limit: ResultContractComponentStatus
+
+
+def _classify_result_contract_expression(expression: str) -> str:
+    """Return a bounded expression category without retaining expression text."""
+    try:
+        tree = parse_one(expression, dialect="postgres")
+    except (SqlglotError, RecursionError, ValueError):
+        return "unknown"
+    if tree.find(exp.Case) is not None:
+        return "conditional"
+    if tree.find(exp.Cast) is not None:
+        return "cast"
+    if any(
+        tree.find(node_type) is not None
+        for node_type in (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+    ):
+        return "arithmetic"
+    if isinstance(tree, exp.Column):
+        return "column"
+    if isinstance(tree, exp.Literal):
+        return "literal"
+    if isinstance(tree, exp.Func):
+        return "function"
+    return "other"
+
+
+def build_result_contract_diagnostic(
+    contract: ResultContract,
+    *,
+    logical_stage: Literal["generation", "repair_generation"],
+    validation_status: Literal["structured_valid", "semantic_valid", "accepted"],
+) -> ResultContractDiagnostic:
+    """Convert a parsed contract to a safe, deterministic diagnostic summary."""
+    if not isinstance(contract, ResultContract):
+        raise TypeError("contract must be a ResultContract")
+    columns = tuple(
+        ResultContractOutputColumnDiagnostic(
+            kind=column.kind.value,
+            source=column.source,
+            function=column.function.value if column.function is not None else None,
+            source_columns=tuple(column.source_columns),
+            expression_classification=(
+                _classify_result_contract_expression(column.expression)
+                if column.expression is not None
+                else None
+            ),
+        )
+        for column in contract.output_columns
+    )
+    return ResultContractDiagnostic(
+        logical_stage=logical_stage,
+        validation_status=validation_status,
+        contract_version=contract.contract_version,
+        row_grain=contract.row_grain.value,
+        grain_keys=tuple(contract.grain_keys),
+        output_columns=columns,
+        group_by=tuple(contract.group_by),
+        order_by=tuple(
+            ResultContractOrderDiagnostic(key=term.key, direction=term.direction.value)
+            for term in contract.order_by
+        ),
+        limit=contract.limit,
+    )
+
+
 class EvaluationQueryPolicy(_EvaluationModel):
     """Safe, non-secret copy of the policy values that affect evaluation."""
 
@@ -607,12 +735,34 @@ class EvaluationRuntimeConfiguration(_EvaluationModel):
 
     max_chars: StrictInt = Field(ge=1)
     nl2sql_max_tokens: StrictInt = Field(ge=1)
+    # ``None`` preserves pre-A5.7d4 artifacts whose effective reasoning mode
+    # was not recorded; new provider runs populate the explicit value.
+    nl2sql_reasoning: Literal["disabled", "low", "high"] | None = None
+    # Provider-effective fields are populated for new explicit-reasoning runs;
+    # missing values remain valid for pre-A5.7d5 artifacts.
+    nl2sql_thinking_type: Literal["enabled", "disabled"] | None = None
+    nl2sql_reasoning_effort: Literal["low", "high"] | None = None
     provider_timeout_seconds: StrictFloat = Field(gt=0)
     provider_max_retries: StrictInt = Field(ge=0)
     nl2sql_prompt_version: StrictStr = Field(min_length=1, max_length=64)
+    # Missing on historical artifacts; new runs explicitly record that the
+    # structured result contract is part of the generation boundary.
+    nl2sql_result_contract_enabled: StrictBool = False
     analysis_prompt_version: StrictStr = Field(min_length=1, max_length=64)
     agent_limits: EvaluationAgentLimits
     query_policy: EvaluationQueryPolicy
+
+    @model_validator(mode="after")
+    def validate_explicit_reasoning_provenance(self) -> EvaluationRuntimeConfiguration:
+        if self.nl2sql_reasoning in {"low", "high"} and (
+            self.nl2sql_thinking_type != "enabled"
+            or self.nl2sql_reasoning_effort != self.nl2sql_reasoning
+        ):
+            raise ValueError(
+                "explicit NL2SQL reasoning provenance must record enabled thinking "
+                "and the matching reasoning effort"
+            )
+        return self
 
 
 class EvaluationRunProvenance(_EvaluationModel):
@@ -870,9 +1020,17 @@ def _evaluation_configuration(
     return EvaluationRuntimeConfiguration(
         max_chars=max_chars,
         nl2sql_max_tokens=settings.chatbi_nl2sql_max_tokens,
+        nl2sql_reasoning=NL2SQL_REASONING_MODE,
+        nl2sql_thinking_type=(
+            "enabled" if NL2SQL_REASONING_MODE in {"low", "high"} else "disabled"
+        ),
+        nl2sql_reasoning_effort=(
+            NL2SQL_REASONING_MODE if NL2SQL_REASONING_MODE in {"low", "high"} else None
+        ),
         provider_timeout_seconds=settings.llm_timeout_seconds,
         provider_max_retries=settings.llm_max_retries,
         nl2sql_prompt_version=NL2SQL_PROMPT_VERSION,
+        nl2sql_result_contract_enabled=False,
         analysis_prompt_version=CHATBI_ANALYSIS_PROMPT_VERSION,
         agent_limits=EvaluationAgentLimits.model_validate(limits.model_dump(mode="json")),
         query_policy=_evaluation_policy(policy),
@@ -1214,6 +1372,7 @@ class ChatBIEvaluationObservation(_EvaluationModel):
     timings: ChatBIStageTimings = Field(default_factory=ChatBIStageTimings)
     stages: EvaluationStageState = Field(default_factory=EvaluationStageState)
     provider_invocations: list[LLMProviderInvocation] = Field(default_factory=list)
+    result_contract_diagnostics: list[ResultContractDiagnostic] = Field(default_factory=list)
 
 
 class ChatBICaseRunner(Protocol):
@@ -1627,6 +1786,7 @@ class _TimedGeneration:
         max_tokens: int | None = None,
         previous_sql: str | None = None,
         validation_error: str | None = None,
+        previous_contract: ResultContract | None = None,
     ) -> tuple[SQLCandidate, LLMResult]:
         is_repair = previous_sql is not None or validation_error is not None
         schema_before = self._timing.schema_prep_ms
@@ -1643,6 +1803,7 @@ class _TimedGeneration:
                     max_tokens=max_tokens,
                     previous_sql=previous_sql,
                     validation_error=validation_error,
+                    previous_contract=previous_contract,
                 )
             self._timing.stages = self._timing.stages.model_copy(update={stage: "passed"})
             return result
@@ -2128,9 +2289,15 @@ __all__ = [
     "ProviderChatBICaseRunner",
     "RepairOutcome",
     "ResultComparison",
+    "ResultContractComponentStatus",
+    "ResultContractDiagnostic",
+    "ResultContractDiagnosticComparison",
+    "ResultContractOrderDiagnostic",
+    "ResultContractOutputColumnDiagnostic",
     "StoredOfflineScenarioRunner",
     "answer_facts_match",
     "assert_no_oracle_leakage",
+    "build_result_contract_diagnostic",
     "compare_normalized_result",
     "current_git_dirty",
     "current_git_revision",

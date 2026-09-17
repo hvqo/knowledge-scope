@@ -33,6 +33,7 @@ from .execution import (
     redact_sql_literals,
 )
 from .nl2sql import (
+    NL2SQL_REASONING_MODE,
     NL2SQLService,
     RegisteredDataSourceProvider,
     SchemaDiscoveryProvider,
@@ -41,12 +42,28 @@ from .nl2sql import (
 )
 from .nl2sql_models import (
     NL2SQL_MAX_TOKENS,
+    NL2SQL_PROMPT_VERSION,
+    NL2SQL_RESULT_CONTRACT_PROMPT_VERSION,
+    RESULT_CONTRACT_VERSION,
     NL2SQLInput,
     NL2SQLResult,
+    ResultContract,
+    ResultContractSQLGenerationPayload,
     SQLCandidate,
     SQLGenerationPayload,
 )
 from .policy import QueryPolicy, SQLDialect, default_query_policy
+from .result_contract import (
+    AggregateFunction,
+    OutputColumnKind,
+    ResultGrain,
+    ResultOrderByTerm,
+    ResultOutputColumn,
+    SortDirection,
+    build_result_contract_prompt_example,
+    validate_result_contract,
+    validate_sql_result_contract,
+)
 from .schema_models import (
     SchemaColumn,
     SchemaContextBudgetError,
@@ -79,6 +96,11 @@ from .sql_validation import policy_fingerprint
 __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
     "NL2SQL_MAX_TOKENS",
+    "NL2SQL_PROMPT_VERSION",
+    "NL2SQL_REASONING_MODE",
+    "NL2SQL_RESULT_CONTRACT_PROMPT_VERSION",
+    "RESULT_CONTRACT_VERSION",
+    "AggregateFunction",
     "ChatBIAgentLimits",
     "ChatBIAgentService",
     "ChatBIAnalysisPayload",
@@ -99,6 +121,7 @@ __all__ = [
     "NL2SQLInput",
     "NL2SQLResult",
     "NL2SQLService",
+    "OutputColumnKind",
     "PostgresExecutionAdapter",
     "QueryAuditRecord",
     "QueryExecutionRequest",
@@ -108,6 +131,11 @@ __all__ = [
     "QueryTruncationReason",
     "RegisteredDataSourceProvider",
     "ResolvedDatabaseCredentials",
+    "ResultContract",
+    "ResultContractSQLGenerationPayload",
+    "ResultGrain",
+    "ResultOrderByTerm",
+    "ResultOutputColumn",
     "SQLCandidate",
     "SQLDialect",
     "SQLExecutionAuditRecord",
@@ -127,9 +155,11 @@ __all__ = [
     "SchemaUniqueConstraint",
     "SecretReferenceResolver",
     "SemanticSchemaContext",
+    "SortDirection",
     "build_chatbi_analysis_messages",
     "build_nl2sql_messages",
     "build_nl2sql_repair_messages",
+    "build_result_contract_prompt_example",
     "build_safe_search_path_statement",
     "build_semantic_schema_context",
     "create_postgres_schema_discovery_service",
@@ -139,4 +169,6 @@ __all__ = [
     "redact_sql_literals",
     "render_structural_schema_context",
     "validate_connection_ref",
+    "validate_result_contract",
+    "validate_sql_result_contract",
 ]

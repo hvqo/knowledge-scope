@@ -21,14 +21,32 @@ from knowledge_scope.chatbi import (
     SQLExecutionService,
 )
 from knowledge_scope.chatbi.discovery import create_postgres_schema_discovery_service
+from knowledge_scope.chatbi.errors import ChatBIErrorCategory
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
+from knowledge_scope.chatbi.nl2sql import LLMUsageMetadata, NL2SQLGenerationError
 from knowledge_scope.chatbi.policy import SQLDialect
 from knowledge_scope.chatbi.registry import DatabaseDataSourceProvider
+from knowledge_scope.chatbi.result_contract import (
+    OutputColumnKind,
+    ResultContract,
+    ResultGrain,
+    ResultOutputColumn,
+)
+from knowledge_scope.chatbi.schema_models import (
+    SchemaColumn,
+    SchemaDiscoveryResult,
+    SchemaObjectKind,
+    SchemaRelation,
+    SchemaSnapshot,
+    build_semantic_schema_context,
+)
 from knowledge_scope.evaluation.chatbi_evaluation import (
     ChatBIEvaluationObservation,
     ChatBIStageTimings,
+    EvaluationRuntimeConfiguration,
     EvaluationStageState,
     RepairOutcome,
+    build_result_contract_diagnostic,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     ChatBIEvaluationV2Category,
@@ -36,6 +54,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     load_chatbi_evaluation_dataset_v2,
 )
 from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
+    _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS,
     CHATBI_EVALUATION_V2_CONNECTION_REF,
     CHATBI_EVALUATION_V2_DATABASE_NAME,
     CHATBI_EVALUATION_V2_DATASOURCE_DISPLAY_NAME,
@@ -43,6 +62,7 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     CHATBI_EVALUATION_V2_SCHEMA,
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
+    DEFAULT_PROVIDER_OUTPUT_V2,
     EXPECTED_DATASET_FINGERPRINT_V2,
     EXPECTED_FIXTURE_DATA_FINGERPRINT_V2,
     EXPECTED_FIXTURE_FINGERPRINT_V2,
@@ -50,21 +70,30 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     V2ProviderBenchmarkError,
     V2ProviderCaseRecord,
     V2ProviderPreflightReport,
+    V2ProviderRun,
     V2ProviderSplit,
     _authoritative_record_matches,
     _build_v2_aggregate,
+    _compare_result_contract_diagnostic,
+    _expected_result_contract_diagnostic,
     _fixture_data_fingerprint,
     _fixture_schema_fingerprint,
     _fixture_schema_payload,
     _local_postgres_urls,
+    _parse_v2_contract_only_payload,
     _prepare_v2_preflight,
+    _ResultContractCapture,
     _TimingState,
+    _v2_configuration,
     _v2_query_policy,
     _v2_record,
     _v2_usage_aggregate,
     _V2AgentRunner,
+    build_v2_contract_only_messages,
     evaluate_v2_provider_cases,
     select_v2_provider_cases,
+    select_v2_provider_contract_diagnostic_cases,
+    select_v2_provider_diagnostic_cases,
 )
 from knowledge_scope.llm import LLMProviderInvocation, LLMRequest, LLMResult
 from knowledge_scope.llm.usage import (
@@ -83,6 +112,323 @@ def test_v2_provider_selects_only_the_frozen_dev_split() -> None:
     assert {case.split for case in selected} == {"dev"}
     with pytest.raises(V2ProviderBenchmarkError, match="permits only"):
         select_v2_provider_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_v2_structured_output_diagnostic_selects_exact_frozen_controls() -> None:
+    dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+
+    selected = select_v2_provider_diagnostic_cases(dataset, V2ProviderSplit.DEV.value)
+
+    assert [case.case_id for case in selected] == [
+        "aggregation-01",
+        "join-02",
+        "group-by-02",
+    ]
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+            ("aggregation-01", "join-02"),
+        )
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_diagnostic_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_v2_result_contract_diagnostic_selects_exact_eleven_frozen_dev_cases() -> None:
+    dataset = load_chatbi_evaluation_dataset_v2(DEFAULT_DATASET_V2)
+
+    selected = select_v2_provider_contract_diagnostic_cases(
+        dataset,
+        V2ProviderSplit.DEV.value,
+    )
+
+    assert [case.case_id for case in selected] == list(_RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS)
+    with pytest.raises(V2ProviderBenchmarkError):
+        select_v2_provider_contract_diagnostic_cases(
+            dataset,
+            V2ProviderSplit.DEV.value,
+            _RESULT_CONTRACT_DIAGNOSTIC_CASE_IDS[:-1],
+        )
+    with pytest.raises(V2ProviderBenchmarkError, match="only"):
+        select_v2_provider_contract_diagnostic_cases(dataset, V2ProviderSplit.TEST.value)
+
+
+def test_result_contract_diagnostic_omits_raw_expression_and_alias() -> None:
+    contract = ResultContract(
+        row_grain=ResultGrain.DETAIL,
+        grain_keys=("public.sales.sale_id",),
+        output_columns=(
+            ResultOutputColumn(
+                kind=OutputColumnKind.SOURCE,
+                source="public.sales.amount",
+                alias="sensitive_alias",
+            ),
+            ResultOutputColumn(
+                kind=OutputColumnKind.DERIVED,
+                expression="amount * 987654321",
+                source_columns=("public.sales.amount",),
+                alias="secret_total",
+            ),
+        ),
+    )
+
+    summary = build_result_contract_diagnostic(
+        contract,
+        logical_stage="generation",
+        validation_status="accepted",
+    )
+    encoded = json.dumps(summary.model_dump(mode="json"), ensure_ascii=False)
+
+    assert summary.output_columns[1].expression_classification == "arithmetic"
+    assert "987654321" not in encoded
+    assert "sensitive_alias" not in encoded
+    assert "secret_total" not in encoded
+
+
+def test_contract_capture_records_success_and_semantic_failure_without_raw_text() -> None:
+    contract = ResultContract(
+        row_grain=ResultGrain.DETAIL,
+        grain_keys=("public.sales.sale_id",),
+        output_columns=(
+            ResultOutputColumn(kind=OutputColumnKind.SOURCE, source="public.sales.amount"),
+        ),
+    )
+    capture = _ResultContractCapture()
+    candidate = SimpleNamespace(result_contract=contract)
+    capture.capture_success(candidate, is_repair=False)  # type: ignore[arg-type]
+    error = NL2SQLGenerationError(
+        ChatBIErrorCategory.RESULT_CONTRACT_INCONSISTENT,
+        "contract inconsistent",
+        usage=LLMUsageMetadata(
+            provider="fake",
+            model="fake",
+            input_tokens=1,
+            output_tokens=2,
+            provider_attempts=1,
+        ),
+        result_contract=contract,
+        boundary_observation=SimpleNamespace(semantic_contract_validation_status="passed"),
+    )
+    capture.capture_failure(error, is_repair=True)
+
+    assert [item.logical_stage for item in capture.diagnostics] == [
+        "generation",
+        "repair_generation",
+    ]
+    assert all(
+        "contract inconsistent" not in item.model_dump_json() for item in capture.diagnostics
+    )
+
+
+def test_result_contract_comparison_has_explicit_unavailable_and_exact_states() -> None:
+    expected = _expected_result_contract_diagnostic("simple-04")
+    assert expected is not None
+
+    unavailable = _compare_result_contract_diagnostic(None, expected)
+    assert unavailable.overall == "unavailable"
+    assert unavailable.output_columns == "unavailable"
+
+    exact = _compare_result_contract_diagnostic(expected, expected)
+    assert exact.overall == "exact"
+    assert all(
+        getattr(exact, name) == "correct"
+        for name in ("row_grain", "grain_keys", "output_columns", "group_by", "order_by", "limit")
+    )
+
+
+def _contract_only_schema_result() -> SchemaDiscoveryResult:
+    datasource_id = uuid4()
+    snapshot = SchemaSnapshot(
+        datasource_id=datasource_id,
+        dialect=SQLDialect.POSTGRESQL,
+        database_name="chatbi_eval",
+        schemas=("chatbi_demo",),
+        relations=(
+            SchemaRelation(
+                schema_name="chatbi_demo",
+                name="customers",
+                kind=SchemaObjectKind.TABLE,
+                columns=(
+                    SchemaColumn(
+                        name="customer_id",
+                        normalized_type="integer",
+                        nullable=False,
+                        ordinal=1,
+                    ),
+                    SchemaColumn(
+                        name="customer_name",
+                        normalized_type="text",
+                        nullable=False,
+                        ordinal=2,
+                    ),
+                ),
+                primary_key=("customer_id",),
+            ),
+        ),
+    )
+    return SchemaDiscoveryResult(
+        snapshot=snapshot,
+        fingerprint=snapshot.fingerprint,
+        context=build_semantic_schema_context(snapshot, max_chars=24_000),
+    )
+
+
+def _contract_only_result_contract() -> ResultContract:
+    return ResultContract(
+        row_grain=ResultGrain.DETAIL,
+        grain_keys=("chatbi_demo.customers.customer_id",),
+        output_columns=(
+            ResultOutputColumn(
+                kind=OutputColumnKind.SOURCE,
+                source="chatbi_demo.customers.customer_name",
+            ),
+        ),
+    )
+
+
+def test_contract_only_parser_accepts_only_one_structured_result_contract() -> None:
+    contract_json = json.dumps(
+        {"result_contract": _contract_only_result_contract().model_dump(mode="json")}
+    )
+
+    parsed, stage = _parse_v2_contract_only_payload(contract_json)
+
+    assert stage == "parsed"
+    assert parsed == _contract_only_result_contract()
+
+    extra_sql, extra_stage = _parse_v2_contract_only_payload(
+        contract_json[:-1] + ',"sql":"SELECT 1"}'
+    )
+    assert extra_sql is None
+    assert extra_stage == "top_level_schema_invalid"
+
+    duplicate, duplicate_stage = _parse_v2_contract_only_payload(
+        '{"result_contract":{},"result_contract":{}}'
+    )
+    assert duplicate is None
+    assert duplicate_stage == "json_decode_failed"
+
+    non_finite, non_finite_stage = _parse_v2_contract_only_payload(
+        '{"result_contract":{"row_grain":"detail","grain_keys":[],'
+        '"output_columns":[{"kind":"source","source":"x"}],'
+        '"group_by":[],"order_by":[],"limit":NaN}}'
+    )
+    assert non_finite is None
+    assert non_finite_stage == "json_decode_failed"
+
+
+def test_contract_only_prompt_is_schema_data_and_contains_no_sql_generation_contract() -> None:
+    discovered = _contract_only_schema_result()
+    policy = QueryPolicy(allowed_schemas=("chatbi_demo",))
+
+    messages = build_v2_contract_only_messages(
+        question="列出客户名称",
+        discovered=discovered,
+        policy=policy,
+    )
+    encoded = "\n".join(message.content for message in messages)
+
+    assert [message.role for message in messages] == ["system", "user"]
+    assert "result_contract" in encoded
+    assert '"sql"' not in encoded.lower()
+    assert "select" not in encoded.lower()
+    assert "chatbi_demo" in encoded
+    assert "customer_name" in encoded
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("chatbi-eval-v2-dev-run-6.json", "chatbi-eval-v2-dev-run-11.json"),
+)
+def test_historical_provider_artifacts_without_contract_diagnostics_remain_readable(
+    artifact_name: str,
+) -> None:
+    artifact = DEFAULT_PROVIDER_OUTPUT_V2.parent / artifact_name
+    if not artifact.is_file():
+        pytest.skip("historical provider artifact is not present in the local runtime")
+
+    run = V2ProviderRun.model_validate_json(artifact.read_text(encoding="utf-8"))
+
+    assert len(run.records) == 50
+    assert all(record.result_contract_diagnostics == [] for record in run.records)
+
+
+def test_v2_provenance_records_retained_nl2sql_reasoning_mode() -> None:
+    settings = Settings(_env_file=None)
+
+    configuration = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    assert configuration.nl2sql_max_tokens == 1024
+    assert configuration.nl2sql_reasoning == "disabled"
+    assert configuration.nl2sql_thinking_type == "disabled"
+    assert configuration.nl2sql_reasoning_effort is None
+    assert configuration.nl2sql_prompt_version == "a5.3-v3"
+    assert configuration.nl2sql_result_contract_enabled is False
+
+    diagnostic_configuration = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+        result_contract_enabled=True,
+    )
+    assert diagnostic_configuration.nl2sql_prompt_version == "a5.3-v4"
+    assert diagnostic_configuration.nl2sql_result_contract_enabled is True
+
+
+def test_v2_provenance_uses_resolved_budgets() -> None:
+    settings = Settings(
+        _env_file=None,
+        chatbi_nl2sql_max_tokens=3072,
+        chatbi_analysis_max_tokens=768,
+    )
+
+    configuration = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    assert configuration.nl2sql_max_tokens == 3072
+    assert configuration.agent_limits.analysis_max_tokens == 768
+
+
+def test_runtime_provenance_retains_historical_low_and_high_modes() -> None:
+    settings = Settings(_env_file=None)
+    baseline = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    )
+
+    for mode in ("low", "high"):
+        historical_payload = baseline.model_dump(mode="json")
+        historical_payload.update(
+            nl2sql_reasoning=mode,
+            nl2sql_thinking_type="enabled",
+            nl2sql_reasoning_effort=mode,
+        )
+        historical = EvaluationRuntimeConfiguration.model_validate(historical_payload)
+        assert historical.nl2sql_reasoning == mode
+        assert historical.nl2sql_thinking_type == "enabled"
+        assert historical.nl2sql_reasoning_effort == mode
+
+
+def test_historical_provenance_without_result_contract_flag_remains_readable() -> None:
+    settings = Settings(_env_file=None)
+    payload = _v2_configuration(
+        settings,
+        _v2_query_policy(settings),
+        max_chars=settings.chatbi_schema_context_max_chars,
+    ).model_dump(mode="json")
+    payload.pop("nl2sql_result_contract_enabled")
+
+    historical = EvaluationRuntimeConfiguration.model_validate(payload)
+
+    assert historical.nl2sql_result_contract_enabled is False
 
 
 def test_v2_provider_cli_rejects_test_before_provider_setup(
@@ -623,7 +969,11 @@ class _DeterministicV2Gateway:
         self.requests.append(request)
         if request.task_type == "nl2sql":
             response = (
-                '{"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
+                '{"result_contract":{"row_grain":"detail","grain_keys":["chatbi_demo.customers.customer_id"],'
+                '"output_columns":[{"kind":"source","source":"chatbi_demo.customers.customer_name"}],'
+                '"group_by":[],"order_by":[{"key":"chatbi_demo.customers.customer_id",'
+                '"direction":"asc"}],"limit":null},'
+                '"sql":"SELECT customer_name FROM chatbi_demo.customers ORDER BY customer_id"}'
             )
             input_tokens, output_tokens = 13, 8
         elif request.task_type == "chatbi_analysis":
