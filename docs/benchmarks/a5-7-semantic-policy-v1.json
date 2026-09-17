@@ -1,0 +1,241 @@
+{
+  "schema_version": "a5.7f2-semantic-policy-v1",
+  "provenance": "Human product-semantics review of the frozen ChatBI v2 DEV questions; evaluation-only metadata, not automatic ground truth.",
+  "dataset_fingerprint": "60c75c597da8fc71a0fa5b25d335b63410b44a4ab3a403da40ca72c5ae375ab3",
+  "fixture_version": "chatbi-demo-v2",
+  "fixture_fingerprint": "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d",
+  "fixture_schema_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+  "schema": {
+    "schema_version": "a5.7f2c-schema-v1",
+    "fixture_version": "chatbi-demo-v2",
+    "fixture_fingerprint": "fd972106c39c7a8b31b57975118708e213a32e4e008ee13fafc15b1ea1b5182d",
+    "fixture_schema_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+    "schema_metadata_fingerprint": "592681fd7c63ee654f87ecfac62455536f90c994fc74fc4e00973743be607071",
+    "catalog_schema": "chatbi_demo",
+    "relations": [
+      {
+        "relation": "chatbi_demo.customers",
+        "kind": "table",
+        "columns": ["customer_id", "customer_name"],
+        "column_metadata": [
+          {"position": 1, "name": "customer_id", "type": "bigint", "nullable": false},
+          {"position": 2, "name": "customer_name", "type": "text", "nullable": false}
+        ],
+        "primary_key": ["customer_id"],
+        "unique_constraints": [],
+        "not_null_columns": ["customer_id", "customer_name"],
+        "foreign_keys": [],
+        "check_constraints": []
+      },
+      {
+        "relation": "chatbi_demo.regions",
+        "kind": "table",
+        "columns": ["region_code", "region_name", "market"],
+        "column_metadata": [
+          {"position": 1, "name": "region_code", "type": "text", "nullable": false},
+          {"position": 2, "name": "region_name", "type": "text", "nullable": false},
+          {"position": 3, "name": "market", "type": "text", "nullable": false}
+        ],
+        "primary_key": ["region_code"],
+        "unique_constraints": [["region_name"]],
+        "not_null_columns": ["region_code", "region_name", "market"],
+        "foreign_keys": [],
+        "check_constraints": []
+      },
+      {
+        "relation": "chatbi_demo.sales",
+        "kind": "table",
+        "columns": ["sale_id", "customer_id", "region_code", "sold_on", "amount"],
+        "column_metadata": [
+          {"position": 1, "name": "sale_id", "type": "bigint", "nullable": false},
+          {"position": 2, "name": "customer_id", "type": "bigint", "nullable": false},
+          {"position": 3, "name": "region_code", "type": "text", "nullable": false},
+          {"position": 4, "name": "sold_on", "type": "date", "nullable": false},
+          {"position": 5, "name": "amount", "type": "numeric(12,2)", "nullable": false}
+        ],
+        "primary_key": ["sale_id"],
+        "unique_constraints": [],
+        "not_null_columns": ["sale_id", "customer_id", "region_code", "sold_on", "amount"],
+        "foreign_keys": [
+          {
+            "source_relation": "chatbi_demo.sales",
+            "source_columns": ["customer_id"],
+            "target_relation": "chatbi_demo.customers",
+            "target_columns": ["customer_id"]
+          },
+          {
+            "source_relation": "chatbi_demo.sales",
+            "source_columns": ["region_code"],
+            "target_relation": "chatbi_demo.regions",
+            "target_columns": ["region_code"]
+          }
+        ],
+        "check_constraints": [
+          {"columns": ["amount"], "definition": "CHECK (amount >= 0::numeric)"}
+        ]
+      },
+      {
+        "relation": "chatbi_demo.region_sales",
+        "kind": "view",
+        "columns": ["region_code", "region_name", "sale_count", "total_amount"],
+        "column_metadata": [
+          {"position": 1, "name": "region_code", "type": "text", "nullable": true},
+          {"position": 2, "name": "region_name", "type": "text", "nullable": true},
+          {"position": 3, "name": "sale_count", "type": "bigint", "nullable": true},
+          {"position": 4, "name": "total_amount", "type": "numeric", "nullable": true}
+        ],
+        "primary_key": [],
+        "unique_constraints": [],
+        "not_null_columns": [],
+        "foreign_keys": [],
+        "check_constraints": []
+      }
+    ]
+  },
+  "defaults": {
+    "row_grain": "detail",
+    "required_fields": [],
+    "optional_fields": [],
+    "identity_fields": [],
+    "semantic_order_required": false,
+    "allow_safe_extra_fields": false
+  },
+  "cases": {
+    "join-01": {
+      "row_grain": "detail",
+      "required_fields": ["customer_name", "amount"],
+      "optional_fields": ["sale_id"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "join-03": {
+      "row_grain": "detail",
+      "required_fields": ["customer_name", "amount"],
+      "optional_fields": ["sale_id"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "join-04": {
+      "row_grain": "detail",
+      "required_fields": ["customer_name", "sold_on"],
+      "optional_fields": ["sale_id"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "null-03": {
+      "row_grain": "entity",
+      "required_fields": ["customer_id", "customer_name", "aggregate:max:sold_on"],
+      "optional_fields": [],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "derived-03": {
+      "row_grain": "entity",
+      "required_fields": ["customer_id", "customer_name", "aggregate:avg:amount"],
+      "optional_fields": [],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "cte-set-01": {
+      "row_grain": "grouped",
+      "required_fields": ["customer_id", "total_amount"],
+      "optional_fields": [],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "join-05": {
+      "row_grain": "entity",
+      "required_fields": ["customer_id", "aggregate:min:sold_on"],
+      "optional_fields": ["customer_name"],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "group-by-01": {
+      "row_grain": "grouped",
+      "required_fields": ["region_name", "aggregate:count:sale_id", "aggregate:sum:amount"],
+      "optional_fields": [],
+      "identity_fields": ["region_code"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "group-by-04": {
+      "row_grain": "grouped",
+      "required_fields": ["region_name", "aggregate:max:amount"],
+      "optional_fields": [],
+      "identity_fields": ["region_code"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "group-by-05": {
+      "row_grain": "grouped",
+      "required_fields": ["region_name", "aggregate:avg:amount"],
+      "optional_fields": [],
+      "identity_fields": ["region_code"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "multi-join-02": {
+      "row_grain": "grouped",
+      "required_fields": ["market", "region_name", "aggregate:count:distinct:customer_id", "aggregate:sum:amount"],
+      "optional_fields": [],
+      "identity_fields": ["region_code"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "derived-01": {
+      "row_grain": "detail",
+      "required_fields": ["expression:amount - (select avg(amount) from chatbi_demo.sales)"],
+      "optional_fields": ["sale_id", "amount"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "cte-set-02": {
+      "row_grain": "detail",
+      "required_fields": ["sale_id", "amount"],
+      "optional_fields": ["region_name"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "simple-02": {
+      "row_grain": "detail",
+      "required_fields": ["sale_id", "region_name", "amount"],
+      "optional_fields": [],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": true,
+      "allow_safe_extra_fields": false
+    },
+    "join-06": {
+      "row_grain": "detail",
+      "required_fields": ["customer_name"],
+      "optional_fields": ["sale_id", "amount"],
+      "identity_fields": ["sale_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "multi-join-01": {
+      "row_grain": "grouped",
+      "required_fields": ["customer_id", "customer_name", "region_name", "aggregate:count:sale_id", "aggregate:sum:amount"],
+      "optional_fields": [],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    },
+    "multi-join-03": {
+      "row_grain": "grouped",
+      "required_fields": ["region_name", "customer_id", "customer_name", "aggregate:count:*"],
+      "optional_fields": [],
+      "identity_fields": ["customer_id"],
+      "semantic_order_required": false,
+      "allow_safe_extra_fields": false
+    }
+  }
+}

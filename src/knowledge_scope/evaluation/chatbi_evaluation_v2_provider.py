@@ -125,6 +125,10 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     load_chatbi_evaluation_dataset_v2,
     structured_result_facts_match,
 )
+from knowledge_scope.evaluation.chatbi_schema_fingerprint import (
+    canonical_schema_payload,
+    schema_fingerprint,
+)
 from knowledge_scope.llm import LLMGateway, LLMResult, create_llm_provider
 from knowledge_scope.llm.errors import LLMError
 from knowledge_scope.llm.observability import provider_observation_context
@@ -1606,20 +1610,10 @@ def _fixture_schema_payload(
             }
         )
 
-    relations = []
-    for key in sorted(relation_map):
-        relation = relation_map[key]
-        columns = relation["columns"]
-        constraints = relation["constraints"]
-        assert isinstance(columns, list)
-        assert isinstance(constraints, list)
-        relation["columns"] = sorted(columns, key=lambda column: column["position"])
-        relation["constraints"] = sorted(
-            constraints,
-            key=lambda constraint: _sha256_json(constraint),
-        )
-        relations.append(relation)
-    return {"schema": CHATBI_EVALUATION_V2_SCHEMA, "relations": relations}
+    return canonical_schema_payload(
+        schema=CHATBI_EVALUATION_V2_SCHEMA,
+        relations=relation_map.values(),
+    )
 
 
 async def _fixture_schema_fingerprint(database_url: str) -> str:
@@ -1636,7 +1630,7 @@ async def _fixture_schema_fingerprint(database_url: str) -> str:
                 {"schema": CHATBI_EVALUATION_V2_SCHEMA},
             )
             payload = _fixture_schema_payload(relations.fetchall(), constraints.fetchall())
-            return _sha256_json(payload)
+            return schema_fingerprint(payload)
     except V2ProviderBenchmarkError:
         raise
     except SQLAlchemyError as error:
