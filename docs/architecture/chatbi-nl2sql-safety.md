@@ -19,9 +19,9 @@ A5.2 只读 schema discovery
         ↓
 SchemaDiscoveryResult（当前 snapshot + 已预算 context）
         ↓
-LLMGateway（一次结构化 JSON：ResultContract + sql）
+LLMGateway（一次结构化 JSON：SQL-only，a5.3-v3）
         ↓
-ResultContract 结构校验 + SQL/ResultContract 一致性校验
+SQL 结构校验
         ↓
 SQLCandidate（应用补充 provider/model/context fingerprint）
         ↓
@@ -45,9 +45,18 @@ authoritative snapshot。低层 `_SQLSafetyValidator` 和
 SQL 候选进入上述 trusted validation path，不能接收调用方传入或反序列化的
 `ValidatedSQL`。
 
-## ResultContract
+## ResultContract（显式评测/诊断能力）
 
-NL2SQL 的一次结构化响应使用 `a5.3-v4` contract：
+生产 NL2SQL 默认使用 `a5.3-v3` 的 SQL-only 响应：
+
+```json
+{"sql":"SELECT ..."}
+```
+
+`ResultContract + SQL` 的 `a5.3-v4` 响应、schema/语义校验和 SQL 一致性诊断仍保留，
+但必须由调用方显式启用 `result_contract_enabled` 才会进入该实验路径。它用于历史评测、
+结构诊断和实验对比，不是生产请求的必需字段；普通请求不会因为缺少或无法生成
+`ResultContract` 而失败。下面的结构仅描述该显式诊断协议：
 
 ```json
 {
@@ -138,9 +147,10 @@ delimiter-safe escaping；标识符
 错误使用独立的 `ChatBIErrorCategory`。错误文本不包含 raw provider payload、
 `connection_ref`、数据库 URL 或凭据。
 
-`chatbi nl2sql` 是开发者 smoke-test：它先从注册数据源执行只读 schema
-discovery，再生成 ResultContract + SQL，进行结构一致性和安全验证，输出安全的结构化
-结果；没有 SQL 执行 endpoint。
+`chatbi nl2sql` 是开发者 smoke-test：它先从注册数据源执行只读 schema discovery，
+再生成 `a5.3-v3` SQL-only 响应，进入 A5.3 trusted SQL validation；完整生产链路随后
+进入只读执行，本命令本身没有 SQL 执行 endpoint。`a5.3-v4` ResultContract + SQL 仅在显式
+评测/诊断配置下使用。
 当前执行 adapter 只接受同一 trusted validation path 产生的内部结果，见
 [`chatbi-sql-execution.md`](chatbi-sql-execution.md)；本模块仍没有参数绑定、结果行脱敏、MCP、
 NL2SQL 质量评测或前端 ChatBI 页面；有界 Agent 的编排见

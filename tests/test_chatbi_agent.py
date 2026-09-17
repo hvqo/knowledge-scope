@@ -38,7 +38,14 @@ DATASOURCE_ID = UUID("11111111-1111-4111-8111-111111111111")
 _FINGERPRINT = "a" * 64
 
 
-def _generation_payload(sql: str = "SELECT 1", *, expression: str = "1") -> str:
+def _generation_payload(
+    sql: str = "SELECT 1",
+    *,
+    expression: str = "1",
+    result_contract: bool = False,
+) -> str:
+    if not result_contract:
+        return json.dumps({"sql": sql}, ensure_ascii=False)
     return json.dumps(
         {
             "result_contract": {
@@ -231,7 +238,11 @@ class _FailingGateway:
         raise error
 
 
-def _registered_generation_service(gateway: _ScriptedGateway) -> NL2SQLService:
+def _registered_generation_service(
+    gateway: _ScriptedGateway,
+    *,
+    result_contract_enabled: bool = False,
+) -> NL2SQLService:
     """Use the real registered-datasource generation path with a tiny snapshot."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
     data_source = DataSource(
@@ -279,6 +290,7 @@ def _registered_generation_service(gateway: _ScriptedGateway) -> NL2SQLService:
         gateway,
         schema_discovery=_Discovery(),
         data_source_provider=_Provider(),
+        result_contract_enabled=result_contract_enabled,
     )
 
 
@@ -516,12 +528,12 @@ async def test_malformed_generation_is_repaired_with_bounded_feedback() -> None:
 async def test_result_contract_mismatch_uses_one_bounded_repair() -> None:
     gateway = _ScriptedGateway(
         [
-            _generation_payload(expression="2"),
-            _generation_payload(),
+            _generation_payload(expression="2", result_contract=True),
+            _generation_payload(result_contract=True),
             '{"answer":"1","warning":null}',
         ]
     )
-    generation = _registered_generation_service(gateway)
+    generation = _registered_generation_service(gateway, result_contract_enabled=True)
     execution = _FakeExecution([_execution_result(rows=[["1"]])])
 
     result = await ChatBIAgentService(generation, execution, gateway).ask(

@@ -39,39 +39,12 @@ class _DeterministicAgentGateway:
         if request.task_type == "nl2sql":
             text = json.dumps(
                 {
-                    "result_contract": {
-                        "row_grain": "grouped",
-                        "grain_keys": ["chatbi_demo.customers.customer_id"],
-                        "output_columns": [
-                            {
-                                "kind": "source",
-                                "source": "chatbi_demo.customers.customer_name",
-                            },
-                            {
-                                "kind": "aggregate",
-                                "function": "sum",
-                                "source": "chatbi_demo.sales.amount",
-                                "alias": "total_amount",
-                            },
-                        ],
-                        "group_by": [
-                            "chatbi_demo.customers.customer_id",
-                            "chatbi_demo.customers.customer_name",
-                        ],
-                        "order_by": [
-                            {
-                                "key": "chatbi_demo.customers.customer_name",
-                                "direction": "asc",
-                            }
-                        ],
-                        "limit": None,
-                    },
                     "sql": (
                         "SELECT c.customer_name, SUM(s.amount) AS total_amount "
                         "FROM chatbi_demo.sales AS s "
                         "JOIN chatbi_demo.customers AS c ON c.customer_id = s.customer_id "
                         "GROUP BY c.customer_id, c.customer_name ORDER BY c.customer_name"
-                    ),
+                    )
                 },
                 ensure_ascii=False,
             )
@@ -402,6 +375,7 @@ async def test_real_postgresql_result_contract_shapes(
             gateway,
             schema_discovery=discovery,
             data_source_provider=registry,
+            result_contract_enabled=True,
         )
         execution = SQLExecutionService(
             generation,

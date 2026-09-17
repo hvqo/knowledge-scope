@@ -20,7 +20,8 @@ from .result_contract import RESULT_CONTRACT_VERSION, ResultContract
 from .schema_models import SchemaSnapshot, SemanticSchemaContext
 
 NL2SQL_SCHEMA_VERSION: Final = "1.0"
-NL2SQL_PROMPT_VERSION: Final = "a5.3-v4"
+NL2SQL_PROMPT_VERSION: Final = "a5.3-v3"
+NL2SQL_RESULT_CONTRACT_PROMPT_VERSION: Final = "a5.3-v4"
 SQL_VALIDATION_VERSION: Final = "1.0"
 NL2SQL_MAX_TOKENS: Final = 16_384
 NL2SQL_FINGERPRINT_PATTERN: Final = r"^[0-9a-f]{64}$"
@@ -84,6 +85,17 @@ class _NL2SQLRequest(_NL2SQLModel):
 
 class SQLGenerationPayload(_NL2SQLModel):
     """The only model-produced value accepted from a structured response."""
+
+    sql: StrictStr = Field(min_length=1, max_length=100_000)
+
+    @field_validator("sql")
+    @classmethod
+    def normalize_sql(cls, value: str) -> str:
+        return _trimmed_required(value, "sql")
+
+
+class ResultContractSQLGenerationPayload(_NL2SQLModel):
+    """Explicitly opt-in experimental ResultContract + SQL response shape."""
 
     result_contract: ResultContract
     sql: StrictStr = Field(min_length=1, max_length=100_000)
@@ -258,12 +270,14 @@ __all__ = [
     "NL2SQL_FINGERPRINT_PATTERN",
     "NL2SQL_MAX_TOKENS",
     "NL2SQL_PROMPT_VERSION",
+    "NL2SQL_RESULT_CONTRACT_PROMPT_VERSION",
     "NL2SQL_SCHEMA_VERSION",
     "RESULT_CONTRACT_VERSION",
     "SQL_VALIDATION_VERSION",
     "NL2SQLInput",
     "NL2SQLResult",
     "ResultContract",
+    "ResultContractSQLGenerationPayload",
     "SQLCandidate",
     "SQLGenerationPayload",
 ]

@@ -10,8 +10,7 @@ PostgreSQL schema discovery、NL2SQL 校验和只读执行服务，不建立第�
 question
   -> registered datasource lookup
   -> trusted schema discovery
-  -> NL2SQL LLM call（a5.3-v4：ResultContract + SQL）
-  -> ResultContract / SQL 一致性校验
+  -> NL2SQL LLM call（a5.3-v3：SQL-only）
   -> SQLCandidate（不可信）
   -> fresh datasource-bound AST / policy validation
   -> read-only PostgreSQL execution
@@ -24,6 +23,11 @@ question
 `ValidatedSQL` 只是校验结果和审计投影，不是授权 capability；调用方不能用它、序列化后的
 对象或 caller-owned `SchemaSnapshot` 跳过这条路径。A5.4 的执行服务是唯一的实际 SQL 执行
 入口。
+
+生产 ChatBI 默认不要求模型生成 `ResultContract`。`a5.3-v4` 的
+ResultContract + SQL 结构、解析器、语义诊断和一致性工具仍保留为显式的评测/诊断能力；
+只有调用方明确启用诊断配置时才使用它们。正常 NL2SQL 初次生成和有界修复都使用
+`a5.3-v3` 的 SQL-only 响应，因此契约诊断失败不会阻断正常 SQL 生成。
 
 ## 有界循环
 

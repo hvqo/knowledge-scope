@@ -103,8 +103,15 @@ def _candidate(request: _NL2SQLRequest, sql: str) -> SQLCandidate:
     )
 
 
-def _generation_payload(sql: str, *, expression: str = "1") -> str:
+def _generation_payload(
+    sql: str,
+    *,
+    expression: str = "1",
+    result_contract: bool = False,
+) -> str:
     """Build the smallest structured response used by provider-free tests."""
+    if not result_contract:
+        return json.dumps({"sql": sql}, ensure_ascii=False)
     normalized = " ".join(sql.strip().split()).lower()
     if normalized == "select id from public.sales":
         contract = {
@@ -256,9 +263,13 @@ async def test_default_nl2sql_and_repair_use_disabled_reasoning_and_1024_tokens(
     )
 
     assert candidate.sql == "SELECT 1"
+    assert candidate.prompt_version == "a5.3-v3"
+    assert candidate.result_contract is None
     assert [item.max_tokens for item in gateway.requests] == [1024, 1024]
     assert [item.reasoning for item in gateway.requests] == ["disabled", "disabled"]
     assert gateway.requests[0].messages[0] == gateway.requests[1].messages[0]
+    assert "result_contract" not in gateway.requests[0].messages[0].content
+    assert "previous_result_contract" not in gateway.requests[1].messages[1].content
     assert _result.structured_output_observation.logical_stage == "repair_generation"
 
 
@@ -284,9 +295,14 @@ async def test_structured_output_boundary_accepts_supported_contracts(
 ) -> None:
     gateway = _FakeGateway(_structured_payload(contract, sql))
 
-    candidate, result = await NL2SQLService(gateway)._generate_with_result(_request())
+    candidate, result = await NL2SQLService(
+        gateway,
+        result_contract_enabled=True,
+    )._generate_with_result(_request())
 
     assert candidate.sql == sql, name
+    assert candidate.prompt_version == "a5.3-v4"
+    assert candidate.result_contract is not None
     assert result.structured_output_observation is not None
     observation = result.structured_output_observation
     assert observation.json_decode_status == "passed"
@@ -306,12 +322,13 @@ def test_prompt_structural_example_matches_production_parser() -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    prompt = build_nl2sql_messages(_request())[0].content
+    prompt = build_nl2sql_messages(_request(), result_contract_enabled=True)[0].content
 
     assert encoded_example in prompt
     payload, observation = _parse_generation_payload_with_observation(
         encoded_example,
         logical_stage="generation",
+        result_contract_enabled=True,
     )
     assert [column.kind.value for column in payload.result_contract.output_columns] == [
         "source",
@@ -357,7 +374,11 @@ def test_structured_output_boundary_reports_safe_parse_diagnostics(
     stage: str,
 ) -> None:
     with pytest.raises(StructuredOutputError) as error:
-        _parse_generation_payload_with_observation(text, logical_stage="generation")
+        _parse_generation_payload_with_observation(
+            text,
+            logical_stage="generation",
+            result_contract_enabled=True,
+        )
 
     diagnostic = error.value.diagnostic
     observation = error.value.boundary_observation
@@ -379,7 +400,11 @@ def test_structured_output_boundary_sanitizes_hostile_field_paths() -> None:
     )
 
     with pytest.raises(StructuredOutputError) as error:
-        _parse_generation_payload_with_observation(text, logical_stage="generation")
+        _parse_generation_payload_with_observation(
+            text,
+            logical_stage="generation",
+            result_contract_enabled=True,
+        )
 
     observation = error.value.boundary_observation
     assert observation is not None
@@ -398,7 +423,8 @@ async def test_structured_output_boundary_separates_semantic_and_consistency_fai
     }
     with pytest.raises(NL2SQLGenerationError) as semantic_error:
         await NL2SQLService(
-            _FakeGateway(_structured_payload(semantic_contract, "SELECT amount FROM public.sales"))
+            _FakeGateway(_structured_payload(semantic_contract, "SELECT amount FROM public.sales")),
+            result_contract_enabled=True,
         )._generate_with_result(_request())
     assert semantic_error.value.diagnostic.stage == "result_contract_semantic_validation_failed"
     assert semantic_error.value.boundary_observation.semantic_contract_validation_status == (
@@ -407,7 +433,8 @@ async def test_structured_output_boundary_separates_semantic_and_consistency_fai
 
     with pytest.raises(NL2SQLGenerationError) as consistency_error:
         await NL2SQLService(
-            _FakeGateway(_structured_payload(_detail_contract(), "SELECT id FROM public.sales"))
+            _FakeGateway(_structured_payload(_detail_contract(), "SELECT id FROM public.sales")),
+            result_contract_enabled=True,
         )._generate_with_result(_request())
     assert consistency_error.value.diagnostic.stage == "sql_contract_consistency_failed"
     assert consistency_error.value.boundary_observation.sql_contract_consistency_status == (
@@ -608,7 +635,7 @@ async def test_production_validation_uses_discovered_snapshot_not_caller_snapsho
             max_chars=10_000,
         )
 
-    assert error.value.category is ChatBIErrorCategory.RESULT_CONTRACT_INCONSISTENT
+    assert error.value.category is ChatBIErrorCategory.UNKNOWN_TABLE
 
 
 @pytest.mark.anyio
@@ -660,7 +687,8 @@ def test_prompt_is_versioned_and_contains_only_question_and_structural_context()
     messages = build_nl2sql_messages(request)
 
     assert [message.role for message in messages] == ["system", "user"]
-    assert "a5.3-v4" in messages[0].content
+    assert "a5.3-v3" in messages[0].content
+    assert "result_contract" not in messages[0].content
     assert request.question in messages[1].content
     assert "Approved semantic schema context JSON" in messages[1].content
     assert "Comment:" not in messages[1].content
@@ -668,7 +696,7 @@ def test_prompt_is_versioned_and_contains_only_question_and_structural_context()
     assert "password" not in "".join(message.content for message in messages).lower()
 
 
-def test_nl2sql_prompt_enforces_general_exact_projection_contract() -> None:
+def test_nl2sql_prompt_enforces_sql_only_exact_projection_contract() -> None:
     request = _request()
 
     base_messages = build_nl2sql_messages(request)
@@ -679,9 +707,7 @@ def test_nl2sql_prompt_enforces_general_exact_projection_contract() -> None:
     )
 
     required_rules = (
-        "intended row_grain",
-        "stable grain_keys",
-        "exact ordered output_columns",
+        "Select exactly the columns or derived values needed",
         "Never use SELECT *",
         "Do not return explanations",
     )
@@ -691,6 +717,23 @@ def test_nl2sql_prompt_enforces_general_exact_projection_contract() -> None:
     assert repair_messages[0].content == base_messages[0].content
     assert "case_id" not in base_messages[0].content
     assert "reference_sql" not in base_messages[0].content
+
+
+def test_result_contract_prompt_remains_explicit_diagnostic_only() -> None:
+    request = _request()
+    messages = build_nl2sql_messages(request, result_contract_enabled=True)
+    repair_messages = build_nl2sql_repair_messages(
+        request,
+        previous_sql="SELECT id FROM public.sales",
+        validation_error="unknown column",
+        result_contract_enabled=True,
+    )
+
+    assert "a5.3-v4" in messages[0].content
+    for rule in ("intended row_grain", "stable grain_keys", "exact ordered output_columns"):
+        assert rule in messages[0].content
+        assert rule in repair_messages[0].content
+    assert messages[0].content == repair_messages[0].content
 
 
 def test_prompt_excludes_untrusted_schema_comments() -> None:

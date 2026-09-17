@@ -42,10 +42,13 @@ from .nl2sql import (
 )
 from .nl2sql_models import (
     NL2SQL_MAX_TOKENS,
+    NL2SQL_PROMPT_VERSION,
+    NL2SQL_RESULT_CONTRACT_PROMPT_VERSION,
     RESULT_CONTRACT_VERSION,
     NL2SQLInput,
     NL2SQLResult,
     ResultContract,
+    ResultContractSQLGenerationPayload,
     SQLCandidate,
     SQLGenerationPayload,
 )
@@ -93,7 +96,9 @@ from .sql_validation import policy_fingerprint
 __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
     "NL2SQL_MAX_TOKENS",
+    "NL2SQL_PROMPT_VERSION",
     "NL2SQL_REASONING_MODE",
+    "NL2SQL_RESULT_CONTRACT_PROMPT_VERSION",
     "RESULT_CONTRACT_VERSION",
     "AggregateFunction",
     "ChatBIAgentLimits",
@@ -127,6 +132,7 @@ __all__ = [
     "RegisteredDataSourceProvider",
     "ResolvedDatabaseCredentials",
     "ResultContract",
+    "ResultContractSQLGenerationPayload",
     "ResultGrain",
     "ResultOrderByTerm",
     "ResultOutputColumn",

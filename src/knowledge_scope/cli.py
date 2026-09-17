@@ -72,12 +72,14 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2_provider import (
     DEFAULT_DATASET_V2,
     DEFAULT_FIXTURE_PATH_V2,
     DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2,
+    DEFAULT_PROVIDER_CONTRACT_ONLY_OUTPUT_V2,
     DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2,
     DEFAULT_PROVIDER_OUTPUT_V2,
     V2ProviderBenchmarkError,
     preflight_v2_provider_benchmark,
     run_v2_provider_benchmark,
     run_v2_provider_contract_diagnostic,
+    run_v2_provider_contract_only_probe,
     run_v2_provider_diagnostic,
 )
 from knowledge_scope.evaluation.embedding_benchmark import (
@@ -373,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--contract-diagnostic",
         action="store_true",
         help="run the fixed eleven-DEV ResultContract semantic diagnostic cases only",
+    )
+    chatbi_eval_v2_provider.add_argument(
+        "--contract-only-probe",
+        action="store_true",
+        help="run the fixed eleven-DEV ResultContract-only planning probe",
     )
     mcp = subparsers.add_parser(
         "mcp",
@@ -1685,12 +1692,18 @@ async def _run_chatbi_eval_v2_provider_async(
 ) -> dict[str, object]:
     """Run the provider-free v2 preflight or the explicit DEV benchmark."""
     diagnostic_cases = args.diagnostic_cases
+    if args.contract_only_probe and (args.contract_diagnostic or diagnostic_cases is not None):
+        raise V2ProviderBenchmarkError(
+            "--contract-only-probe cannot be combined with another diagnostic mode"
+        )
     if args.contract_diagnostic and diagnostic_cases is not None:
         raise V2ProviderBenchmarkError(
             "--contract-diagnostic cannot be combined with --diagnostic-case"
         )
     diagnostic_output = args.output
-    if args.contract_diagnostic and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
+    if args.contract_only_probe and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
+        diagnostic_output = DEFAULT_PROVIDER_CONTRACT_ONLY_OUTPUT_V2
+    elif args.contract_diagnostic and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
         diagnostic_output = DEFAULT_PROVIDER_CONTRACT_DIAGNOSTIC_OUTPUT_V2
     elif diagnostic_cases is not None and diagnostic_output == DEFAULT_PROVIDER_OUTPUT_V2:
         diagnostic_output = DEFAULT_PROVIDER_DIAGNOSTIC_OUTPUT_V2
@@ -1703,6 +1716,15 @@ async def _run_chatbi_eval_v2_provider_async(
             output_path=diagnostic_output,
             diagnostic_case_ids=diagnostic_cases,
             contract_diagnostic=args.contract_diagnostic,
+            contract_only_probe=args.contract_only_probe,
+        )
+    elif args.contract_only_probe:
+        report = await run_v2_provider_contract_only_probe(
+            settings,
+            split=args.split,
+            dataset_path=args.dataset,
+            fixture_path=args.fixture,
+            output_path=diagnostic_output,
         )
     elif args.contract_diagnostic:
         report = await run_v2_provider_contract_diagnostic(
