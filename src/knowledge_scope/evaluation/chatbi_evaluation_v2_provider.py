@@ -129,6 +129,13 @@ from knowledge_scope.evaluation.chatbi_schema_fingerprint import (
     canonical_schema_payload,
     schema_fingerprint,
 )
+from knowledge_scope.evaluation.semantic_evidence import (
+    SEMANTIC_EVIDENCE_VERSION,
+    SYNTHETIC_EXACT_MODE,
+    SemanticEvidenceRecord,
+    build_unavailable_semantic_evidence,
+    capture_semantic_evidence,
+)
 from knowledge_scope.llm import LLMGateway, LLMResult, create_llm_provider
 from knowledge_scope.llm.errors import LLMError
 from knowledge_scope.llm.observability import provider_observation_context
@@ -149,7 +156,8 @@ from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import create_database_engine, create_session_factory
 
 CHATBI_EVALUATION_V2_PROVIDER_VERSION = "a5.7b"
-CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION = "a5.7b-provider-run-v1"
+CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION = "a5.7g2-provider-run-v2"
+CHATBI_EVALUATION_V2_LEGACY_PROVIDER_RUN_SCHEMA_VERSION = "a5.7b-provider-run-v1"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_VERSION = "a5.7e2a"
 CHATBI_EVALUATION_V2_DIAGNOSTIC_SCHEMA_VERSION = "a5.7e2a-provider-diagnostic-v1"
 CHATBI_EVALUATION_V2_CONTRACT_DIAGNOSTIC_VERSION = "a5.7e2c"
@@ -263,6 +271,7 @@ class V2ProviderCaseRecord(_EvaluationModel):
     analysis_token_limit_status: StrictStr | None = Field(default=None, max_length=16)
     redacted_sql: StrictStr | None = Field(default=None, max_length=100_000)
     trace_events: list[StrictStr] = Field(default_factory=list)
+    semantic_evidence: SemanticEvidenceRecord | None = None
 
 
 class V2ProviderDiagnosticCaseRecord(_EvaluationModel):
@@ -451,6 +460,7 @@ class V2ProviderRunProvenance(_EvaluationModel):
     configuration: EvaluationRuntimeConfiguration
     started_at: datetime
     completed_at: datetime
+    semantic_evidence_version: Literal["a5.7g2-semantic-evidence-v1"] | None = None
 
     @field_validator("fixture_path")
     @classmethod
@@ -464,7 +474,7 @@ class V2ProviderRun(_EvaluationModel):
     """Repository-safe artifact contract for exactly the frozen DEV split."""
 
     run_id: UUID
-    artifact_schema_version: Literal["a5.7b-provider-run-v1"] = (
+    artifact_schema_version: Literal["a5.7b-provider-run-v1", "a5.7g2-provider-run-v2"] = (
         CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION
     )
     started_at: datetime
@@ -504,6 +514,32 @@ class V2ProviderRun(_EvaluationModel):
             raise ValueError("run and provenance case counts must match")
         if self.aggregates.case_count != self.case_count:
             raise ValueError("run and aggregate case counts must match")
+        evidence_records = [record.semantic_evidence for record in self.records]
+        if self.artifact_schema_version == CHATBI_EVALUATION_V2_PROVIDER_RUN_SCHEMA_VERSION:
+            if any(record is None for record in evidence_records):
+                raise ValueError("g2 provider artifacts require evidence for every case")
+            if self.provenance.semantic_evidence_version != SEMANTIC_EVIDENCE_VERSION:
+                raise ValueError("g2 provider provenance must declare the evidence version")
+        elif (
+            self.artifact_schema_version == CHATBI_EVALUATION_V2_LEGACY_PROVIDER_RUN_SCHEMA_VERSION
+        ):
+            if any(record is not None for record in evidence_records):
+                raise ValueError("legacy provider artifacts cannot contain semantic evidence")
+        else:
+            raise ValueError("unsupported v2 provider artifact schema")
+        for record, evidence in zip(self.records, evidence_records, strict=True):
+            if evidence is not None:
+                if evidence.case_id != record.case_id or evidence.split != record.split:
+                    raise ValueError("provider case and semantic evidence identities must match")
+                if evidence.datasource_id != self.datasource_id:
+                    raise ValueError(
+                        "provider run and semantic evidence datasource identities must match"
+                    )
+                evidence.validate_provenance(
+                    dataset_fingerprint=self.dataset_fingerprint,
+                    fixture_fingerprint=self.fixture_fingerprint,
+                    schema_fingerprint=self.fixture_schema_fingerprint,
+                )
         return self
 
 
@@ -2337,6 +2373,7 @@ def _v2_record(
         analysis_token_limit_status=analysis_token_limit_status,
         redacted_sql=result.redacted_sql,
         trace_events=[event.event for event in result.trace],
+        semantic_evidence=observation.semantic_evidence,
     )
 
 
@@ -2914,6 +2951,11 @@ class _V2AgentRunner:
         invocation_recorder: InMemoryProviderInvocationRecorder,
         invocation_updater: ProviderInvocationRecorder,
         contract_capture: _ResultContractCapture | None = None,
+        *,
+        evidence_dataset_fingerprint: str | None = None,
+        evidence_fixture_fingerprint: str | None = None,
+        evidence_schema_fingerprint: str | None = None,
+        evidence_synthetic_fixture_fingerprint: str | None = None,
     ) -> None:
         self._agent = agent
         self._timing = timing
@@ -2923,6 +2965,10 @@ class _V2AgentRunner:
         self._invocation_recorder = invocation_recorder
         self._invocation_updater = invocation_updater
         self._contract_capture = contract_capture
+        self._evidence_dataset_fingerprint = evidence_dataset_fingerprint
+        self._evidence_fixture_fingerprint = evidence_fixture_fingerprint
+        self._evidence_schema_fingerprint = evidence_schema_fingerprint
+        self._evidence_synthetic_fixture_fingerprint = evidence_synthetic_fixture_fingerprint
 
     async def run(self, case: ChatBIEvaluationCaseV2) -> ChatBIEvaluationObservation:
         self._timing.reset()
@@ -2994,6 +3040,46 @@ class _V2AgentRunner:
                 error_category=error_category,
             )
         invocations = list(self._invocation_recorder.records[invocation_start:])
+        semantic_evidence = None
+        if all(
+            value is not None
+            for value in (
+                self._evidence_dataset_fingerprint,
+                self._evidence_fixture_fingerprint,
+                self._evidence_schema_fingerprint,
+                self._evidence_synthetic_fixture_fingerprint,
+            )
+        ):
+            try:
+                semantic_evidence = capture_semantic_evidence(
+                    case_id=case.case_id,
+                    split=case.split,
+                    datasource_id=self._datasource_id,
+                    dataset_fingerprint=self._evidence_dataset_fingerprint,
+                    fixture_fingerprint=self._evidence_fixture_fingerprint,
+                    schema_fingerprint=self._evidence_schema_fingerprint,
+                    synthetic_fixture_fingerprint=self._evidence_synthetic_fixture_fingerprint,
+                    validated_sql=self._timing.validated_sql,
+                    execution_result=self._timing.execution_result,
+                    chatbi_result=result,
+                    provider_invocations=invocations,
+                    prompt_version=NL2SQL_PROMPT_VERSION,
+                    reasoning_mode=NL2SQL_REASONING_MODE,
+                    evidence_mode=SYNTHETIC_EXACT_MODE,
+                )
+            except Exception:
+                # Evidence is an evaluation sidecar. A collector defect must
+                # never replace or mutate the authoritative ChatBI result.
+                semantic_evidence = build_unavailable_semantic_evidence(
+                    case_id=case.case_id,
+                    split=case.split,
+                    datasource_id=self._datasource_id,
+                    dataset_fingerprint=self._evidence_dataset_fingerprint,
+                    fixture_fingerprint=self._evidence_fixture_fingerprint,
+                    schema_fingerprint=self._evidence_schema_fingerprint,
+                    prompt_version=NL2SQL_PROMPT_VERSION,
+                    reasoning_mode=NL2SQL_REASONING_MODE,
+                )
         return ChatBIEvaluationObservation(
             result=result,
             execution_result=self._timing.execution_result,
@@ -3005,6 +3091,7 @@ class _V2AgentRunner:
                 if self._contract_capture is not None
                 else []
             ),
+            semantic_evidence=semantic_evidence,
         )
 
 
@@ -3088,6 +3175,10 @@ async def _execute_v2_provider_cases(
             invocation_recorder,
             invocation_sink,
             contract_capture,
+            evidence_dataset_fingerprint=context.dataset.fingerprint,
+            evidence_fixture_fingerprint=context.fixture_fingerprint,
+            evidence_schema_fingerprint=context.fixture_schema_fingerprint,
+            evidence_synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
         )
         if diagnostic:
             return await evaluate_v2_provider_diagnostic_cases(context.selected_cases, runner)
@@ -3264,6 +3355,7 @@ async def run_v2_provider_benchmark(
             model=settings.llm_model,
             temperature=0.0,
             response_format="json_object",
+            semantic_evidence_version=SEMANTIC_EVIDENCE_VERSION,
             configuration=_v2_configuration(
                 settings,
                 policy,
