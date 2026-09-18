@@ -129,6 +129,34 @@ reasoning 与 output budget 实验已经结束。保留 `DISABLED + 1024`：Run 
 被覆盖、删除或回写。Run #9 的 negative safe success 为 `0/3`，该未解决问题留在后续的
 语义与安全优化工作中，本决策不改变拒答行为。
 
+## A5.7h2 语义证据与策略 provenance 修正
+
+Run #12（`76fb3a39-8245-413b-9341-6af8eb8d7ceb`）保持原样，仍按
+`a5.7g2-provider-run-v2` 读取。该运行发现了两个评测基础设施问题：执行路径已经得到
+`ValidatedSQL`，但 timing wrapper 只检查直接返回值，没有读取
+`_RegisteredValidation.validated`，因此成功执行的记录也可能错误地标记为
+`validated_sql_unavailable`；同时 v2 provider artifact 没有绑定 g3 SemanticPolicy 的版本和
+指纹。因此 Run #12 的正式指标只能作为历史诊断保留，不能作为 evidence-backed semantic
+acceptance 的最终 DEV 结果；历史文件不回写、不补录证据或策略字段。
+
+A5.7h2 修正只改变评测观察层：collector 使用执行路径已经产生的权威嵌套
+`ValidatedSQL`，不重建、不重新校验 SQL，也不改变候选、验证、执行、repair、formal
+comparator 或 ChatBI 运行时。验证拒绝的 case 不会伪造 `ValidatedSQL`；evidence collector
+仍是旁路，失败时不会覆盖正式结果。
+
+新的完整 provider artifact 使用 `a5.7h2-provider-run-v3`。它在 provenance 中强制记录并
+校验：
+
+- `semantic_evidence_version = a5.7g2-semantic-evidence-v1`；
+- `semantic_policy_version = a5.7g3-semantic-policy-v1`；
+- `semantic_policy_fingerprint = 7da8b8c4b843dd1cdb50bc56cb2f826a02b625d1c797084f3000dbdb8cdf70ee`。
+
+v1/v2 reader 仍支持历史 artifact；v2 不会被静默重定义为 v3。新 v3 loader 会重新加载实际
+冻结的 g3 policy 并 fail closed 检查版本和指纹，避免只相信 artifact 自己携带的 provenance。
+SemanticEvidence 仍只描述候选实际产生了什么，SemanticPolicy 仍只描述题目要求什么，策略
+字段不会复制到每条 evidence。A5.7h2 不运行 provider、DEV 或 TEST；修正完成后需要新的
+Fresh DEV run 才能取得证据完备的语义评测结果。
+
 ## 冻结输入
 
 评测输入来自 `docs/benchmarks/a5-7-chatbi-eval-v2.json`，状态为
