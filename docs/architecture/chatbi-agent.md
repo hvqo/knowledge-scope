@@ -80,6 +80,14 @@ eligibility gate 使用现有 LLM Gateway 的 `task_type=chatbi_eligibility`；�
 `eligibility` 字段记录版本化 decision、reason code、method 和 schema fingerprint；它不是
 SQL authorization。
 
+模型侧只接受最小的严格 JSON：`{"decision":"...","reason_code":"..."}`。decision 与
+reason code 的合法组合由一份闭合集合统一驱动 prompt 和 parser；`eligible`、`clarify`、
+`refuse` 的用户消息、clarification、gate version、method、schema provenance 都由应用生成。
+`eligibility_check_unavailable` 仅属于应用侧失败结果，不能由 provider 伪造。顶层类型、必需
+字段、额外字段、JSON 重复键、合法值和 decision/reason 组合分别经过有界检查；已完成调用的
+失败只记录安全的结构化错误分类，不保存原始响应、问题、prompt 或推理内容。所有这类失败都
+保持 `unavailable`，并在 Agent 中停止后续 NL2SQL、校验、执行和分析。
+
 `clarify` 和 `refuse` 是不产生 SQL 的用户级终态；它们的 `sql_attempts`、`repair_attempts`、
 validation、execution 和 analysis 调用均为零。`unavailable` 表示门控本身无法安全判断，
 不会伪装成用户请求被拒绝。
