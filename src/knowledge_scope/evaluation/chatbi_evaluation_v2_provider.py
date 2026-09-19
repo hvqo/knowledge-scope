@@ -125,9 +125,11 @@ from knowledge_scope.evaluation.chatbi_evaluation_v2 import (
     load_chatbi_evaluation_dataset_v2,
     structured_result_facts_match,
 )
-from knowledge_scope.evaluation.chatbi_schema_fingerprint import (
-    canonical_schema_payload,
-    schema_fingerprint,
+from knowledge_scope.evaluation.chatbi_schema_provenance import (
+    PostgreSQLSchemaProvenance,
+    PostgreSQLSchemaProvenanceError,
+    canonical_postgres_schema_payload,
+    discover_postgres_schema_provenance,
 )
 from knowledge_scope.evaluation.chatbi_semantic_evaluation import (
     DEFAULT_G3_SEMANTIC_POLICY_PATH,
@@ -246,6 +248,7 @@ class V2ProviderPreflightReport(_EvaluationModel):
     fixture_version: Literal["chatbi-demo-v2"] = CHATBI_DEMO_FIXTURE_VERSION_V2
     fixture_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    authoritative_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     fixture_data_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     datasource_id: UUID
     datasource_identity: Literal["chatbi-demo-v2-authoritative"] = (
@@ -483,6 +486,12 @@ class V2ProviderRunProvenance(_EvaluationModel):
     fixture_path: StrictStr = Field(min_length=1, max_length=500)
     fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     fixture_schema_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    # Optional for historical v1/v2/v3 readers; all newly emitted v3 runs set
+    # this to the verified shared catalog fingerprint.
+    authoritative_schema_fingerprint: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     fixture_data_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     datasource_id: UUID
     datasource_identity: Literal["chatbi-demo-v2-authoritative"] = (
@@ -556,6 +565,11 @@ class V2ProviderRun(_EvaluationModel):
             raise ValueError("run and provenance fixture fingerprints must match")
         if self.fixture_schema_fingerprint != self.provenance.fixture_schema_fingerprint:
             raise ValueError("run and provenance schema fingerprints must match")
+        if (
+            self.provenance.authoritative_schema_fingerprint is not None
+            and self.provenance.authoritative_schema_fingerprint != self.fixture_schema_fingerprint
+        ):
+            raise ValueError("authoritative and fixture schema fingerprints must match")
         if self.provenance.case_count != self.case_count:
             raise ValueError("run and provenance case counts must match")
         if self.aggregates.case_count != self.case_count:
@@ -1587,193 +1601,33 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-_FIXTURE_SCHEMA_RELATIONS_QUERY = text(
-    """
-    SELECT
-        c.relname AS relation_name,
-        CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' END AS relation_kind,
-        a.attnum AS column_position,
-        a.attname AS column_name,
-        format_type(a.atttypid, a.atttypmod) AS data_type,
-        a.attnotnull AS not_null
-    FROM pg_catalog.pg_class AS c
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid
-    WHERE n.nspname = :schema
-      AND c.relkind IN ('r', 'v')
-      AND a.attnum > 0
-      AND NOT a.attisdropped
-    ORDER BY c.relkind, c.relname, a.attnum
-    """
-)
-_FIXTURE_SCHEMA_CONSTRAINTS_QUERY = text(
-    """
-    SELECT
-        c.relname AS relation_name,
-        con.contype AS constraint_type,
-        ARRAY(
-            SELECT a.attname
-            FROM unnest(con.conkey) WITH ORDINALITY AS key(attnum, position)
-            JOIN pg_catalog.pg_attribute AS a
-              ON a.attrelid = con.conrelid AND a.attnum = key.attnum
-            ORDER BY key.position
-        ) AS columns,
-        rn.nspname AS referenced_schema,
-        rc.relname AS referenced_relation,
-        ARRAY(
-            SELECT a.attname
-            FROM unnest(con.confkey) WITH ORDINALITY AS key(attnum, position)
-            JOIN pg_catalog.pg_attribute AS a
-              ON a.attrelid = con.confrelid AND a.attnum = key.attnum
-            ORDER BY key.position
-        ) AS referenced_columns,
-        CASE
-            WHEN con.contype = 'c' THEN pg_catalog.pg_get_constraintdef(con.oid, true)
-            ELSE NULL
-        END AS check_definition
-    FROM pg_catalog.pg_constraint AS con
-    JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    LEFT JOIN pg_catalog.pg_class AS rc ON rc.oid = con.confrelid
-    LEFT JOIN pg_catalog.pg_namespace AS rn ON rn.oid = rc.relnamespace
-    WHERE n.nspname = :schema
-      AND c.relkind = 'r'
-      AND con.contype IN ('p', 'u', 'f', 'c')
-    ORDER BY
-        c.relname,
-        con.contype,
-        columns,
-        referenced_schema,
-        referenced_relation,
-        referenced_columns,
-        check_definition
-    """
-)
-
-
-def _metadata_array(value: object) -> list[str]:
-    """Convert a PostgreSQL text[] catalog value into a stable JSON list."""
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    raise V2ProviderBenchmarkError("v2 fixture schema metadata has an invalid array value")
-
-
-def _metadata_text(value: object) -> str:
-    """Normalize text-like PostgreSQL catalog scalars without driver artifacts."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    if isinstance(value, str):
-        return value
-    raise V2ProviderBenchmarkError("v2 fixture schema metadata has an invalid text value")
-
-
 def _fixture_schema_payload(
     relation_rows: Sequence[object],
     constraint_rows: Sequence[object],
 ) -> dict[str, object]:
-    """Build a catalog-order-independent, credential-free schema contract."""
-    relation_map: dict[tuple[str, str], dict[str, object]] = {}
-    for row in relation_rows:
-        mapping = row._mapping  # type: ignore[attr-defined]
-        relation_name = _metadata_text(mapping["relation_name"])
-        relation_kind = _metadata_text(mapping["relation_kind"])
-        key = (relation_kind, relation_name)
-        relation = relation_map.setdefault(
-            key,
-            {
-                "name": relation_name,
-                "kind": relation_kind,
-                "columns": [],
-                "constraints": [],
-            },
+    """Compatibility wrapper for the shared PostgreSQL provenance adapter."""
+    try:
+        return canonical_postgres_schema_payload(
+            relation_rows,
+            constraint_rows,
+            schema=CHATBI_EVALUATION_V2_SCHEMA,
         )
-        columns = relation["columns"]
-        if not isinstance(columns, list):
-            raise V2ProviderBenchmarkError("v2 fixture schema metadata has an invalid column list")
-        columns.append(
-            {
-                "position": int(mapping["column_position"]),
-                "name": str(mapping["column_name"]),
-                "type": str(mapping["data_type"]),
-                "nullable": not bool(mapping["not_null"]),
-            }
-        )
-
-    constraint_types = {
-        "p": "primary_key",
-        "u": "unique",
-        "f": "foreign_key",
-        "c": "check",
-    }
-    for row in constraint_rows:
-        mapping = row._mapping  # type: ignore[attr-defined]
-        relation_name = _metadata_text(mapping["relation_name"])
-        constraint_type = _metadata_text(mapping["constraint_type"])
-        if constraint_type not in constraint_types:
-            raise V2ProviderBenchmarkError("v2 fixture schema metadata has an invalid constraint")
-        key = ("table", relation_name)
-        relation = relation_map.get(key)
-        if relation is None:
-            raise V2ProviderBenchmarkError(
-                "v2 fixture constraint references an unexpected relation"
-            )
-        constraints = relation["constraints"]
-        if not isinstance(constraints, list):
-            raise V2ProviderBenchmarkError(
-                "v2 fixture schema metadata has an invalid constraint list"
-            )
-        constraints.append(
-            {
-                "type": constraint_types[constraint_type],
-                "columns": _metadata_array(mapping["columns"]),
-                "referenced_schema": (
-                    _metadata_text(mapping["referenced_schema"])
-                    if mapping["referenced_schema"] is not None
-                    else None
-                ),
-                "referenced_relation": (
-                    _metadata_text(mapping["referenced_relation"])
-                    if mapping["referenced_relation"] is not None
-                    else None
-                ),
-                "referenced_columns": _metadata_array(mapping["referenced_columns"]),
-                "check_definition": (
-                    _metadata_text(mapping["check_definition"])
-                    if mapping["check_definition"] is not None
-                    else None
-                ),
-            }
-        )
-
-    return canonical_schema_payload(
-        schema=CHATBI_EVALUATION_V2_SCHEMA,
-        relations=relation_map.values(),
-    )
+    except PostgreSQLSchemaProvenanceError as error:
+        raise V2ProviderBenchmarkError(str(error)) from error
 
 
 async def _fixture_schema_fingerprint(database_url: str) -> str:
     """Hash the authoritative benchmark schema from stable PostgreSQL metadata."""
-    engine = create_async_engine(database_url)
     try:
-        async with engine.connect() as connection:
-            relations = await connection.execute(
-                _FIXTURE_SCHEMA_RELATIONS_QUERY,
-                {"schema": CHATBI_EVALUATION_V2_SCHEMA},
-            )
-            constraints = await connection.execute(
-                _FIXTURE_SCHEMA_CONSTRAINTS_QUERY,
-                {"schema": CHATBI_EVALUATION_V2_SCHEMA},
-            )
-            payload = _fixture_schema_payload(relations.fetchall(), constraints.fetchall())
-            return schema_fingerprint(payload)
+        provenance = await discover_postgres_schema_provenance(
+            database_url,
+            schema=CHATBI_EVALUATION_V2_SCHEMA,
+        )
+        return provenance.fingerprint
+    except PostgreSQLSchemaProvenanceError as error:
+        raise V2ProviderBenchmarkError(str(error)) from error
     except V2ProviderBenchmarkError:
         raise
-    except SQLAlchemyError as error:
-        raise V2ProviderBenchmarkError("could not verify the v2 benchmark schema") from error
-    finally:
-        await engine.dispose()
 
 
 async def _database_exists(admin_url: URL) -> bool:
@@ -2180,6 +2034,46 @@ async def _discover_v2_schema(
     return discovered
 
 
+async def _discover_v2_authoritative_schema_provenance(
+    data_source: DataSource,
+) -> PostgreSQLSchemaProvenance:
+    """Discover the frozen catalog contract through the registered datasource.
+
+    This is deliberately separate from executable ``SchemaDiscoveryResult``:
+    the catalog contract includes ``region_sales`` and CHECK metadata, while
+    the current query policy continues to exclude views from SQL authorization.
+    """
+    if data_source.id != CHATBI_EVALUATION_V2_DATASOURCE_ID:
+        raise V2ProviderBenchmarkError("v2 schema provenance datasource identity mismatch")
+    if (
+        data_source.connection_ref != CHATBI_EVALUATION_V2_CONNECTION_REF
+        or data_source.default_database != CHATBI_EVALUATION_V2_DATABASE_NAME
+        or data_source.default_schema != CHATBI_EVALUATION_V2_SCHEMA
+        or data_source.enabled is not True
+    ):
+        raise V2ProviderBenchmarkError("v2 schema provenance datasource metadata mismatch")
+    try:
+        credentials = EnvironmentCredentialResolver().resolve(data_source.connection_ref)
+        provenance = await discover_postgres_schema_provenance(
+            credentials.connection_url,
+            schema=CHATBI_EVALUATION_V2_SCHEMA,
+        )
+    except (ChatBIError, PostgreSQLSchemaProvenanceError) as error:
+        raise V2ProviderBenchmarkError(
+            "could not discover authoritative v2 schema provenance"
+        ) from error
+    if provenance.schema != CHATBI_EVALUATION_V2_SCHEMA:
+        raise V2ProviderBenchmarkError("v2 schema provenance schema identity mismatch")
+    if set(provenance.relation_labels) != {
+        "chatbi_demo.customers",
+        "chatbi_demo.regions",
+        "chatbi_demo.sales",
+        "chatbi_demo.region_sales",
+    }:
+        raise V2ProviderBenchmarkError("v2 schema provenance returned an unexpected relation set")
+    return provenance
+
+
 def _check_provider_configuration(settings: Settings) -> None:
     """Check configuration without constructing a provider or making a call."""
     if settings.llm_provider != "deepseek":
@@ -2207,7 +2101,7 @@ class _V2PreflightContext:
     dataset: ChatBIEvaluationDatasetV2
     selected_cases: tuple[ChatBIEvaluationCaseV2, ...]
     fixture_fingerprint: str
-    fixture_schema_fingerprint: str
+    authoritative_schema_fingerprint: str
     bootstrap: _V2DatasourceBootstrap
     fixture_data_fingerprint: str
     discovered_schema: SchemaDiscoveryResult | None
@@ -2270,6 +2164,15 @@ async def _prepare_v2_preflight(
         )
         if registered is None or registered.id != bootstrap.data_source.id:
             raise V2ProviderBenchmarkError("authoritative v2 datasource could not be resolved")
+        authoritative_provenance = await _discover_v2_authoritative_schema_provenance(registered)
+        if authoritative_provenance.fingerprint != EXPECTED_FIXTURE_SCHEMA_FINGERPRINT_V2:
+            raise V2ProviderBenchmarkError(
+                "authoritative v2 schema provenance does not match the frozen fingerprint"
+            )
+        if authoritative_provenance.fingerprint != bootstrap.fixture_schema_fingerprint:
+            raise V2ProviderBenchmarkError(
+                "authoritative v2 schema provenance changed after fixture bootstrap"
+            )
         if contract_only_probe:
             discovered_schema = await _discover_v2_schema(
                 settings,
@@ -2298,7 +2201,7 @@ async def _prepare_v2_preflight(
         dataset=dataset,
         selected_cases=selected,
         fixture_fingerprint=fixture_fingerprint,
-        fixture_schema_fingerprint=bootstrap.fixture_schema_fingerprint,
+        authoritative_schema_fingerprint=authoritative_provenance.fingerprint,
         bootstrap=bootstrap,
         fixture_data_fingerprint=data_fingerprint,
         discovered_schema=discovered_schema,
@@ -2336,7 +2239,8 @@ async def preflight_v2_provider_benchmark(
         return V2ProviderPreflightReport(
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_fingerprint=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
+            authoritative_schema_fingerprint=context.authoritative_schema_fingerprint,
             fixture_data_fingerprint=context.fixture_data_fingerprint,
             datasource_id=context.bootstrap.data_source.id,
             split="dev",
@@ -3257,7 +3161,11 @@ async def _execute_v2_provider_cases(
         )
         policy = _v2_query_policy(settings)
         execution = SQLExecutionService(
-            _TimedValidation(generation, timing),
+            _TimedValidation(
+                generation,
+                timing,
+                evaluation_schema_fingerprint=context.authoritative_schema_fingerprint,
+            ),
             EnvironmentCredentialResolver(),
             _TimedExecutionAdapter(
                 PostgresExecutionAdapter(
@@ -3285,7 +3193,7 @@ async def _execute_v2_provider_cases(
             contract_capture,
             evidence_dataset_fingerprint=context.dataset.fingerprint,
             evidence_fixture_fingerprint=context.fixture_fingerprint,
-            evidence_schema_fingerprint=context.fixture_schema_fingerprint,
+            evidence_schema_fingerprint=context.authoritative_schema_fingerprint,
             evidence_synthetic_fixture_fingerprint=EXPECTED_FIXTURE_FINGERPRINT_V2,
         )
         if diagnostic:
@@ -3453,7 +3361,8 @@ async def run_v2_provider_benchmark(
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
             fixture_sha256=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
+            authoritative_schema_fingerprint=context.authoritative_schema_fingerprint,
             fixture_data_fingerprint=context.fixture_data_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             case_count=len(records),
@@ -3478,7 +3387,7 @@ async def run_v2_provider_benchmark(
             completed_at=completed_at,
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_fingerprint=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             case_count=len(records),
             records=records,
@@ -3525,7 +3434,7 @@ async def run_v2_provider_diagnostic(
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
             fixture_sha256=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             fixture_data_fingerprint=context.fixture_data_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             case_ids=selected_case_ids,
@@ -3549,7 +3458,7 @@ async def run_v2_provider_diagnostic(
             completed_at=completed_at,
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_fingerprint=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             records=diagnostic_records,
             aggregates=_build_v2_diagnostic_aggregate(diagnostic_records),
@@ -3600,7 +3509,7 @@ async def run_v2_provider_contract_diagnostic(
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
             fixture_sha256=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             fixture_data_fingerprint=context.fixture_data_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             case_ids=selected_case_ids,
@@ -3623,7 +3532,7 @@ async def run_v2_provider_contract_diagnostic(
             completed_at=completed_at,
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_fingerprint=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             records=records,
             aggregates=_build_v2_contract_diagnostic_aggregate(records),
@@ -3674,7 +3583,7 @@ async def run_v2_provider_contract_only_probe(
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_path=DEFAULT_FIXTURE_PATH_V2.as_posix(),
             fixture_sha256=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             fixture_data_fingerprint=context.fixture_data_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             case_ids=selected_case_ids,
@@ -3692,7 +3601,7 @@ async def run_v2_provider_contract_only_probe(
             completed_at=completed_at,
             dataset_fingerprint=context.dataset.fingerprint,
             fixture_fingerprint=context.fixture_fingerprint,
-            fixture_schema_fingerprint=context.fixture_schema_fingerprint,
+            fixture_schema_fingerprint=context.authoritative_schema_fingerprint,
             datasource_id=CHATBI_EVALUATION_V2_DATASOURCE_ID,
             records=records,
             aggregates=_build_v2_contract_only_aggregate(records),
