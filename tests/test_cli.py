@@ -4,6 +4,12 @@ from uuid import UUID
 
 import pytest
 
+from knowledge_scope.chatbi import (
+    ChatBIErrorCategory,
+    EligibilityAssessment,
+    QueryEligibilityDecision,
+    QueryEligibilityReasonCode,
+)
 from knowledge_scope.chunking.models import ChunkedDocument
 from knowledge_scope.cli import _redact_sql_display, build_parser, main
 from knowledge_scope.graph.neo4j import Neo4jReadiness
@@ -11,6 +17,41 @@ from knowledge_scope.parsing.mineru_adapter import AdapterStats
 from knowledge_scope.parsing.models import CanonicalDocument, Page, TextBlock
 from knowledge_scope.parsing.service import ParseResult
 from knowledge_scope.shared.config import Settings
+
+_CHATBI_CLI_DATASOURCE_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+class _FakeCLIEngine:
+    async def dispose(self) -> None:
+        return None
+
+
+class _FakeCLIProvider:
+    async def aclose(self) -> None:
+        return None
+
+
+class _FakeCLIResult:
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return {"candidate": {"sql": "SELECT 1"}, "validated_sql": {"normalized_sql": "SELECT 1"}}
+
+
+class _FakeCLIGeneration:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate_for_registered_data_source(self, *_args: object, **_kwargs: object):
+        self.generate_calls += 1
+        return _FakeCLIResult()
+
+
+class _FakeCLIEligibility:
+    def __init__(self, assessment: object) -> None:
+        self.assessment = assessment
+
+    async def assess_for_registered_data_source(self, *_args: object, **_kwargs: object):
+        return self.assessment
 
 
 class _FakeNeo4jStore:
@@ -98,6 +139,88 @@ def test_chatbi_nl2sql_parser_requires_question_and_supports_limits() -> None:
     assert args.max_chars == 12_000
     assert args.max_tokens == 256
     assert args.model == "deepseek-chat"
+
+
+@pytest.mark.parametrize(
+    ("decision", "reason_code", "expected_exit", "expected_calls", "expected_status"),
+    [
+        ("clarify", QueryEligibilityReasonCode.AMBIGUOUS_INTENT, 0, 0, "clarify"),
+        ("refuse", QueryEligibilityReasonCode.UNSUPPORTED_WRITE_OPERATION, 0, 0, "refuse"),
+        (
+            "unavailable",
+            QueryEligibilityReasonCode.ELIGIBILITY_CHECK_UNAVAILABLE,
+            1,
+            0,
+            "eligibility_unavailable",
+        ),
+        ("eligible", QueryEligibilityReasonCode.ELIGIBLE_ANALYTICAL, 0, 1, "complete"),
+    ],
+)
+def test_chatbi_nl2sql_cli_applies_eligibility_before_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    decision: str,
+    reason_code: QueryEligibilityReasonCode,
+    expected_exit: int,
+    expected_calls: int,
+    expected_status: str,
+) -> None:
+    fingerprint = None if decision == "unavailable" else "a" * 64
+    eligibility = EligibilityAssessment(
+        decision=QueryEligibilityDecision(
+            decision=decision,  # type: ignore[arg-type]
+            reason_code=reason_code,
+            user_message="请补充范围。" if decision == "clarify" else "request is not supported",
+            clarification_question="请补充范围。" if decision == "clarify" else None,
+            method="llm" if decision != "eligible" else "deterministic",
+            schema_fingerprint=fingerprint,
+        )
+    )
+    generation = _FakeCLIGeneration()
+
+    monkeypatch.setattr("knowledge_scope.cli.get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(
+        "knowledge_scope.cli.create_database_engine",
+        lambda _settings: _FakeCLIEngine(),
+    )
+    monkeypatch.setattr("knowledge_scope.cli.create_session_factory", lambda _engine: object())
+    monkeypatch.setattr(
+        "knowledge_scope.cli.create_postgres_schema_discovery_service",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "knowledge_scope.cli.create_llm_provider",
+        lambda _settings: _FakeCLIProvider(),
+    )
+    monkeypatch.setattr("knowledge_scope.cli.LLMGateway", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("knowledge_scope.cli.DatabaseUsageRecorder", lambda _factory: object())
+    monkeypatch.setattr("knowledge_scope.cli.DatabaseDataSourceProvider", lambda _factory: object())
+    monkeypatch.setattr("knowledge_scope.cli.NL2SQLService", lambda *_args, **_kwargs: generation)
+    monkeypatch.setattr(
+        "knowledge_scope.cli.ChatBIEligibilityService",
+        lambda _preparation, _gateway: _FakeCLIEligibility(eligibility),
+    )
+
+    exit_code = main(
+        [
+            "chatbi",
+            "nl2sql",
+            str(_CHATBI_CLI_DATASOURCE_ID),
+            "统计销售额",
+        ]
+    )
+    output = capsys.readouterr()
+
+    assert exit_code == expected_exit
+    assert generation.generate_calls == expected_calls
+    assert f"chatbi_nl2sql_status: {expected_status}" in (
+        output.err if expected_exit else output.out
+    )
+    if decision in {"clarify", "refuse"}:
+        assert output.err == ""
+    if decision == "unavailable":
+        assert "eligibility_unavailable" in output.err
+        assert ChatBIErrorCategory.ELIGIBILITY_UNAVAILABLE.value in output.err
 
 
 def test_chatbi_execute_parser_accepts_datasource_and_sql() -> None:

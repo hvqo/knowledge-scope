@@ -36,6 +36,8 @@ def logical_stage_for_task(task_type: str) -> LLMLogicalStage:
         return "generation"
     if task_type == "chatbi_analysis":
         return "analysis"
+    if task_type == "chatbi_eligibility":
+        return "eligibility"
     return "other"
 
 

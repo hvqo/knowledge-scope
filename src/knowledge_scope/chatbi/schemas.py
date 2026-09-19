@@ -6,7 +6,7 @@ import json
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Final, Self
+from typing import Final, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -90,6 +90,83 @@ class QueryLifecycleState(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    CLARIFY = "clarify"
+    REFUSE = "refuse"
+    ELIGIBILITY_UNAVAILABLE = "eligibility_unavailable"
+
+
+class QueryEligibilityReasonCode(StrEnum):
+    """Closed reasons for the product-level query eligibility boundary."""
+
+    ELIGIBLE_ANALYTICAL = "eligible_analytical"
+    AMBIGUOUS_INTENT = "ambiguous_intent"
+    UNSUPPORTED_WRITE_OPERATION = "unsupported_write_operation"
+    UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    NOT_GROUNDED_IN_SCHEMA = "not_grounded_in_schema"
+    ELIGIBILITY_CHECK_UNAVAILABLE = "eligibility_check_unavailable"
+
+
+class QueryEligibilityDecision(_ChatBIModel):
+    """Typed, bounded decision made before NL2SQL generation.
+
+    This is a product-capability result, not SQL authorization.  The existing
+    datasource-bound SQL validator remains mandatory for eligible requests.
+    """
+
+    decision: Literal["eligible", "clarify", "refuse", "unavailable"]
+    reason_code: QueryEligibilityReasonCode
+    user_message: str = Field(min_length=1, max_length=1_000)
+    clarification_question: str | None = Field(default=None, max_length=1_000)
+    gate_version: Literal["a5.7i2-v1"] = "a5.7i2-v1"
+    method: Literal["deterministic", "llm"]
+    schema_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator("user_message", "clarification_question")
+    @classmethod
+    def normalize_messages(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_decision_shape(self) -> Self:
+        if self.decision == "eligible":
+            if self.reason_code is not QueryEligibilityReasonCode.ELIGIBLE_ANALYTICAL:
+                raise ValueError("eligible decisions require the eligible_analytical reason")
+            if self.clarification_question is not None:
+                raise ValueError("eligible decisions cannot contain a clarification question")
+            if self.schema_fingerprint is None:
+                raise ValueError("eligible decisions require schema provenance")
+        elif self.decision == "clarify":
+            if self.reason_code is not QueryEligibilityReasonCode.AMBIGUOUS_INTENT:
+                raise ValueError("clarify decisions require the ambiguous_intent reason")
+            if self.clarification_question is None:
+                raise ValueError("clarify decisions require a clarification question")
+            if self.schema_fingerprint is None:
+                raise ValueError("clarify decisions require schema provenance")
+        elif self.decision == "refuse":
+            if self.reason_code not in {
+                QueryEligibilityReasonCode.UNSUPPORTED_WRITE_OPERATION,
+                QueryEligibilityReasonCode.UNSUPPORTED_CAPABILITY,
+                QueryEligibilityReasonCode.NOT_GROUNDED_IN_SCHEMA,
+            }:
+                raise ValueError("refuse decisions require an unsupported-request reason")
+            if self.clarification_question is not None:
+                raise ValueError("refuse decisions cannot contain a clarification question")
+            if self.schema_fingerprint is None:
+                raise ValueError("refuse decisions require schema provenance")
+        else:
+            if self.reason_code is not QueryEligibilityReasonCode.ELIGIBILITY_CHECK_UNAVAILABLE:
+                raise ValueError("unavailable decisions require the unavailable reason")
+            if self.clarification_question is not None:
+                raise ValueError("unavailable decisions cannot contain a clarification question")
+        return self
 
 
 class QueryTruncationReason(StrEnum):
