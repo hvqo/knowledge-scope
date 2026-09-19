@@ -147,10 +147,11 @@ delimiter-safe escaping；标识符
 错误使用独立的 `ChatBIErrorCategory`。错误文本不包含 raw provider payload、
 `connection_ref`、数据库 URL 或凭据。
 
-`chatbi nl2sql` 是开发者 smoke-test：它先从注册数据源执行只读 schema discovery，
-再生成 `a5.3-v3` SQL-only 响应，进入 A5.3 trusted SQL validation；完整生产链路随后
-进入只读执行，本命令本身没有 SQL 执行 endpoint。`a5.3-v4` ResultContract + SQL 仅在显式
-评测/诊断配置下使用。
+`chatbi nl2sql` 是面向用户的 SQL 生成命令：它先从注册数据源执行只读 schema discovery，
+再经过 Query Eligibility。只有 `eligible` 请求才生成 `a5.3-v3` SQL-only 响应并进入
+A5.3 trusted SQL validation；`clarify`、`refuse` 和 `unavailable` 都在生成前终止，
+不会调用 NL2SQL。完整生产链路随后进入只读执行，本命令本身没有 SQL 执行 endpoint。
+`a5.3-v4` ResultContract + SQL 仅在显式评测/诊断配置下使用。
 当前执行 adapter 只接受同一 trusted validation path 产生的内部结果，见
 [`chatbi-sql-execution.md`](chatbi-sql-execution.md)；本模块仍没有参数绑定、结果行脱敏、MCP、
 NL2SQL 质量评测或前端 ChatBI 页面；有界 Agent 的编排见

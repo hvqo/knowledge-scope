@@ -10,6 +10,11 @@ PostgreSQL schema discovery、NL2SQL 校验和只读执行服务，不建立第�
 question
   -> registered datasource lookup
   -> trusted schema discovery
+  -> query eligibility gate
+     ├─ eligible -> NL2SQL
+     ├─ clarify -> terminal clarification result
+     ├─ refuse -> terminal unsupported result
+     └─ unavailable -> terminal controlled eligibility failure
   -> NL2SQL LLM call（a5.3-v3：SQL-only）
   -> SQLCandidate（不可信）
   -> fresh datasource-bound AST / policy validation
@@ -36,7 +41,7 @@ Agent 不是无界 ReAct 循环。默认设置如下，均可通过 `Settings` �
 - `chatbi_agent_max_sql_attempts=2`：所有 SQL 生成尝试（初次和修复）总数；
 - `chatbi_agent_max_repair_attempts=1`：允许的修复次数；
 - `chatbi_agent_max_steps=6`：生成、执行和分析动作总数；
-- `chatbi_agent_max_llm_calls=3`：SQL 生成和结果分析的网关调用总数；
+- `chatbi_agent_max_llm_calls=3`：eligibility、SQL 生成和结果分析的网关调用总数；
 - `chatbi_nl2sql_max_tokens=1024`：初次生成和有界修复共用的输出预算；
 - `chatbi_analysis_max_tokens=1024`：结果分析的输出预算。
 
@@ -65,6 +70,19 @@ task-local context 进入观测记录，不使用全局可变状态。
 provider timeout 是每次 attempt 的应用层绝对 wall-clock deadline，覆盖 provider await 的
 完整过程；超时会取消当前操作并记录一次失败 attempt。只有显式 retryable 的 provider 错误
 才沿用网关现有的有限重试，重试可能重复 provider 侧工作或费用，不提供 exactly-once 保证。
+
+## 查询资格门控
+
+eligibility gate 使用现有 LLM Gateway 的 `task_type=chatbi_eligibility`；它先处理明确的
+写入/管理请求，再对剩余问题执行一次有界结构化分类。分类超时、provider 错误或 malformed
+输出返回 `unavailable`，不会回退到 NL2SQL。分类请求只接收问题、确定性结构化 schema data
+和只读能力说明，不接收注释、凭据、SQL 或原始 provider artifacts。`ChatBIResult` 的
+`eligibility` 字段记录版本化 decision、reason code、method 和 schema fingerprint；它不是
+SQL authorization。
+
+`clarify` 和 `refuse` 是不产生 SQL 的用户级终态；它们的 `sql_attempts`、`repair_attempts`、
+validation、execution 和 analysis 调用均为零。`unavailable` 表示门控本身无法安全判断，
+不会伪装成用户请求被拒绝。
 
 ## 结果分析
 
@@ -107,5 +125,6 @@ knowledgescope chatbi ask <datasource_id> <question>
 ```
 
 CLI 只接受注册数据源 ID 和问题，输出 `ChatBIResult` 的安全投影；无通用 raw SQL 或
-`ValidatedSQL` 输入参数。当前实现停在 SQL 生成、只读执行和结果分析，不包含 MCP、额外的
-外部工具循环、前端 ChatBI 页面或外部数据写入。
+`ValidatedSQL` 输入参数。MCP 仅复用同一高层 Agent，并将 `clarify`/`refuse` 作为用户级结果
+返回；`unavailable` 作为受控域错误返回。当前实现不包含额外的外部工具循环、前端 ChatBI
+页面或外部数据写入。

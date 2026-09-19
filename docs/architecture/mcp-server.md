@@ -15,8 +15,9 @@ MCP client
 服务只注册两个高层工具：
 
 - `chatbi_ask(datasource_id, question)`：调用现有 `ChatBIAgentService`，返回安全的
-  成功 `ChatBIResult`，包括答案、执行状态、有界结果元数据、脱敏 SQL、usage 和安全 trace；
-  预期的 ChatBI 失败会使用 MCP 的 `isError` 工具结果和固定错误消息返回。
+  `ChatBIResult`，包括答案、执行状态、有界结果元数据、脱敏 SQL、usage 和安全 trace。
+  用户级 `clarify`/`refuse` 作为成功工具结果返回；门控或执行等技术失败使用 MCP 的
+  `isError` 工具结果和固定错误消息返回。
 - `chatbi_schema(datasource_id)`：通过注册表和只读 Schema Discovery 获取有界的
   Schema Context 及其 fingerprint。MCP 投影不返回关系/字段注释，也不返回连接配置；
   关系、字段和外键会按固定上限选择，响应包含返回数、遗漏数、截断标志和有界的遗漏样本。

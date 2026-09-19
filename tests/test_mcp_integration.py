@@ -22,7 +22,18 @@ class _DeterministicMCPGateway:
     """Fake gateway; discovery, validation, execution and normalization stay real."""
 
     async def complete(self, request: LLMRequest) -> LLMResult:
-        if request.task_type == "nl2sql":
+        if request.task_type == "chatbi_eligibility":
+            text = json.dumps(
+                {
+                    "decision": "eligible",
+                    "reason_code": "eligible_analytical",
+                    "user_message": "eligible",
+                    "clarification_question": None,
+                },
+                ensure_ascii=False,
+            )
+            input_tokens, output_tokens = 5, 3
+        elif request.task_type == "nl2sql":
             text = json.dumps(
                 {
                     "sql": (
@@ -38,7 +49,7 @@ class _DeterministicMCPGateway:
         elif request.task_type == "chatbi_analysis":
             text = '{"answer":"MCP 返回 2 位客户。","warning":null}'
             input_tokens, output_tokens = 11, 7
-        else:  # pragma: no cover - the real Agent should use only these two tasks
+        else:  # pragma: no cover - the real Agent should use only these tasks
             raise AssertionError(f"unexpected task type: {request.task_type}")
         return LLMResult(
             text=text,
@@ -121,12 +132,19 @@ async def test_real_postgresql_mcp_chatbi_path(
             assert result["row_count"] == 2  # type: ignore[index]
             assert result["truncated"] is False  # type: ignore[index]
             assert "chatbi_demo" in result["redacted_sql"]  # type: ignore[index]
-            assert result["usage"]["llm_calls"] == 2  # type: ignore[index]
+            assert result["usage"]["llm_calls"] == 3  # type: ignore[index]
             assert result["usage"]["provider"] == "fake-mcp"  # type: ignore[index]
             assert result["usage"]["model"] == "fake-mcp-model"  # type: ignore[index]
-            assert result["usage"]["input_tokens"] == 21  # type: ignore[index]
-            assert result["usage"]["output_tokens"] == 12  # type: ignore[index]
+            assert result["usage"]["input_tokens"] == 26  # type: ignore[index]
+            assert result["usage"]["output_tokens"] == 15  # type: ignore[index]
+            assert result["usage"]["task_type_counts"] == {  # type: ignore[index]
+                "chatbi_analysis": 1,
+                "chatbi_eligibility": 1,
+                "nl2sql": 1,
+            }
             assert [event["event"] for event in result["trace"]] == [  # type: ignore[index]
+                "eligibility_check_started",
+                "eligibility_eligible",
                 "schema_prepared",
                 "sql_generated",
                 "validation_accepted",

@@ -21,6 +21,14 @@ from .discovery import (
     SchemaDiscoveryService,
     create_postgres_schema_discovery_service,
 )
+from .eligibility import (
+    ELIGIBILITY_GATE_VERSION,
+    ELIGIBILITY_MAX_TOKENS,
+    ChatBIEligibilityService,
+    EligibilityAssessment,
+    EligibilityClassifierPayload,
+    build_eligibility_messages,
+)
 from .errors import ChatBIError, ChatBIErrorCategory
 from .execution import (
     ExecutionAdapter,
@@ -85,6 +93,8 @@ from .schemas import (
     DataSourcePublic,
     DataSourceUpdate,
     QueryAuditRecord,
+    QueryEligibilityDecision,
+    QueryEligibilityReasonCode,
     QueryExecutionRequest,
     QueryExecutionResult,
     QueryLifecycleState,
@@ -95,6 +105,8 @@ from .sql_validation import policy_fingerprint
 
 __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
+    "ELIGIBILITY_GATE_VERSION",
+    "ELIGIBILITY_MAX_TOKENS",
     "NL2SQL_MAX_TOKENS",
     "NL2SQL_PROMPT_VERSION",
     "NL2SQL_REASONING_MODE",
@@ -104,6 +116,7 @@ __all__ = [
     "ChatBIAgentLimits",
     "ChatBIAgentService",
     "ChatBIAnalysisPayload",
+    "ChatBIEligibilityService",
     "ChatBIError",
     "ChatBIErrorCategory",
     "ChatBIResult",
@@ -115,6 +128,8 @@ __all__ = [
     "DataSourceCreate",
     "DataSourcePublic",
     "DataSourceUpdate",
+    "EligibilityAssessment",
+    "EligibilityClassifierPayload",
     "EnvironmentCredentialResolver",
     "ExecutionAdapter",
     "ExecutionAuditRecorder",
@@ -124,6 +139,8 @@ __all__ = [
     "OutputColumnKind",
     "PostgresExecutionAdapter",
     "QueryAuditRecord",
+    "QueryEligibilityDecision",
+    "QueryEligibilityReasonCode",
     "QueryExecutionRequest",
     "QueryExecutionResult",
     "QueryLifecycleState",
@@ -157,6 +174,7 @@ __all__ = [
     "SemanticSchemaContext",
     "SortDirection",
     "build_chatbi_analysis_messages",
+    "build_eligibility_messages",
     "build_nl2sql_messages",
     "build_nl2sql_repair_messages",
     "build_result_contract_prompt_example",
