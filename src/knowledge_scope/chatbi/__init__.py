@@ -22,11 +22,14 @@ from .discovery import (
     create_postgres_schema_discovery_service,
 )
 from .eligibility import (
+    CLASSIFIER_DECISION_REASON_CODES,
     ELIGIBILITY_GATE_VERSION,
     ELIGIBILITY_MAX_TOKENS,
     ChatBIEligibilityService,
     EligibilityAssessment,
+    EligibilityClassifierOutputError,
     EligibilityClassifierPayload,
+    EligibilityStructuredErrorCategory,
     build_eligibility_messages,
 )
 from .errors import ChatBIError, ChatBIErrorCategory
@@ -105,6 +108,7 @@ from .sql_validation import policy_fingerprint
 
 __all__ = [
     "CHATBI_ANALYSIS_PROMPT_VERSION",
+    "CLASSIFIER_DECISION_REASON_CODES",
     "ELIGIBILITY_GATE_VERSION",
     "ELIGIBILITY_MAX_TOKENS",
     "NL2SQL_MAX_TOKENS",
@@ -129,7 +133,9 @@ __all__ = [
     "DataSourcePublic",
     "DataSourceUpdate",
     "EligibilityAssessment",
+    "EligibilityClassifierOutputError",
     "EligibilityClassifierPayload",
+    "EligibilityStructuredErrorCategory",
     "EnvironmentCredentialResolver",
     "ExecutionAdapter",
     "ExecutionAuditRecorder",

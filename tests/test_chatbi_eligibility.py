@@ -8,11 +8,13 @@ from uuid import UUID, uuid4
 import pytest
 
 from knowledge_scope.chatbi import (
+    CLASSIFIER_DECISION_REASON_CODES,
     ChatBIAgentService,
     ChatBIEligibilityService,
     ChatBIErrorCategory,
     ColumnMetadata,
     DataSource,
+    EligibilityStructuredErrorCategory,
     NL2SQLInput,
     NL2SQLService,
     QueryEligibilityReasonCode,
@@ -140,15 +142,11 @@ def _query(question: str) -> NL2SQLInput:
 def _classifier_payload(
     decision: str,
     reason_code: str,
-    *,
-    clarification_question: str | None = None,
 ) -> str:
     return json.dumps(
         {
             "decision": decision,
             "reason_code": reason_code,
-            "user_message": "model text is not trusted",
-            "clarification_question": clarification_question,
         },
         ensure_ascii=False,
     )
@@ -183,9 +181,7 @@ async def test_deterministic_write_gate_refuses_without_provider_or_sql() -> Non
 async def test_ambiguous_requests_use_strict_classifier_and_return_clarify(
     question: str,
 ) -> None:
-    gateway = _ClassifierGateway(
-        [_classifier_payload("clarify", "ambiguous_intent", clarification_question="请补充范围")]
-    )
+    gateway = _ClassifierGateway([_classifier_payload("clarify", "ambiguous_intent")])
     service, _discovery = _eligibility_service(gateway)
 
     assessment = await service.assess_for_registered_data_source(
@@ -251,8 +247,131 @@ async def test_mutation_keyword_in_analytical_question_is_not_deterministically_
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("decision", "reason_code"),
+    [
+        (decision, reason_code.value)
+        for decision, reason_codes in CLASSIFIER_DECISION_REASON_CODES.items()
+        for reason_code in reason_codes
+    ],
+)
+async def test_classifier_accepts_only_closed_decision_reason_combinations(
+    decision: str,
+    reason_code: str,
+) -> None:
+    gateway = _ClassifierGateway([_classifier_payload(decision, reason_code)])
+    service, _discovery = _eligibility_service(gateway)
+
+    assessment = await service.assess_for_registered_data_source(
+        DATASOURCE_ID,
+        _query("统计每个地区的销售总额"),
+        policy=QueryPolicy(),
+        max_chars=10_000,
+    )
+
+    assert assessment.decision.decision == decision
+    assert assessment.decision.reason_code.value == reason_code
+    assert assessment.structured_error_category is None
+
+
+@pytest.mark.anyio
+async def test_classifier_prompt_is_synchronized_with_the_closed_mapping() -> None:
+    gateway = _ClassifierGateway([_classifier_payload("eligible", "eligible_analytical")])
+    service, _discovery = _eligibility_service(gateway)
+
+    await service.assess_for_registered_data_source(
+        DATASOURCE_ID,
+        _query("统计每个地区的销售总额"),
+        policy=QueryPolicy(),
+        max_chars=10_000,
+    )
+
+    prompt = gateway.requests[0].messages[0].content
+    assert '{"decision":"<decision>","reason_code":"<reason_code>"}' in prompt
+    for decision, reason_codes in CLASSIFIER_DECISION_REASON_CODES.items():
+        assert f'"{decision}"' in prompt
+        for reason_code in reason_codes:
+            assert f'"{reason_code.value}"' in prompt
+    assert "user_message" not in prompt
+    assert "clarification_question" not in prompt
+    assert "no markdown" in prompt
+    assert "Do not add additional fields." in prompt
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("response", "category"),
+    [
+        ("", EligibilityStructuredErrorCategory.PROVIDER_CONTENT_MISSING),
+        ("not-json", EligibilityStructuredErrorCategory.JSON_DECODE_ERROR),
+        ("[]", EligibilityStructuredErrorCategory.TOP_LEVEL_SHAPE_ERROR),
+        ('"eligible"', EligibilityStructuredErrorCategory.TOP_LEVEL_SHAPE_ERROR),
+        ('{"decision":"eligible"}', EligibilityStructuredErrorCategory.REQUIRED_FIELD_MISSING),
+        (
+            '{"reason_code":"eligible_analytical"}',
+            EligibilityStructuredErrorCategory.REQUIRED_FIELD_MISSING,
+        ),
+        (
+            '{"decision":"eligible","reason_code":"eligible_analytical","user_message":"legacy"}',
+            EligibilityStructuredErrorCategory.EXTRA_FIELD_ERROR,
+        ),
+        (
+            '{"decision":"ELIGIBLE","reason_code":"eligible_analytical"}',
+            EligibilityStructuredErrorCategory.INVALID_DECISION,
+        ),
+        (
+            '{"decision":"eligible","reason_code":"unknown"}',
+            EligibilityStructuredErrorCategory.INVALID_REASON_CODE,
+        ),
+        (
+            '{"decision":"eligible","reason_code":"eligibility_check_unavailable"}',
+            EligibilityStructuredErrorCategory.INVALID_REASON_CODE,
+        ),
+        (
+            '{"decision":"eligible","reason_code":"ambiguous_intent"}',
+            EligibilityStructuredErrorCategory.SEMANTIC_CONTRACT_ERROR,
+        ),
+        (
+            '{"decision":"eligible","reason_code":"eligible_analytical","decision":"eligible"}',
+            EligibilityStructuredErrorCategory.JSON_DECODE_ERROR,
+        ),
+        (
+            '```json\n{"decision":"eligible","reason_code":"eligible_analytical"}\n```',
+            EligibilityStructuredErrorCategory.JSON_DECODE_ERROR,
+        ),
+        (
+            'Here is the decision: {"decision":"eligible","reason_code":"eligible_analytical"}',
+            EligibilityStructuredErrorCategory.JSON_DECODE_ERROR,
+        ),
+    ],
+)
+async def test_classifier_contract_failures_are_bounded_and_unavailable(
+    response: str,
+    category: EligibilityStructuredErrorCategory,
+) -> None:
+    gateway = _ClassifierGateway([response])
+    service, _discovery = _eligibility_service(gateway)
+
+    assessment = await service.assess_for_registered_data_source(
+        DATASOURCE_ID,
+        _query("统计每个地区的销售总额"),
+        policy=QueryPolicy(),
+        max_chars=10_000,
+    )
+
+    assert assessment.decision.decision == "unavailable"
+    unavailable_reason = QueryEligibilityReasonCode.ELIGIBILITY_CHECK_UNAVAILABLE
+    assert assessment.decision.reason_code is unavailable_reason
+    assert assessment.structured_error_category is category
+    if response:
+        assert response not in assessment.decision.user_message
+
+
+@pytest.mark.anyio
 async def test_malformed_classifier_fails_closed_with_completed_usage() -> None:
-    gateway = _ClassifierGateway(['{"decision":"eligible","unknown":true}'])
+    gateway = _ClassifierGateway(
+        ['{"decision":"eligible","reason_code":"eligible_analytical","unknown":true}']
+    )
     service, _discovery = _eligibility_service(gateway)
 
     assessment = await service.assess_for_registered_data_source(
@@ -269,6 +388,8 @@ async def test_malformed_classifier_fails_closed_with_completed_usage() -> None:
     assert assessment.llm_call_made is True
     assert assessment.usage is not None
     assert assessment.usage.task_type == "chatbi_eligibility"  # type: ignore[union-attr]
+    extra_field_error = EligibilityStructuredErrorCategory.EXTRA_FIELD_ERROR
+    assert assessment.structured_error_category is extra_field_error
 
 
 @pytest.mark.anyio
@@ -392,7 +513,7 @@ class _Analysis:
     [
         (
             "销售情况怎么样\uff1f",
-            _classifier_payload("clarify", "ambiguous_intent", clarification_question="请补充范围"),
+            _classifier_payload("clarify", "ambiguous_intent"),
             QueryLifecycleState.CLARIFY,
         ),
         (
