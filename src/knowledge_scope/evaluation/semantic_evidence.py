@@ -27,6 +27,7 @@ from sqlglot.errors import SqlglotError
 from knowledge_scope.chatbi.agent import ChatBIResult
 from knowledge_scope.chatbi.nl2sql_models import ValidatedSQL
 from knowledge_scope.chatbi.schemas import QueryExecutionResult, QueryLifecycleState
+from knowledge_scope.evaluation.schema_provenance import EvaluationValidatedSQL
 from knowledge_scope.llm.schemas import LLMProviderInvocation
 
 SEMANTIC_EVIDENCE_VERSION = "a5.7g2-semantic-evidence-v1"
@@ -1563,7 +1564,7 @@ def capture_semantic_evidence(
     fixture_fingerprint: str,
     schema_fingerprint: str,
     synthetic_fixture_fingerprint: str,
-    validated_sql: ValidatedSQL | None,
+    validated_sql: ValidatedSQL | EvaluationValidatedSQL | None,
     execution_result: QueryExecutionResult | None,
     chatbi_result: ChatBIResult,
     provider_invocations: Iterable[LLMProviderInvocation],
@@ -1576,10 +1577,19 @@ def capture_semantic_evidence(
         raise SemanticEvidenceError("only synthetic_exact_v1 is implemented")
     if fixture_fingerprint != synthetic_fixture_fingerprint:
         raise SemanticEvidenceError("synthetic exact evidence requires the frozen fixture")
-    if validated_sql is not None:
-        if validated_sql.datasource_id != datasource_id:
+    native_validated_sql: ValidatedSQL | None
+    if isinstance(validated_sql, EvaluationValidatedSQL):
+        native_validated_sql = validated_sql.validated_sql
+        validated_schema_fingerprint = validated_sql.evaluation_schema_fingerprint
+    else:
+        native_validated_sql = validated_sql
+        validated_schema_fingerprint = (
+            validated_sql.schema_fingerprint if validated_sql is not None else None
+        )
+    if native_validated_sql is not None:
+        if native_validated_sql.datasource_id != datasource_id:
             raise SemanticEvidenceError("validated SQL datasource does not match evidence")
-        if validated_sql.schema_fingerprint != schema_fingerprint:
+        if validated_schema_fingerprint != schema_fingerprint:
             raise SemanticEvidenceError("validated SQL schema fingerprint does not match evidence")
     if chatbi_result.datasource_id != datasource_id:
         raise SemanticEvidenceError("ChatBI result datasource does not match evidence")
@@ -1617,7 +1627,9 @@ def capture_semantic_evidence(
             reasons=capture_reasons,
         )
     try:
-        statement = parse_one(validated_sql.normalized_sql, read="postgres")
+        if native_validated_sql is None:
+            raise SemanticEvidenceError("validated SQL is required for SQL evidence")
+        statement = parse_one(native_validated_sql.normalized_sql, read="postgres")
         _check_ast_node_bound(statement)
         sql_evidence = _query_evidence(statement)
     except _EvidenceBoundExceeded as error:

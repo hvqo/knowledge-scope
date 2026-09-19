@@ -34,6 +34,22 @@ schema allow-list 限制范围。`information_schema`、`pg_catalog`、`pg_toast
 `SchemaSnapshot.to_deterministic_json()` 使用 UTF-8、固定 separators 和 sorted keys；其 SHA-256
 `fingerprint` 会随结构或语义 comment 改变，但不包含时间戳或凭据。
 
+## 评测 provenance 与可执行 schema 的边界
+
+正式 ChatBI 运行使用上述 `SchemaSnapshot` 作为 NL2SQL prompt、授权和执行安全的
+executable schema。A5.7 provider 评测另外通过只读 PostgreSQL catalog provenance adapter
+读取冻结契约所需的表、视图、列、类型、可空性、主键、UNIQUE、FK 和 CHECK；这个
+authoritative provenance schema 只用于共享 canonical payload、benchmark provenance 和
+SemanticEvidence 绑定，不会因为看到了 `chatbi_demo.region_sales` view 就扩大
+`allow_views=false` 的可执行权限。
+
+评测 provenance 使用 `canonical_schema_payload()` 与 `schema_fingerprint()`；它不是
+`SchemaSnapshot.fingerprint` 的替代品。后者仍是生产 native snapshot identity。provider
+preflight 在构造 provider 前从已注册 datasource 重新发现 catalog provenance，并要求它与
+冻结指纹相等；不匹配时不会创建 provider 或执行 DEV cases。通过门禁后，evaluation
+validated SQL 保留 native fingerprint，并通过显式的 evaluation binding 携带已验证的
+catalog fingerprint，避免用一个字段混淆两个 schema contract。
+
 ## SemanticSchemaContext
 
 context 使用确定性的纯文本格式表达完整 relation block。`max_chars` 是字符预算，不会在 table、
