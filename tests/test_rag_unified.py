@@ -239,6 +239,8 @@ def test_multimodal_context_uses_evidence_citation_without_fake_chunk(
     assert citation.evidence_id == f"evidence-{modality}"
     assert citation.modality == modality
     assert citation.representation_ids == [f"representation-{modality}"]
+    assert citation.snippet == f"{modality} 的可检索表示"
+    assert citation.snippet_kind == "representation"
     assert citation.asset_refs == [f"assets/{modality}-1"]
     assert "context_kind=representation" in selection.render()
 

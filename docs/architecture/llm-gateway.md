@@ -32,4 +32,4 @@ uv run alembic upgrade head
 uv run knowledgescope llm-smoke-test --task-type evaluation
 ```
 
-正常单元测试通过 mock HTTP transport、fake provider 和测试数据库验证，不会发起网络请求。A2.7 在此 gateway 之上增加了独立的 RAG prompt 编排和 `POST /api/v1/rag/query` SSE endpoint；当前仍没有对话历史、流式 WebSocket 或前端聊天 UI。
+正常单元测试通过 mock HTTP transport、fake provider 和测试数据库验证，不会发起网络请求。A2.7 在此 gateway 之上增加了独立的 RAG prompt 编排和 `POST /api/v1/rag/query` SSE endpoint；F1 前端工作区消费该 SSE 接口，但后端仍不保存对话历史，也不使用流式 WebSocket。

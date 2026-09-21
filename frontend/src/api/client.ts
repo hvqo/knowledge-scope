@@ -7,6 +7,9 @@ import type {
   MetaResponse,
   Document,
   DocumentListResponse,
+  RAGCitation,
+  RAGCompleteData,
+  RAGStreamEvent,
 } from "./types";
 
 const DEFAULT_API_BASE_URL = "/api";
@@ -202,4 +205,294 @@ export function deleteDocument(knowledgeBaseId: string, documentId: string): Pro
     `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}`,
     { method: "DELETE" },
   );
+}
+
+export interface RAGQueryRequest {
+  query: string;
+  knowledge_base_id: string;
+  retrieval_mode?: "dense" | "unified";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`RAG stream field ${field} is invalid`);
+  }
+  return value;
+}
+
+function nullableString(value: unknown, field: string): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return requiredString(value, field);
+}
+
+function requiredFiniteNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`RAG stream field ${field} is invalid`);
+  }
+  return value;
+}
+
+function nullableFiniteNumber(value: unknown, field: string): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return requiredFiniteNumber(value, field);
+}
+
+function nullableBoolean(value: unknown, field: string): boolean | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`RAG stream field ${field} is invalid`);
+  }
+  return value;
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`RAG stream field ${field} is invalid`);
+  }
+  return value;
+}
+
+function parseCitationBranch(value: unknown): RAGCitation["branch_provenance"][number] {
+  if (!isRecord(value)) {
+    throw new Error("RAG citation branch is invalid");
+  }
+  const branch = requiredString(value.branch, "branch");
+  if (branch !== "dense" && branch !== "sparse" && branch !== "graph" && branch !== "multimodal") {
+    throw new Error("RAG citation branch is invalid");
+  }
+  const graphSeed = nullableString(value.graph_seed_entity_id, "graph_seed_entity_id");
+  const graphReason = nullableString(value.graph_retrieval_reason, "graph_retrieval_reason");
+  if (branch === "graph" && (graphSeed === null || graphReason === null)) {
+    throw new Error("RAG graph citation branch is incomplete");
+  }
+  if (branch !== "graph" && (graphSeed !== null || graphReason !== null)) {
+    throw new Error("RAG non-graph citation branch contains graph metadata");
+  }
+  return {
+    branch,
+    rank: requiredFiniteNumber(value.rank, "rank"),
+    score: requiredFiniteNumber(value.score, "score"),
+    graph_seed_entity_id: graphSeed,
+    graph_retrieval_reason: graphReason,
+  };
+}
+
+function parseCitation(value: unknown): RAGCitation {
+  if (!isRecord(value)) {
+    throw new Error("RAG citation is invalid");
+  }
+  const candidateKind = requiredString(value.candidate_kind, "candidate_kind");
+  if (candidateKind !== "chunk" && candidateKind !== "evidence") {
+    throw new Error("RAG citation kind is invalid");
+  }
+  const modality = nullableString(value.modality, "modality");
+  if (
+    modality !== null &&
+    modality !== "text" &&
+    modality !== "image" &&
+    modality !== "table" &&
+    modality !== "formula"
+  ) {
+    throw new Error("RAG citation modality is invalid");
+  }
+  const citation: RAGCitation = {
+    marker: requiredString(value.marker, "marker"),
+    document_id: requiredString(value.document_id, "document_id"),
+    knowledge_base_id: nullableString(value.knowledge_base_id, "knowledge_base_id"),
+    candidate_kind: candidateKind,
+    chunk_id: nullableString(value.chunk_id, "chunk_id"),
+    evidence_id: nullableString(value.evidence_id, "evidence_id"),
+    modality,
+    representation_ids: stringArray(value.representation_ids, "representation_ids"),
+    asset_refs: stringArray(value.asset_refs, "asset_refs"),
+    page_start: requiredFiniteNumber(value.page_start, "page_start"),
+    page_end: requiredFiniteNumber(value.page_end, "page_end"),
+    source_block_ids: stringArray(value.source_block_ids, "source_block_ids"),
+    section_path: stringArray(value.section_path, "section_path"),
+    section_title: nullableString(value.section_title, "section_title"),
+    snippet: nullableString(value.snippet, "snippet"),
+    snippet_kind: (() => {
+      const valueKind = nullableString(value.snippet_kind, "snippet_kind");
+      if (valueKind !== null && valueKind !== "source" && valueKind !== "representation") {
+        throw new Error("RAG citation snippet kind is invalid");
+      }
+      return valueKind;
+    })(),
+    final_rank: nullableFiniteNumber(value.final_rank, "final_rank"),
+    final_reranker_score: nullableFiniteNumber(value.final_reranker_score, "final_reranker_score"),
+    branch_provenance: Array.isArray(value.branch_provenance)
+      ? value.branch_provenance.map(parseCitationBranch)
+      : (() => {
+          throw new Error("RAG branch provenance is invalid");
+        })(),
+  };
+  if (citation.candidate_kind === "chunk") {
+    if (citation.chunk_id === null || citation.evidence_id !== null || citation.modality !== null) {
+      throw new Error("RAG chunk citation contract is invalid");
+    }
+  } else if (
+    citation.chunk_id !== null ||
+    citation.evidence_id === null ||
+    citation.modality === null ||
+    citation.representation_ids.length === 0
+  ) {
+    throw new Error("RAG Evidence citation contract is invalid");
+  }
+  if ((citation.snippet === null) !== (citation.snippet_kind === null)) {
+    throw new Error("RAG citation snippet contract is invalid");
+  }
+  if (
+    citation.candidate_kind === "chunk" &&
+    citation.snippet_kind !== null &&
+    citation.snippet_kind !== "source"
+  ) {
+    throw new Error("RAG chunk snippet contract is invalid");
+  }
+  if (
+    citation.candidate_kind === "evidence" &&
+    citation.snippet_kind !== null &&
+    citation.snippet_kind !== "representation"
+  ) {
+    throw new Error("RAG Evidence snippet contract is invalid");
+  }
+  return citation;
+}
+
+function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawData) as unknown;
+  } catch {
+    throw new Error("RAG stream returned invalid JSON");
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("RAG stream payload is not an object");
+  }
+  if (eventName === "answer_delta") {
+    return { event: "answer_delta", data: { text: requiredString(parsed.text, "text") } };
+  }
+  if (eventName === "citations") {
+    const items = Array.isArray(parsed.items) ? parsed.items.map(parseCitation) : null;
+    if (items === null) {
+      throw new Error("RAG citations payload is invalid");
+    }
+    return {
+      event: "citations",
+      data: { prompt_version: requiredString(parsed.prompt_version, "prompt_version"), items },
+    };
+  }
+  if (eventName === "error") {
+    return {
+      event: "error",
+      data: {
+        category: requiredString(parsed.category, "category"),
+        message: requiredString(parsed.message, "message"),
+      },
+    };
+  }
+  if (eventName === "complete") {
+    const status = requiredString(parsed.status, "status");
+    if (status !== "completed" && status !== "insufficient_evidence" && status !== "error") {
+      throw new Error("RAG completion status is invalid");
+    }
+    const retrievalMode = requiredString(parsed.retrieval_mode, "retrieval_mode");
+    if (retrievalMode !== "dense" && retrievalMode !== "unified") {
+      throw new Error("RAG retrieval mode is invalid");
+    }
+    const complete: RAGCompleteData = {
+      status,
+      prompt_version: requiredString(parsed.prompt_version, "prompt_version"),
+      provider: nullableString(parsed.provider, "provider"),
+      model: nullableString(parsed.model, "model"),
+      retrieval_mode: retrievalMode,
+      retrieval_degraded: nullableBoolean(parsed.retrieval_degraded, "retrieval_degraded"),
+      retrieval_branch_statuses: isRecord(parsed.retrieval_branch_statuses)
+        ? Object.fromEntries(
+            Object.entries(parsed.retrieval_branch_statuses).filter(
+              ([, value]) => typeof value === "string",
+            ),
+          ) as RAGCompleteData["retrieval_branch_statuses"]
+        : null,
+      input_tokens: nullableFiniteNumber(parsed.input_tokens, "input_tokens"),
+      output_tokens: nullableFiniteNumber(parsed.output_tokens, "output_tokens"),
+      finish_reason: nullableString(parsed.finish_reason, "finish_reason"),
+      retrieval_latency_ms: nullableFiniteNumber(parsed.retrieval_latency_ms, "retrieval_latency_ms"),
+      llm_latency_ms: nullableFiniteNumber(parsed.llm_latency_ms, "llm_latency_ms"),
+      latency_ms: requiredFiniteNumber(parsed.latency_ms, "latency_ms"),
+    };
+    return { event: "complete", data: complete };
+  }
+  throw new Error("RAG stream event is unsupported");
+}
+
+function parseSseBlock(block: string): { event: string; data: string } | null {
+  const data: string[] = [];
+  let event = "message";
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+  return data.length > 0 ? { event, data: data.join("\n") } : null;
+}
+
+export async function* streamRagQuery(
+  payload: RAGQueryRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<RAGStreamEvent> {
+  const response = await fetch(`${API_BASE_URL}/v1/rag/query`, {
+    method: "POST",
+    headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, retrieval_mode: payload.retrieval_mode ?? "dense" }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new ApiError(response.status, response.statusText, await readErrorDetail(response));
+  }
+  if (response.body === null) {
+    throw new Error("RAG stream has no response body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex >= 0) {
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const parsed = parseSseBlock(block);
+        if (parsed !== null) {
+          yield parseRagStreamEvent(parsed.event, parsed.data);
+        }
+        separatorIndex = buffer.indexOf("\n\n");
+      }
+      if (done) {
+        if (buffer.trim()) {
+          const parsed = parseSseBlock(buffer);
+          if (parsed !== null) {
+            yield parseRagStreamEvent(parsed.event, parsed.data);
+          }
+        }
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
