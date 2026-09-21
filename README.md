@@ -40,6 +40,10 @@ text、image、table、formula 都可以作为 Evidence 来源，并拥有多个
 统一候选池交给 BGE final reranker，再组装 RAG context。应用生成确定性的 citation marker，
 每个 citation 都能回到真实的 document/page/block/evidence lineage。
 
+### AI 问答
+
+前端 AI 问答工作区连接现有 RAG SSE 接口，支持选择知识库、流式回答和可回看的来源卡片。对话暂存于当前浏览器会话，引用保留文档、页码和 source block lineage。
+
 ### 以评测为约束
 
 检索路径提供只读、可复现的离线评测和消融记录。评测使用冻结的标注、索引和数据快照，
