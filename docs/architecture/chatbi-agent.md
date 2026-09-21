@@ -15,7 +15,7 @@ question
      ├─ clarify -> terminal clarification result
      ├─ refuse -> terminal unsupported result
      └─ unavailable -> terminal controlled eligibility failure
-  -> NL2SQL LLM call（a5.3-v3：SQL-only）
+  -> NL2SQL LLM call（a5.7j2-v1：SQL-only）
   -> SQLCandidate（不可信）
   -> fresh datasource-bound AST / policy validation
   -> read-only PostgreSQL execution
@@ -32,7 +32,7 @@ question
 生产 ChatBI 默认不要求模型生成 `ResultContract`。`a5.3-v4` 的
 ResultContract + SQL 结构、解析器、语义诊断和一致性工具仍保留为显式的评测/诊断能力；
 只有调用方明确启用诊断配置时才使用它们。正常 NL2SQL 初次生成和有界修复都使用
-`a5.3-v3` 的 SQL-only 响应，因此契约诊断失败不会阻断正常 SQL 生成。
+`a5.7j2-v1` 的 SQL-only 响应，因此契约诊断失败不会阻断正常 SQL 生成。
 
 ## 有界循环
 

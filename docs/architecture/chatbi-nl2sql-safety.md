@@ -19,7 +19,7 @@ A5.2 只读 schema discovery
         ↓
 SchemaDiscoveryResult（当前 snapshot + 已预算 context）
         ↓
-LLMGateway（一次结构化 JSON：SQL-only，a5.3-v3）
+LLMGateway（一次结构化 JSON：SQL-only，a5.7j2-v1）
         ↓
 SQL 结构校验
         ↓
@@ -47,7 +47,7 @@ SQL 候选进入上述 trusted validation path，不能接收调用方传入或�
 
 ## ResultContract（显式评测/诊断能力）
 
-生产 NL2SQL 默认使用 `a5.3-v3` 的 SQL-only 响应：
+当前 SQL-only 提示词实验使用 `a5.7j2-v1`，输出契约仍为：
 
 ```json
 {"sql":"SELECT ..."}
@@ -148,7 +148,7 @@ delimiter-safe escaping；标识符
 `connection_ref`、数据库 URL 或凭据。
 
 `chatbi nl2sql` 是面向用户的 SQL 生成命令：它先从注册数据源执行只读 schema discovery，
-再经过 Query Eligibility。只有 `eligible` 请求才生成 `a5.3-v3` SQL-only 响应并进入
+再经过 Query Eligibility。只有 `eligible` 请求才生成 `a5.7j2-v1` SQL-only 响应并进入
 A5.3 trusted SQL validation；`clarify`、`refuse` 和 `unavailable` 都在生成前终止，
 不会调用 NL2SQL。完整生产链路随后进入只读执行，本命令本身没有 SQL 执行 endpoint。
 `a5.3-v4` ResultContract + SQL 仅在显式评测/诊断配置下使用。
