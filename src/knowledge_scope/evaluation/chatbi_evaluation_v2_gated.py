@@ -41,6 +41,7 @@ from knowledge_scope.chatbi.eligibility import (
     EligibilityAssessment,
     EligibilityStructuredErrorCategory,
 )
+from knowledge_scope.chatbi.nl2sql_models import NL2SQL_PROMPT_VERSION
 from knowledge_scope.chatbi.schemas import QueryEligibilityReasonCode, QueryLifecycleState
 from knowledge_scope.evaluation.chatbi_evaluation import (
     ChatBIEvaluationError,
@@ -304,7 +305,9 @@ class GatedRunProvenance(_GatedModel):
     model: StrictStr = Field(min_length=1, max_length=255)
     eligibility_gate_version: Literal["a5.7i2-v1"] = ELIGIBILITY_GATE_VERSION
     eligibility_task_type: Literal["chatbi_eligibility"] = "chatbi_eligibility"
-    nl2sql_prompt_version: Literal["a5.3-v3"] = "a5.3-v3"
+    # Keep historical a5.3-v3 gated artifacts readable while recording the
+    # current prompt experiment for newly built artifacts.
+    nl2sql_prompt_version: Literal["a5.3-v3", "a5.7j2-v1"] = NL2SQL_PROMPT_VERSION
     nl2sql_reasoning: Literal["disabled"] = "disabled"
     nl2sql_max_tokens: Literal[1024] = 1024
     repair_reasoning: Literal["disabled"] = "disabled"
