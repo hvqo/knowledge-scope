@@ -141,6 +141,38 @@ def test_chatbi_nl2sql_parser_requires_question_and_supports_limits() -> None:
     assert args.model == "deepseek-chat"
 
 
+def test_gated_provider_cli_is_distinct_from_legacy_provider_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from knowledge_scope import cli
+
+    calls: list[str] = []
+
+    def gated_dispatch(args: object) -> int:
+        calls.append(args.chatbi_action)
+        return 17
+
+    monkeypatch.setattr(cli, "_run_chatbi_eval_v2_gated_provider", gated_dispatch)
+    assert cli.main(["chatbi", "eval-v2-gated-provider", "--split", "dev"]) == 17
+    assert calls == ["eval-v2-gated-provider"]
+
+    gated_args = build_parser().parse_args(["chatbi", "eval-v2-gated-provider", "--split", "dev"])
+    legacy_args = build_parser().parse_args(["chatbi", "eval-v2-provider", "--split", "dev"])
+    assert gated_args.chatbi_action != legacy_args.chatbi_action
+
+
+def test_gated_provider_cli_rejects_test_before_provider_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from knowledge_scope import cli
+
+    monkeypatch.setattr(cli, "get_settings", lambda: Settings(_env_file=None))
+
+    assert cli.main(["chatbi", "eval-v2-gated-provider", "--split", "test"]) == 1
+    assert "only the frozen DEV split" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("decision", "reason_code", "expected_exit", "expected_calls", "expected_status"),
     [
