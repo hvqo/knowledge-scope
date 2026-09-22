@@ -184,6 +184,9 @@ describe("askChatBI", () => {
     expect(getUserFacingError(new Error("internal stack"), "请求失败，请稍后重试。")).toBe(
       "请求失败，请稍后重试。",
     );
+    expect(getUserFacingError(new ApiError(400, "Bad Request", "内部校验细节"), "请求失败，请稍后重试。")).toBe(
+      "请求内容不正确，请检查后重试。",
+    );
   });
 
   it("sends only the question and parses bounded tabular output", async () => {

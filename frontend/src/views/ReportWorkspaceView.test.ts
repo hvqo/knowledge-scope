@@ -618,6 +618,98 @@ describe("ReportWorkspaceView", () => {
     expect(fetchMock.mock.calls.filter(([, request]) => request?.method === "PATCH")).toHaveLength(2);
   });
 
+  it("confirms before removing a persisted source", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1")) {
+        return jsonResponse(baseReport);
+      }
+      if (
+        url.includes("/knowledge-bases?") ||
+        url.includes("/chatbi/data-sources?") ||
+        url.includes("/documents?")
+      ) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    await wrapper.findAll("[role='tab']")[2]!.trigger("click");
+    await wrapper.get(".report-source-card__remove").trigger("click");
+    expect(confirm).toHaveBeenCalledWith("确认移除这条报告来源吗？正文内容不会自动删除。");
+    expect(fetchMock.mock.calls.some(([, request]) => request?.method === "DELETE")).toBe(false);
+
+    confirm.mockReturnValue(true);
+    await wrapper.get(".report-source-card__remove").trigger("click");
+    await vi.waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, request]) => request?.method === "DELETE")).toBe(true),
+    );
+  });
+
+  it("does not download an export that completes after switching reports", async () => {
+    const reportB = JSON.parse(JSON.stringify(baseReport)) as typeof baseReport;
+    reportB.id = "report-2";
+    reportB.sections[0].report_id = "report-2";
+    reportB.sections[0].content = "报告 B 内容";
+    let resolveExport: ((response: Response) => void) | null = null;
+    const createObjectURL = vi.fn(() => "blob:stale");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1") && !url.includes("/export/")) {
+        return jsonResponse(baseReport);
+      }
+      if (init?.method === undefined && url.includes("/reports/report-2") && !url.includes("/export/")) {
+        return jsonResponse(reportB);
+      }
+      if (
+        url.includes("/knowledge-bases?") ||
+        url.includes("/chatbi/data-sources?") ||
+        url.includes("/documents?")
+      ) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (url.endsWith("/export/docx")) {
+        return new Promise<Response>((resolve) => {
+          resolveExport = resolve;
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    await wrapper.findAll(".report-workspace-page__export")[0]!.trigger("click");
+    await vi.waitFor(() => expect(resolveExport).not.toBeNull());
+    routeState.current!.id = "report-2";
+    await vi.waitFor(() =>
+      expect((wrapper.get(".report-editor__textarea").element as HTMLTextAreaElement).value).toBe("报告 B 内容"),
+    );
+    resolveExport!(new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    await flushPromises();
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
   it("triggers DOCX/PDF export and surfaces export failures", async () => {
     const createObjectURL = vi.fn(() => "blob:report");
     const revokeObjectURL = vi.fn();
