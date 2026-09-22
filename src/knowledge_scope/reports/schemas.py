@@ -311,7 +311,85 @@ class ReportListResponse(_ReportModel):
     offset: int = Field(ge=0)
 
 
+REPORT_AI_MAX_SOURCE_REFERENCES = 12
+REPORT_AI_INSTRUCTION_MAX_LENGTH = 2_000
+
+
+class ReportAIContextRequest(_ReportModel):
+    """Bounded source selection shared by report-generation previews."""
+
+    source_ids: list[UUID] = Field(
+        default_factory=list,
+        max_length=REPORT_AI_MAX_SOURCE_REFERENCES,
+    )
+    instruction: str | None = Field(default=None, max_length=REPORT_AI_INSTRUCTION_MAX_LENGTH)
+
+    @field_validator("instruction")
+    @classmethod
+    def normalize_instruction(cls, value: str | None) -> str | None:
+        return _optional_trimmed(value, "instruction")
+
+    @field_validator("source_ids")
+    @classmethod
+    def require_unique_sources(cls, value: list[UUID]) -> list[UUID]:
+        if len(value) != len(set(value)):
+            raise ValueError("source_ids must be unique")
+        return value
+
+
+class ReportAIOutlineRequest(ReportAIContextRequest):
+    topic: str | None = Field(default=None, max_length=REPORT_TITLE_MAX_LENGTH)
+
+    @field_validator("topic")
+    @classmethod
+    def normalize_topic(cls, value: str | None) -> str | None:
+        return _optional_trimmed(value, "topic")
+
+
+class ReportAIEditRequest(ReportAIContextRequest):
+    operation: Literal["rewrite", "expand", "summarize"]
+
+
+class ReportAIOutlineItem(_ReportModel):
+    title: str = Field(min_length=1, max_length=REPORT_SECTION_TITLE_MAX_LENGTH)
+    summary: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("title", "summary")
+    @classmethod
+    def normalize_outline_text(cls, value: str) -> str:
+        return _trimmed(value, "outline value")
+
+
+class ReportAIOutlineResponse(_ReportModel):
+    items: list[ReportAIOutlineItem] = Field(min_length=1, max_length=12)
+
+
+class ReportAICitation(_ReportModel):
+    marker: str = Field(pattern=r"^S-[0-9A-F]{12}$")
+    title: str = Field(min_length=1, max_length=REPORT_SOURCE_TITLE_MAX_LENGTH)
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+
+
+class ReportAIDraftResponse(_ReportModel):
+    operation: Literal["generate", "rewrite", "expand", "summarize"]
+    content: str = Field(min_length=1, max_length=REPORT_SECTION_CONTENT_MAX_LENGTH)
+    citations: list[ReportAICitation] = Field(default_factory=list, max_length=12)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_generated_content(cls, value: str) -> str:
+        return _trimmed(value, "generated content")
+
+
 __all__ = [
+    "ReportAICitation",
+    "ReportAIContextRequest",
+    "ReportAIDraftResponse",
+    "ReportAIEditRequest",
+    "ReportAIOutlineItem",
+    "ReportAIOutlineRequest",
+    "ReportAIOutlineResponse",
     "ReportChatBISourceCreate",
     "ReportCreate",
     "ReportDetailResponse",

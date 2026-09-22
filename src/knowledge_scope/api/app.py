@@ -60,7 +60,7 @@ PROJECT_STATUS: Final = "foundation"
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Initialize the default RAG graph and dispose owned clients on shutdown."""
     provider = None
-    gateway: LLMGateway | None = None
+    gateway: LLMGateway | None = getattr(application.state, "llm_gateway", None)
     try:
         if application.state.representation_store is None:
             application.state.representation_store = QdrantRepresentationStore(
@@ -79,13 +79,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             sparse_store = application.state.sparse_store
             if sparse_store is None:  # pragma: no cover - initialized above.
                 raise RuntimeError("sparse store is not initialized")
-            provider = create_llm_provider(settings)
-            application.state.llm_provider = provider
-            gateway = LLMGateway(
-                provider,
-                DatabaseUsageRecorder(application.state.db_session_factory),
-                settings,
-            )
+            if gateway is None:
+                provider = create_llm_provider(settings)
+                application.state.llm_provider = provider
+                gateway = LLMGateway(
+                    provider,
+                    DatabaseUsageRecorder(application.state.db_session_factory),
+                    settings,
+                )
+                application.state.llm_gateway = gateway
         if application.state.rag_service is None:
             settings = application.state.settings
             if gateway is None:  # pragma: no cover - provider is created above.
@@ -196,6 +198,7 @@ def create_app(
     representation_store: QdrantRepresentationStore | None = None,
     sparse_store: SparseIndexStore | None = None,
     chatbi_agent_service: ChatBIAgentService | None = None,
+    llm_gateway: LLMGateway | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -218,6 +221,8 @@ def create_app(
     application.state.representation_store = representation_store
     application.state.sparse_store = sparse_store
     application.state.chatbi_agent_service = chatbi_agent_service
+    application.state.llm_gateway = llm_gateway
+    application.state.report_generation_service = None
     application.state.llm_provider = None
     application.add_middleware(
         CORSMiddleware,

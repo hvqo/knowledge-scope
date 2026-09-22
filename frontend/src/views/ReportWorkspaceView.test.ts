@@ -2,6 +2,7 @@ import { VueQueryPlugin, QueryClient } from "@tanstack/vue-query";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import ReportAIPanel from "../components/report/ReportAIPanel.vue";
 import ReportWorkspaceView from "./ReportWorkspaceView.vue";
 
 const { routerPush, routeState } = vi.hoisted(() => ({
@@ -417,5 +418,247 @@ describe("ReportWorkspaceView", () => {
       elapsed_ms: 4,
     }));
     await vi.waitFor(() => expect(wrapper.text()).not.toContain("过期结果不应显示"));
+  });
+
+  it("previews an AI section draft and keeps it local until the user saves", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1")) {
+        return jsonResponse(baseReport);
+      }
+      if (
+        url.includes("/knowledge-bases?") ||
+        url.includes("/chatbi/data-sources?") ||
+        url.includes("/documents?")
+      ) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (url.endsWith("/sections/section-1/ai/generate")) {
+        return jsonResponse({
+          operation: "generate",
+          content: "AI 草稿 [S-A1B2C3D4]",
+          citations: [{
+            marker: "S-A1B2C3D4",
+            source_id: "source-1",
+            title: "质量控制",
+            page_start: 2,
+            page_end: 2,
+          }],
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    await wrapper.findAll(".report-ai-panel__actions button")[1]!.trigger("click");
+    await vi.waitFor(() => expect(wrapper.text()).toContain("章节预览"));
+    await wrapper.get(".report-ai-panel__accept").trigger("click");
+    expect((wrapper.get(".report-editor__textarea").element as HTMLTextAreaElement).value).toBe(
+      "AI 草稿 [S-A1B2C3D4]",
+    );
+    expect(fetchMock.mock.calls.some(([, request]) => request?.method === "PATCH")).toBe(false);
+  });
+
+  it("ignores a late AI response after switching reports", async () => {
+    const reportB = JSON.parse(JSON.stringify(baseReport)) as typeof baseReport;
+    reportB.id = "report-2";
+    reportB.sections[0].report_id = "report-2";
+    reportB.sections[0].content = "报告 B 内容";
+    let resolveAI: ((response: Response) => void) | null = null;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1")) {
+        return jsonResponse(baseReport);
+      }
+      if (init?.method === undefined && url.includes("/reports/report-2")) {
+        return jsonResponse(reportB);
+      }
+      if (url.includes("/knowledge-bases?") || url.includes("/chatbi/data-sources?") || url.includes("/documents?")) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (url.endsWith("/sections/section-1/ai/generate")) {
+        return new Promise<Response>((resolve) => {
+          resolveAI = resolve;
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    await wrapper.findAll(".report-ai-panel__actions button")[1]!.trigger("click");
+    await vi.waitFor(() => expect(resolveAI).not.toBeNull());
+
+    routeState.current!.id = "report-2";
+    await vi.waitFor(() =>
+      expect((wrapper.get(".report-editor__textarea").element as HTMLTextAreaElement).value).toBe("报告 B 内容"),
+    );
+    resolveAI!(jsonResponse({
+      operation: "generate",
+      content: "报告 A 的过期草稿",
+      citations: [],
+    }));
+    await flushPromises();
+
+    expect(wrapper.find(".report-ai-panel__preview").exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("报告 A 的过期草稿");
+    expect(fetchMock.mock.calls.some(([, request]) => request?.method === "PATCH")).toBe(false);
+  });
+
+  it("keeps the newest AI request when an older response arrives late", async () => {
+    let aiCallCount = 0;
+    let resolveFirst: ((response: Response) => void) | null = null;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1")) {
+        return jsonResponse(baseReport);
+      }
+      if (url.includes("/knowledge-bases?") || url.includes("/chatbi/data-sources?") || url.includes("/documents?")) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (url.endsWith("/sections/section-1/ai/generate")) {
+        aiCallCount += 1;
+        if (aiCallCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        return jsonResponse({ operation: "generate", content: "第二次结果", citations: [] });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    const generateButton = wrapper.findAll(".report-ai-panel__actions button")[1]!;
+    await generateButton.trigger("click");
+    await vi.waitFor(() => expect(aiCallCount).toBe(1));
+    await wrapper.findComponent(ReportAIPanel).vm.$emit("generateSection", "第二次");
+    await vi.waitFor(() => expect(aiCallCount).toBe(2));
+    await vi.waitFor(() =>
+      expect((wrapper.get(".report-ai-panel__draft").element as HTMLTextAreaElement).value).toBe("第二次结果"),
+    );
+
+    resolveFirst!(jsonResponse({ operation: "generate", content: "第一次结果", citations: [] }));
+    await flushPromises();
+    expect((wrapper.get(".report-ai-panel__draft").element as HTMLTextAreaElement).value).toBe("第二次结果");
+    expect((wrapper.get(".report-ai-panel__draft").element as HTMLTextAreaElement).value).not.toBe("第一次结果");
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/ai/generate"))).toHaveLength(2);
+  });
+
+  it("previews and accepts or discards each section edit operation", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1")) {
+        return jsonResponse(baseReport);
+      }
+      if (url.includes("/knowledge-bases?") || url.includes("/chatbi/data-sources?") || url.includes("/documents?")) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (init?.method === "PATCH") {
+        return jsonResponse(baseReport);
+      }
+      if (url.endsWith("/sections/section-1/ai/edit")) {
+        const body = JSON.parse(String(init?.body)) as { operation: string };
+        return jsonResponse({
+          operation: body.operation,
+          content: `${body.operation} 预览`,
+          citations: [],
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    for (const [index, operation] of [[2, "rewrite"], [3, "expand"], [4, "summarize"]] as const) {
+      await wrapper.findAll(".report-ai-panel__actions button")[index]!.trigger("click");
+      await vi.waitFor(() =>
+        expect((wrapper.get(".report-ai-panel__draft").element as HTMLTextAreaElement).value).toBe(
+          `${operation} 预览`,
+        ),
+      );
+      if (operation === "expand") {
+        await wrapper.get(".report-ai-panel__accept").trigger("click");
+        expect((wrapper.get(".report-editor__textarea").element as HTMLTextAreaElement).value).toBe("expand 预览");
+      } else {
+        await wrapper.get(".report-ai-panel__discard").trigger("click");
+      }
+      expect(wrapper.find(".report-ai-panel__preview").exists()).toBe(false);
+    }
+    expect(fetchMock.mock.calls.filter(([, request]) => request?.method === "PATCH")).toHaveLength(2);
+  });
+
+  it("triggers DOCX/PDF export and surfaces export failures", async () => {
+    const createObjectURL = vi.fn(() => "blob:report");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === undefined && url.includes("/reports/report-1") && !url.includes("/export/")) {
+        return jsonResponse(baseReport);
+      }
+      if (url.includes("/knowledge-bases?") || url.includes("/chatbi/data-sources?") || url.includes("/documents?")) {
+        return jsonResponse({ items: [], total: 0, limit: 100, offset: 0 });
+      }
+      if (url.endsWith("/export/docx")) {
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "Content-Disposition": "attachment; filename*=UTF-8''%E5%AD%A3%E5%BA%A6%E6%8A%A5%E5%91%8A.docx" },
+        });
+      }
+      if (url.endsWith("/export/pdf")) {
+        return jsonResponse({ detail: "导出失败" }, 503);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+
+    const wrapper = mount(ReportWorkspaceView, {
+      global: {
+        plugins: [[VueQueryPlugin, {
+          queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+        }]],
+      },
+    });
+
+    await vi.waitFor(() => expect(wrapper.get(".report-editor__textarea")).toBeTruthy());
+    await wrapper.findAll(".report-workspace-page__export")[0]!.trigger("click");
+    await vi.waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:report");
+    await vi.waitFor(() =>
+      expect(wrapper.findAll(".report-workspace-page__export")[0]!.attributes("disabled")).toBeUndefined(),
+    );
+    await wrapper.findAll(".report-workspace-page__export")[1]!.trigger("click");
+    await vi.waitFor(() => expect(wrapper.text()).toContain("服务暂时不可用"));
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/export/pdf"))).toBe(true);
   });
 });
