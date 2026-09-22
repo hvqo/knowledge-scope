@@ -274,6 +274,41 @@ export interface ReportSourceInsertRequest {
   content_append: string;
 }
 
+export interface ReportAIContextRequest {
+  source_ids?: string[];
+  instruction?: string | null;
+}
+
+export interface ReportAIOutlineRequest extends ReportAIContextRequest {
+  topic?: string | null;
+}
+
+export interface ReportAIEditRequest extends ReportAIContextRequest {
+  operation: "rewrite" | "expand" | "summarize";
+}
+
+export interface ReportAIOutlineItem {
+  title: string;
+  summary: string;
+}
+
+export interface ReportAIOutlineResponse {
+  items: ReportAIOutlineItem[];
+}
+
+export interface ReportAICitation {
+  marker: string;
+  title: string;
+  page_start: number | null;
+  page_end: number | null;
+}
+
+export interface ReportAIDraftResponse {
+  operation: "generate" | "rewrite" | "expand" | "summarize";
+  content: string;
+  citations: ReportAICitation[];
+}
+
 export type RAGRetrievalMode = "dense" | "unified";
 export type RAGCitationModality = "text" | "image" | "table" | "formula";
 export type RAGCitationSnippetKind = "source" | "representation";

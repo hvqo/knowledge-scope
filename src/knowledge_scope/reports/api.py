@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from io import BytesIO
 from typing import Annotated
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +22,8 @@ from knowledge_scope.documents.models import Document
 from knowledge_scope.knowledge_bases.models import KnowledgeBase
 from knowledge_scope.shared.database import get_session
 
+from .export import ReportExportError, build_docx, build_pdf, safe_report_filename
+from .generation import ReportGenerationError, ReportGenerationService
 from .models import (
     REPORT_SECTION_CONTENT_MAX_LENGTH,
     Report,
@@ -26,6 +31,12 @@ from .models import (
     ReportSourceReference,
 )
 from .schemas import (
+    REPORT_AI_MAX_SOURCE_REFERENCES,
+    ReportAIContextRequest,
+    ReportAIDraftResponse,
+    ReportAIEditRequest,
+    ReportAIOutlineRequest,
+    ReportAIOutlineResponse,
     ReportChatBISourceCreate,
     ReportCreate,
     ReportDetailResponse,
@@ -42,6 +53,76 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+def _report_generation_service(request: Request) -> ReportGenerationService:
+    service = getattr(request.app.state, "report_generation_service", None)
+    if service is not None:
+        return service
+    gateway = getattr(request.app.state, "llm_gateway", None)
+    if gateway is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="报告生成服务暂时不可用",
+        )
+    service = ReportGenerationService(gateway, request.app.state.settings)
+    request.app.state.report_generation_service = service
+    return service
+
+
+async def _selected_references(
+    session: AsyncSession,
+    report_id: UUID,
+    source_ids: list[UUID],
+    *,
+    section_id: UUID | None = None,
+) -> list[ReportSourceReference]:
+    query = select(ReportSourceReference).where(ReportSourceReference.report_id == report_id)
+    if section_id is not None and not source_ids:
+        query = query.where(ReportSourceReference.section_id == section_id)
+    query = query.order_by(ReportSourceReference.created_at, ReportSourceReference.id).limit(
+        REPORT_AI_MAX_SOURCE_REFERENCES
+    )
+    references = list(await session.scalars(query)) if not source_ids else []
+    if not source_ids:
+        return references
+    if len(set(source_ids)) != len(source_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="来源引用选择不能重复",
+        )
+    selected = list(
+        await session.scalars(
+            select(ReportSourceReference).where(
+                ReportSourceReference.report_id == report_id,
+                ReportSourceReference.id.in_(source_ids),
+            )
+        )
+    )
+    by_id = {reference.id: reference for reference in selected}
+    if len(by_id) != len(source_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="来源引用不属于当前报告",
+        )
+    return [by_id[source_id] for source_id in source_ids]
+
+
+def _generation_error(error: ReportGenerationError) -> HTTPException:
+    if error.category == "provider":
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="报告生成服务暂时不可用",
+        )
+    if error.category == "context_too_large":
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="报告生成所选来源过多，请减少来源后重试",
+        )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="报告生成结果未通过格式校验，请重试",
+    )
 
 
 async def _get_report(session: AsyncSession, report_id: UUID) -> Report:
@@ -261,6 +342,87 @@ async def get_report(
     return await _detail(session, await _get_report(session, report_id))
 
 
+@router.post("/{report_id}/ai/outline", response_model=ReportAIOutlineResponse)
+async def generate_report_outline(
+    report_id: UUID,
+    payload: ReportAIOutlineRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> ReportAIOutlineResponse:
+    report = await _get_report(session, report_id)
+    references = await _selected_references(session, report_id, payload.source_ids)
+    try:
+        return await _report_generation_service(request).generate_outline(
+            report,
+            references,
+            topic=payload.topic,
+            instruction=payload.instruction,
+        )
+    except ReportGenerationError as error:
+        raise _generation_error(error) from error
+
+
+@router.post(
+    "/{report_id}/sections/{section_id}/ai/generate",
+    response_model=ReportAIDraftResponse,
+)
+async def generate_report_section(
+    report_id: UUID,
+    section_id: UUID,
+    payload: ReportAIContextRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> ReportAIDraftResponse:
+    report = await _get_report(session, report_id)
+    section = await _get_section(session, report_id, section_id)
+    references = await _selected_references(
+        session,
+        report_id,
+        payload.source_ids,
+        section_id=section_id,
+    )
+    try:
+        return await _report_generation_service(request).generate_section(
+            report,
+            section,
+            references,
+            instruction=payload.instruction,
+        )
+    except ReportGenerationError as error:
+        raise _generation_error(error) from error
+
+
+@router.post(
+    "/{report_id}/sections/{section_id}/ai/edit",
+    response_model=ReportAIDraftResponse,
+)
+async def edit_report_section(
+    report_id: UUID,
+    section_id: UUID,
+    payload: ReportAIEditRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> ReportAIDraftResponse:
+    report = await _get_report(session, report_id)
+    section = await _get_section(session, report_id, section_id)
+    references = await _selected_references(
+        session,
+        report_id,
+        payload.source_ids,
+        section_id=section_id,
+    )
+    try:
+        return await _report_generation_service(request).edit_section(
+            report,
+            section,
+            references,
+            operation=payload.operation,
+            instruction=payload.instruction,
+        )
+    except ReportGenerationError as error:
+        raise _generation_error(error) from error
+
+
 @router.patch("/{report_id}", response_model=ReportDetailResponse)
 async def update_report(
     report_id: UUID,
@@ -289,6 +451,81 @@ async def delete_report(
     report = await _get_report(session, report_id)
     await session.delete(report)
     await session.commit()
+
+
+def _download_headers(filename: str) -> dict[str, str]:
+    encoded = quote(filename, safe="")
+    extension = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
+    return {
+        "Content-Disposition": (
+            f"attachment; filename=\"report.{extension}\"; filename*=UTF-8''{encoded}"
+        ),
+        "Cache-Control": "no-store",
+    }
+
+
+@router.get("/{report_id}/export/docx")
+async def export_report_docx(
+    report_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    report = await _get_report(session, report_id)
+    detail = await _detail(session, report)
+    try:
+        content = build_docx(detail)
+    except ReportExportError as error:
+        if error.category == "aggregate_bounds":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="报告内容过大，请减少章节或来源后重试",
+            ) from error
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="DOCX 导出暂时不可用",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="DOCX 导出暂时不可用",
+        ) from error
+    filename = safe_report_filename(report.title, "docx")
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=_download_headers(filename),
+    )
+
+
+@router.get("/{report_id}/export/pdf")
+async def export_report_pdf(
+    report_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    report = await _get_report(session, report_id)
+    detail = await _detail(session, report)
+    try:
+        content = build_pdf(detail)
+    except ReportExportError as error:
+        if error.category == "aggregate_bounds":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="报告内容过大，请减少章节或来源后重试",
+            ) from error
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PDF 导出暂时不可用",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PDF 导出暂时不可用",
+        ) from error
+    filename = safe_report_filename(report.title, "pdf")
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/pdf",
+        headers=_download_headers(filename),
+    )
 
 
 @router.post(

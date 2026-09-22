@@ -162,6 +162,7 @@ async def _test_client(
     data_dir: Path,
     *,
     max_upload_size_bytes: int = 50 * 1024 * 1024,
+    llm_gateway: object | None = None,
 ) -> AsyncIterator[AsyncClient]:
     settings = Settings(
         _env_file=None,
@@ -175,6 +176,7 @@ async def _test_client(
         database_engine=postgres_test_engine,
         vector_store=_TestVectorStore(),
         graph_store=_TestGraphStore(),  # type: ignore[arg-type]
+        llm_gateway=llm_gateway,  # type: ignore[arg-type]
     )
 
     async with postgres_test_engine.connect() as connection:

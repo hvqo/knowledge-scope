@@ -11,6 +11,11 @@ import type {
   ChatBIDataSourceListResponse,
   ChatBIResultScalar,
   Report,
+  ReportAIContextRequest,
+  ReportAIDraftResponse,
+  ReportAIEditRequest,
+  ReportAIOutlineRequest,
+  ReportAIOutlineResponse,
   ReportCreateRequest,
   ReportListResponse,
   ReportSection,
@@ -571,6 +576,66 @@ export function deleteReportSource(reportId: string, sourceId: string): Promise<
     `/v1/reports/${encodeURIComponent(reportId)}/sources/${encodeURIComponent(sourceId)}`,
     { method: "DELETE" },
   );
+}
+
+export function generateReportOutline(
+  reportId: string,
+  payload: ReportAIOutlineRequest,
+  signal?: AbortSignal,
+): Promise<ReportAIOutlineResponse> {
+  return request<ReportAIOutlineResponse>(
+    `/v1/reports/${encodeURIComponent(reportId)}/ai/outline`,
+    { method: "POST", body: JSON.stringify(payload), signal },
+  );
+}
+
+export function generateReportSection(
+  reportId: string,
+  sectionId: string,
+  payload: ReportAIContextRequest,
+  signal?: AbortSignal,
+): Promise<ReportAIDraftResponse> {
+  return request<ReportAIDraftResponse>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/ai/generate`,
+    { method: "POST", body: JSON.stringify(payload), signal },
+  );
+}
+
+export function editReportSection(
+  reportId: string,
+  sectionId: string,
+  payload: ReportAIEditRequest,
+  signal?: AbortSignal,
+): Promise<ReportAIDraftResponse> {
+  return request<ReportAIDraftResponse>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/ai/edit`,
+    { method: "POST", body: JSON.stringify(payload), signal },
+  );
+}
+
+export async function downloadReportExport(
+  reportId: string,
+  format: "docx" | "pdf",
+): Promise<{ blob: Blob; filename: string | null }> {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/reports/${encodeURIComponent(reportId)}/export/${format}`,
+    { headers: { Accept: format === "pdf" ? "application/pdf" : "application/octet-stream" } },
+  );
+  if (!response.ok) {
+    const errorDetail = await readErrorDetail(response);
+    throw new ApiError(
+      response.status,
+      response.statusText,
+      errorDetail.detail,
+      errorDetail.category,
+    );
+  }
+  const disposition = response.headers.get("Content-Disposition");
+  const filenameMatch = disposition?.match(/filename\*=UTF-8''([^;]+)/i);
+  return {
+    blob: await response.blob(),
+    filename: filenameMatch ? decodeURIComponent(filenameMatch[1]) : null,
+  };
 }
 
 function parseCitationBranch(value: unknown): RAGCitation["branch_provenance"][number] {
