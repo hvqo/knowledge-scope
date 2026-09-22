@@ -32,6 +32,22 @@ const router = createRouter({
       },
     },
     {
+      path: "/reports",
+      name: "reports",
+      component: () => import("../views/ReportListView.vue"),
+      meta: {
+        title: "报告创作",
+      },
+    },
+    {
+      path: "/reports/:id",
+      name: "report-workspace",
+      component: () => import("../views/ReportWorkspaceView.vue"),
+      meta: {
+        title: "报告工作区",
+      },
+    },
+    {
       path: "/knowledge-bases/:id",
       name: "knowledge-base-detail",
       component: () => import("../views/KnowledgeBaseDetailView.vue"),

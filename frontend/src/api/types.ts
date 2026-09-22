@@ -136,6 +136,144 @@ export interface ChatBIQuestionRequest {
   question: string;
 }
 
+export interface ReportSummary {
+  id: string;
+  title: string;
+  knowledge_base_id: string | null;
+  datasource_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReportChartPoint {
+  label: string;
+  value: number;
+}
+
+export interface ReportChartSpec {
+  kind: "bar" | "line" | "pie";
+  category_column: string;
+  value_column: string;
+  points: ReportChartPoint[];
+}
+
+export interface ReportSourceReference {
+  id: string;
+  section_id: string;
+  kind: "rag_evidence" | "chatbi_result";
+  title: string;
+  knowledge_base_id: string | null;
+  datasource_id: string | null;
+  document_id: string | null;
+  document_title: string | null;
+  evidence_id: string | null;
+  chunk_id: string | null;
+  page_start: number | null;
+  page_end: number | null;
+  evidence_type: string | null;
+  snippet: string | null;
+  section_path: string[];
+  source_block_ids: string[];
+  question: string | null;
+  answer: string | null;
+  columns: ChatBIColumnMetadata[];
+  rows: ChatBIResultScalar[][];
+  row_count: number | null;
+  truncated: boolean | null;
+  truncation_reason: string | null;
+  redacted_sql: string | null;
+  chart_spec: ReportChartSpec | null;
+  created_at: string;
+}
+
+export interface ReportSection {
+  id: string;
+  report_id: string;
+  title: string;
+  content: string;
+  position: number;
+  sources: ReportSourceReference[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Report extends ReportSummary {
+  sections: ReportSection[];
+}
+
+export interface ReportListResponse {
+  items: ReportSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ReportCreateRequest {
+  title: string;
+  knowledge_base_id?: string | null;
+  datasource_id?: string | null;
+}
+
+export interface ReportUpdateRequest {
+  title?: string;
+  knowledge_base_id?: string | null;
+  datasource_id?: string | null;
+}
+
+export interface ReportSectionCreateRequest {
+  title?: string;
+  content?: string;
+  position?: number;
+}
+
+export interface ReportSectionUpdateRequest {
+  title?: string;
+  content?: string;
+  position?: number;
+}
+
+export interface ReportRagSourceCreateRequest {
+  kind: "rag_evidence";
+  title: string;
+  knowledge_base_id: string;
+  document_id: string;
+  evidence_id?: string | null;
+  chunk_id?: string | null;
+  document_title: string;
+  page_start: number;
+  page_end: number;
+  evidence_type: RAGCitationModality;
+  snippet?: string | null;
+  section_path?: string[];
+  source_block_ids?: string[];
+}
+
+export interface ReportChatBISourceCreateRequest {
+  kind: "chatbi_result";
+  title: string;
+  datasource_id: string;
+  datasource_name: string;
+  question: string;
+  answer?: string | null;
+  columns: ChatBIColumnMetadata[];
+  /** The API validates the bounded JSON snapshot again on write. */
+  rows: unknown[][];
+  row_count: number;
+  truncated: boolean;
+  truncation_reason: ChatBITruncationReason | null;
+  redacted_sql?: string | null;
+  chart_spec?: ReportChartSpec | null;
+}
+
+export type ReportSourceCreateRequest =
+  | ReportRagSourceCreateRequest
+  | ReportChatBISourceCreateRequest;
+
+export interface ReportSourceInsertRequest {
+  source: ReportSourceCreateRequest;
+  content_append: string;
+}
+
 export type RAGRetrievalMode = "dense" | "unified";
 export type RAGCitationModality = "text" | "image" | "table" | "formula";
 export type RAGCitationSnippetKind = "source" | "representation";
