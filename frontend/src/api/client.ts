@@ -72,6 +72,9 @@ export function getUserFacingError(
     }
     return options.conflictMessage ?? fallback;
   }
+  if (error.status === 400) {
+    return "请求内容不正确，请检查后重试。";
+  }
   if (error.status === 413) {
     return "文件过大，请选择较小的 PDF。";
   }
@@ -616,10 +619,14 @@ export function editReportSection(
 export async function downloadReportExport(
   reportId: string,
   format: "docx" | "pdf",
+  signal?: AbortSignal,
 ): Promise<{ blob: Blob; filename: string | null }> {
   const response = await fetch(
     `${API_BASE_URL}/v1/reports/${encodeURIComponent(reportId)}/export/${format}`,
-    { headers: { Accept: format === "pdf" ? "application/pdf" : "application/octet-stream" } },
+    {
+      headers: { Accept: format === "pdf" ? "application/pdf" : "application/octet-stream" },
+      signal,
+    },
   );
   if (!response.ok) {
     const errorDetail = await readErrorDetail(response);
