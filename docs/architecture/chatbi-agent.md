@@ -134,5 +134,6 @@ knowledgescope chatbi ask <datasource_id> <question>
 
 CLI 只接受注册数据源 ID 和问题，输出 `ChatBIResult` 的安全投影；无通用 raw SQL 或
 `ValidatedSQL` 输入参数。MCP 仅复用同一高层 Agent，并将 `clarify`/`refuse` 作为用户级结果
-返回；`unavailable` 作为受控域错误返回。当前实现不包含额外的外部工具循环、前端 ChatBI
-页面或外部数据写入。
+返回；`unavailable` 作为受控域错误返回。数据分析工作区通过独立的 HTTP 产品投影复用同一
+Agent，不把 usage、trace 或 schema provenance 暴露给浏览器。当前实现不包含额外的外部工具
+循环或外部数据写入。

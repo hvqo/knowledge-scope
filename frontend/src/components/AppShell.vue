@@ -79,6 +79,21 @@ const uiStore = useUiStore();
             class="nav-label"
           >AI 问答</span>
         </RouterLink>
+        <RouterLink
+          to="/analysis"
+          class="nav-item"
+          active-class="is-active"
+          title="数据分析"
+        >
+          <span
+            class="nav-icon"
+            aria-hidden="true"
+          >⌁</span>
+          <span
+            v-if="!uiStore.sidebarCollapsed"
+            class="nav-label"
+          >数据分析</span>
+        </RouterLink>
       </nav>
     </aside>
 

@@ -24,6 +24,14 @@ const router = createRouter({
       },
     },
     {
+      path: "/analysis",
+      name: "analysis",
+      component: () => import("../views/AnalysisView.vue"),
+      meta: {
+        title: "数据分析",
+      },
+    },
+    {
       path: "/knowledge-bases/:id",
       name: "knowledge-base-detail",
       component: () => import("../views/KnowledgeBaseDetailView.vue"),

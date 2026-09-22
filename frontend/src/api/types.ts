@@ -61,6 +61,81 @@ export interface DocumentListResponse {
   offset: number;
 }
 
+export type ChatBIDataSourceDialect = "postgresql";
+
+export interface ChatBIDataSource {
+  id: string;
+  display_name: string;
+  dialect: ChatBIDataSourceDialect;
+  enabled: boolean;
+  default_database: string | null;
+  default_schema: string | null;
+  connection_configured: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatBIDataSourceListResponse {
+  items: ChatBIDataSource[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export type ChatBIExecutionStatus =
+  | "succeeded"
+  | "rejected"
+  | "failed"
+  | "cancelled"
+  | "clarify"
+  | "refuse"
+  | "eligibility_unavailable";
+export type ChatBITruncationReason = "row_limit" | "payload_bytes";
+export type ChatBIResultScalar =
+  | string
+  | number
+  | boolean
+  | null
+  | ChatBIResultScalar[]
+  | { [key: string]: ChatBIResultScalar };
+
+export interface ChatBIColumnMetadata {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  ordinal: number;
+}
+
+export type ChatBIEligibilityDecision = "eligible" | "clarify" | "refuse" | "unavailable";
+
+export interface ChatBIEligibilityPublic {
+  decision: ChatBIEligibilityDecision;
+  reason_code: string;
+  user_message: string | null;
+  clarification_question: string | null;
+}
+
+export interface ChatBIAnalysisResult {
+  query_id: string;
+  datasource_id: string;
+  execution_status: ChatBIExecutionStatus;
+  eligibility: ChatBIEligibilityPublic | null;
+  answer: string | null;
+  columns: ChatBIColumnMetadata[];
+  rows: ChatBIResultScalar[][];
+  row_count: number;
+  truncated: boolean;
+  truncation_reason: ChatBITruncationReason | null;
+  redacted_sql: string | null;
+  warnings: string[];
+  error_message: string | null;
+  elapsed_ms: number;
+}
+
+export interface ChatBIQuestionRequest {
+  question: string;
+}
+
 export type RAGRetrievalMode = "dense" | "unified";
 export type RAGCitationModality = "text" | "image" | "table" | "formula";
 export type RAGCitationSnippetKind = "source" | "representation";
