@@ -116,7 +116,11 @@ async function onFileSelected(event: Event): Promise<void> {
     await uploadMutation.mutateAsync(file);
     ElMessage.success("文档已上传");
   } catch (error) {
-    ElMessage.error(getUserFacingError(error, "文档上传失败，请稍后重试。"));
+    ElMessage.error(
+      getUserFacingError(error, "文档上传失败，请稍后重试。", {
+        conflictMessage: "已有相同内容，请检查后重试。",
+      }),
+    );
   }
 }
 

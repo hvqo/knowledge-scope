@@ -1,8 +1,15 @@
+from uuid import UUID, uuid4
+
 import pytest
 from httpx import AsyncClient
 
+from knowledge_scope.api.app import create_app
 from knowledge_scope.chatbi import (
+    ChatBIResult,
+    ChatBIUsageSummary,
+    ColumnMetadata,
     DataSource,
+    QueryLifecycleState,
     QueryPolicy,
     SchemaColumn,
     SchemaDiscoveryResult,
@@ -12,6 +19,7 @@ from knowledge_scope.chatbi import (
     SQLDialect,
     build_semantic_schema_context,
 )
+from knowledge_scope.shared.config import Settings
 
 
 async def create_data_source(client: AsyncClient) -> dict[str, object]:
@@ -127,6 +135,75 @@ class _FakeSchemaDiscoveryService:
             fingerprint=snapshot.fingerprint,
             context=build_semantic_schema_context(snapshot, max_chars=max_chars),
         )
+
+
+class _FakeChatBIAgent:
+    def __init__(self, datasource_id: UUID) -> None:
+        self.datasource_id = datasource_id
+        self.questions: list[str] = []
+
+    async def ask(self, datasource_id: UUID, question: str, **_kwargs: object) -> ChatBIResult:
+        self.questions.append(question)
+        assert datasource_id == self.datasource_id
+        return ChatBIResult(
+            query_id=uuid4(),
+            datasource_id=datasource_id,
+            answer="按地区统计完成。",
+            execution_status=QueryLifecycleState.SUCCEEDED,
+            redacted_sql="SELECT region_code, COUNT(*) FROM public.sales GROUP BY region_code",
+            columns=[
+                ColumnMetadata(name="region_code", data_type="text", ordinal=0),
+                ColumnMetadata(name="count", data_type="bigint", ordinal=1),
+            ],
+            rows=[["华东", 3], ["华南", 2]],
+            row_count=2,
+            sql_attempts=1,
+            repair_attempts=0,
+            usage=ChatBIUsageSummary(
+                llm_calls=2,
+                provider_attempts=2,
+                provider="stub",
+                model="stub-model",
+                task_type_counts={"chatbi_eligibility": 1, "nl2sql": 1},
+            ),
+            error_category=None,
+            error_message=None,
+        )
+
+
+@pytest.mark.anyio
+async def test_analysis_endpoint_projects_bounded_agent_result_without_internal_metadata(
+    postgres_test_engine,
+) -> None:
+    datasource_id = uuid4()
+    agent = _FakeChatBIAgent(datasource_id)
+    application = create_app(
+        Settings(_env_file=None, environment="test"),
+        database_engine=postgres_test_engine,
+        vector_store=object(),  # type: ignore[arg-type]
+        graph_store=object(),  # type: ignore[arg-type]
+        chatbi_agent_service=agent,  # type: ignore[arg-type]
+    )
+
+    from httpx import ASGITransport
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://testserver"
+    ) as http_client:
+        response = await http_client.post(
+            f"/api/v1/chatbi/data-sources/{datasource_id}/ask",
+            json={"question": "统计每个地区的客户数量。"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["datasource_id"] == str(datasource_id)
+    assert payload["rows"] == [["华东", 3], ["华南", 2]]
+    assert payload["row_count"] == 2
+    assert payload["redacted_sql"] is not None
+    assert "usage" not in payload
+    assert "schema_fingerprint" not in response.text
+    assert agent.questions == ["统计每个地区的客户数量。"]
 
 
 @pytest.mark.anyio

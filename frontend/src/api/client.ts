@@ -7,6 +7,9 @@ import type {
   MetaResponse,
   Document,
   DocumentListResponse,
+  ChatBIAnalysisResult,
+  ChatBIDataSourceListResponse,
+  ChatBIResultScalar,
   RAGCitation,
   RAGCompleteData,
   RAGStreamEvent,
@@ -20,15 +23,27 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE_URL)
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly detail?: string;
+  readonly category?: string;
 
-  constructor(status: number, statusText: string, detail?: string) {
+  constructor(status: number, statusText: string, detail?: string, category?: string) {
     super(detail || `API request failed: ${status} ${statusText}`);
     this.name = "ApiError";
     this.status = status;
+    this.detail = detail;
+    this.category = category;
   }
 }
 
-export function getUserFacingError(error: unknown, fallback: string): string {
+export interface UserFacingErrorOptions {
+  conflictMessage?: string;
+}
+
+export function getUserFacingError(
+  error: unknown,
+  fallback: string,
+  options: UserFacingErrorOptions = {},
+): string {
   if (!(error instanceof ApiError)) {
     return fallback;
   }
@@ -37,7 +52,10 @@ export function getUserFacingError(error: unknown, fallback: string): string {
     return "请求的内容不存在或已被删除。";
   }
   if (error.status === 409) {
-    return "已有相同内容，请检查后重试。";
+    if (error.category === "datasource_disabled") {
+      return "当前数据源不可用或已停用。";
+    }
+    return options.conflictMessage ?? fallback;
   }
   if (error.status === 413) {
     return "文件过大，请选择较小的 PDF。";
@@ -54,28 +72,51 @@ export function getUserFacingError(error: unknown, fallback: string): string {
   return fallback;
 }
 
-async function readErrorDetail(response: Response): Promise<string | undefined> {
+interface ParsedErrorDetail {
+  detail?: string;
+  category?: string;
+}
+
+function safeErrorString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= 2000 ? value : undefined;
+}
+
+function safeErrorCategory(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value)
+    ? value
+    : undefined;
+}
+
+async function readErrorDetail(response: Response): Promise<ParsedErrorDetail> {
   try {
     const payload: unknown = await response.json();
     if (typeof payload === "object" && payload !== null && "detail" in payload) {
       const detail = payload.detail;
       if (typeof detail === "string") {
-        return detail;
+        return { detail: safeErrorString(detail) };
+      }
+      if (typeof detail === "object" && detail !== null && !Array.isArray(detail)) {
+        const detailRecord = detail as Record<string, unknown>;
+        return {
+          detail: safeErrorString(detailRecord.message),
+          category: safeErrorCategory(detailRecord.category),
+        };
       }
       if (Array.isArray(detail)) {
         const messages = detail.flatMap((item) => {
           if (typeof item === "object" && item !== null && "msg" in item) {
-            return typeof item.msg === "string" ? [item.msg] : [];
+            const message = safeErrorString(item.msg);
+            return message === undefined ? [] : [message];
           }
           return [];
         });
-        return messages.length > 0 ? messages.join("；") : undefined;
+        return messages.length > 0 ? { detail: messages.join("；") } : {};
       }
     }
   } catch {
-    return undefined;
+    return {};
   }
-  return undefined;
+  return {};
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -93,10 +134,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
 
   if (!response.ok) {
+    const errorDetail = await readErrorDetail(response);
     throw new ApiError(
       response.status,
       response.statusText,
-      await readErrorDetail(response),
+      errorDetail.detail,
+      errorDetail.category,
     );
   }
 
@@ -109,10 +152,12 @@ async function requestNoContent(path: string, options: RequestInit = {}): Promis
   const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
 
   if (!response.ok) {
+    const errorDetail = await readErrorDetail(response);
     throw new ApiError(
       response.status,
       response.statusText,
-      await readErrorDetail(response),
+      errorDetail.detail,
+      errorDetail.category,
     );
   }
 }
@@ -207,6 +252,24 @@ export function deleteDocument(knowledgeBaseId: string, documentId: string): Pro
   );
 }
 
+export interface ChatBIDataSourceListParams {
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchChatBIDataSources({
+  limit = 100,
+  offset = 0,
+}: ChatBIDataSourceListParams = {}): Promise<ChatBIDataSourceListResponse> {
+  const searchParams = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  return request<ChatBIDataSourceListResponse>(
+    `/v1/chatbi/data-sources?${searchParams.toString()}`,
+  );
+}
+
 export interface RAGQueryRequest {
   query: string;
   knowledge_base_id: string;
@@ -260,6 +323,149 @@ function stringArray(value: unknown, field: string): string[] {
     throw new Error(`RAG stream field ${field} is invalid`);
   }
   return value;
+}
+
+function parseChatBIScalar(value: unknown, depth = 0): ChatBIResultScalar {
+  if (depth > 32) {
+    throw new Error("ChatBI result value is too deeply nested");
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("ChatBI result contains a non-finite number");
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => parseChatBIScalar(item, depth + 1));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, parseChatBIScalar(item, depth + 1)]),
+    );
+  }
+  throw new Error("ChatBI result contains an unsupported value");
+}
+
+function parseChatBIResult(value: unknown): ChatBIAnalysisResult {
+  if (!isRecord(value)) {
+    throw new Error("ChatBI response is invalid");
+  }
+  const status = requiredString(value.execution_status, "execution_status");
+  const allowedStatuses = new Set([
+    "succeeded",
+    "rejected",
+    "failed",
+    "cancelled",
+    "clarify",
+    "refuse",
+    "eligibility_unavailable",
+  ]);
+  if (!allowedStatuses.has(status)) {
+    throw new Error("ChatBI execution status is invalid");
+  }
+  const columnsValue = value.columns;
+  if (!Array.isArray(columnsValue)) {
+    throw new Error("ChatBI columns are invalid");
+  }
+  const columns = columnsValue.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new Error("ChatBI column is invalid");
+    }
+    const ordinal = requiredFiniteNumber(item.ordinal, `columns[${index}].ordinal`);
+    if (!Number.isInteger(ordinal) || ordinal < 0) {
+      throw new Error("ChatBI column ordinal is invalid");
+    }
+    return {
+      name: requiredString(item.name, `columns[${index}].name`),
+      data_type: requiredString(item.data_type, `columns[${index}].data_type`),
+      nullable: typeof item.nullable === "boolean" ? item.nullable : (() => {
+        throw new Error("ChatBI column nullable flag is invalid");
+      })(),
+      ordinal,
+    };
+  });
+  if (!Array.isArray(value.rows)) {
+    throw new Error("ChatBI rows are invalid");
+  }
+  const rows = value.rows.map((row) => {
+    if (!Array.isArray(row)) {
+      throw new Error("ChatBI result row is invalid");
+    }
+    return row.map((cell) => parseChatBIScalar(cell));
+  });
+  if (rows.some((row) => row.length !== columns.length)) {
+    throw new Error("ChatBI rows do not match the column contract");
+  }
+  const eligibilityValue = value.eligibility;
+  let eligibility: ChatBIAnalysisResult["eligibility"] = null;
+  if (eligibilityValue !== null && eligibilityValue !== undefined) {
+    if (!isRecord(eligibilityValue)) {
+      throw new Error("ChatBI eligibility is invalid");
+    }
+    const decision = requiredString(eligibilityValue.decision, "eligibility.decision");
+    if (decision !== "eligible" && decision !== "clarify" && decision !== "refuse" && decision !== "unavailable") {
+      throw new Error("ChatBI eligibility decision is invalid");
+    }
+    eligibility = {
+      decision,
+      reason_code: requiredString(eligibilityValue.reason_code, "eligibility.reason_code"),
+      user_message: nullableString(eligibilityValue.user_message, "eligibility.user_message"),
+      clarification_question: nullableString(
+        eligibilityValue.clarification_question,
+        "eligibility.clarification_question",
+      ),
+    };
+  }
+  const rowCount = requiredFiniteNumber(value.row_count, "row_count");
+  const elapsedMs = requiredFiniteNumber(value.elapsed_ms, "elapsed_ms");
+  if (!Number.isInteger(rowCount) || rowCount < 0 || elapsedMs < 0) {
+    throw new Error("ChatBI result metrics are invalid");
+  }
+  const truncated = value.truncated;
+  if (typeof truncated !== "boolean") {
+    throw new Error("ChatBI truncation flag is invalid");
+  }
+  const truncationReason = nullableString(value.truncation_reason, "truncation_reason");
+  if (truncationReason !== null && truncationReason !== "row_limit" && truncationReason !== "payload_bytes") {
+    throw new Error("ChatBI truncation reason is invalid");
+  }
+  if (truncated !== (truncationReason !== null)) {
+    throw new Error("ChatBI truncation contract is invalid");
+  }
+  return {
+    query_id: requiredString(value.query_id, "query_id"),
+    datasource_id: requiredString(value.datasource_id, "datasource_id"),
+    execution_status: status as ChatBIAnalysisResult["execution_status"],
+    eligibility,
+    answer: nullableString(value.answer, "answer"),
+    columns,
+    rows,
+    row_count: rowCount,
+    truncated,
+    truncation_reason: truncationReason,
+    redacted_sql: nullableString(value.redacted_sql, "redacted_sql"),
+    warnings: stringArray(value.warnings, "warnings"),
+    error_message: nullableString(value.error_message, "error_message"),
+    elapsed_ms: elapsedMs,
+  };
+}
+
+export function askChatBI(
+  datasourceId: string,
+  question: string,
+  signal?: AbortSignal,
+): Promise<ChatBIAnalysisResult> {
+  return request<unknown>(
+    `/v1/chatbi/data-sources/${encodeURIComponent(datasourceId)}/ask`,
+    {
+      method: "POST",
+      body: JSON.stringify({ question }),
+      signal,
+    },
+  ).then(parseChatBIResult);
 }
 
 function parseCitationBranch(value: unknown): RAGCitation["branch_provenance"][number] {
@@ -459,7 +665,13 @@ export async function* streamRagQuery(
     signal,
   });
   if (!response.ok) {
-    throw new ApiError(response.status, response.statusText, await readErrorDetail(response));
+    const errorDetail = await readErrorDetail(response);
+    throw new ApiError(
+      response.status,
+      response.statusText,
+      errorDetail.detail,
+      errorDetail.category,
+    );
   }
   if (response.body === null) {
     throw new Error("RAG stream has no response body");
