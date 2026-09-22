@@ -10,6 +10,16 @@ import type {
   ChatBIAnalysisResult,
   ChatBIDataSourceListResponse,
   ChatBIResultScalar,
+  Report,
+  ReportCreateRequest,
+  ReportListResponse,
+  ReportSection,
+  ReportSectionCreateRequest,
+  ReportSectionUpdateRequest,
+  ReportSourceCreateRequest,
+  ReportSourceInsertRequest,
+  ReportSourceReference,
+  ReportUpdateRequest,
   RAGCitation,
   RAGCompleteData,
   RAGStreamEvent,
@@ -466,6 +476,101 @@ export function askChatBI(
       signal,
     },
   ).then(parseChatBIResult);
+}
+
+export interface ReportListParams {
+  limit?: number;
+  offset?: number;
+}
+
+export function fetchReports({
+  limit = 20,
+  offset = 0,
+}: ReportListParams = {}): Promise<ReportListResponse> {
+  const searchParams = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  return request<ReportListResponse>(`/v1/reports?${searchParams.toString()}`);
+}
+
+export function createReport(payload: ReportCreateRequest): Promise<Report> {
+  return request<Report>("/v1/reports", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchReport(reportId: string): Promise<Report> {
+  return request<Report>(`/v1/reports/${encodeURIComponent(reportId)}`);
+}
+
+export function updateReport(reportId: string, payload: ReportUpdateRequest): Promise<Report> {
+  return request<Report>(`/v1/reports/${encodeURIComponent(reportId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteReport(reportId: string): Promise<void> {
+  return requestNoContent(`/v1/reports/${encodeURIComponent(reportId)}`, { method: "DELETE" });
+}
+
+export function createReportSection(
+  reportId: string,
+  payload: ReportSectionCreateRequest = {},
+): Promise<ReportSection> {
+  return request<ReportSection>(`/v1/reports/${encodeURIComponent(reportId)}/sections`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateReportSection(
+  reportId: string,
+  sectionId: string,
+  payload: ReportSectionUpdateRequest,
+): Promise<ReportSection> {
+  return request<ReportSection>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}`,
+    { method: "PATCH", body: JSON.stringify(payload) },
+  );
+}
+
+export function deleteReportSection(reportId: string, sectionId: string): Promise<void> {
+  return requestNoContent(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function createReportSource(
+  reportId: string,
+  sectionId: string,
+  payload: ReportSourceCreateRequest,
+): Promise<ReportSourceReference> {
+  return request<ReportSourceReference>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/sources`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function insertReportSource(
+  reportId: string,
+  sectionId: string,
+  payload: ReportSourceInsertRequest,
+): Promise<ReportSourceReference> {
+  return request<ReportSourceReference>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/sources/insert`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function deleteReportSource(reportId: string, sourceId: string): Promise<void> {
+  return requestNoContent(
+    `/v1/reports/${encodeURIComponent(reportId)}/sources/${encodeURIComponent(sourceId)}`,
+    { method: "DELETE" },
+  );
 }
 
 function parseCitationBranch(value: unknown): RAGCitation["branch_provenance"][number] {

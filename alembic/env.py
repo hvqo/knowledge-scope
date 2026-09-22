@@ -14,6 +14,7 @@ from knowledge_scope.chatbi import models as _chatbi_models  # noqa: F401
 from knowledge_scope.documents import models as document_models
 from knowledge_scope.knowledge_bases import models as _knowledge_base_models  # noqa: F401
 from knowledge_scope.llm import models as _llm_models  # noqa: F401
+from knowledge_scope.reports import models as _report_models  # noqa: F401
 from knowledge_scope.shared.config import get_settings
 
 config = context.config
