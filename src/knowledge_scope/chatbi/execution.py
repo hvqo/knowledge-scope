@@ -322,6 +322,14 @@ def _record_names(record: object) -> tuple[str, ...]:
     return names
 
 
+def _decimal_text(value: Decimal) -> str:
+    """Render a decimal without insignificant fractional zeroes or rounding."""
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"-0", "+0"} else text
+
+
 def _json_safe(
     value: object,
     *,
@@ -346,7 +354,7 @@ def _json_safe(
             )
         return value
     if isinstance(value, Decimal):
-        return str(value)
+        return _decimal_text(value)
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):

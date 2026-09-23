@@ -111,6 +111,12 @@ def _public_eligibility(result: ChatBIResult) -> ChatBIEligibilityPublic | None:
     return None
 
 
+def _public_error_message(result: ChatBIResult) -> str | None:
+    if result.error_category is ChatBIErrorCategory.UNSAFE_QUERY:
+        return "生成的查询未通过安全校验且未执行。请换一种问法后重试。"
+    return result.error_message
+
+
 def _to_analysis_response(result: ChatBIResult, elapsed_ms: float) -> ChatBIAnalysisResponse:
     return ChatBIAnalysisResponse(
         query_id=result.query_id,
@@ -125,7 +131,7 @@ def _to_analysis_response(result: ChatBIResult, elapsed_ms: float) -> ChatBIAnal
         truncation_reason=result.truncation_reason,
         redacted_sql=result.redacted_sql,
         warnings=result.warnings,
-        error_message=result.error_message,
+        error_message=_public_error_message(result),
         elapsed_ms=max(elapsed_ms, 0.0),
     )
 

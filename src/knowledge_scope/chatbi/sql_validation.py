@@ -518,6 +518,12 @@ def _validate_sources(statement: exp.Expression) -> None:
 
 
 def _function_name(function: exp.Func) -> str:
+    # sqlglot normalizes PostgreSQL built-ins to semantic AST names; keep the
+    # allow-list keyed by their actual PostgreSQL spellings.
+    if isinstance(function, exp.TimestampTrunc):
+        return "date_trunc"
+    if isinstance(function, exp.TimeToStr):
+        return "to_char"
     if isinstance(function, exp.Anonymous):
         return function.name.lower()
     return function.sql_name().lower()

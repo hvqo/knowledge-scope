@@ -14,7 +14,7 @@ from uuid import UUID
 
 from fastapi import UploadFile
 
-from .models import DOCUMENT_FILENAME_MAX_LENGTH
+from .models import DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX, DOCUMENT_FILENAME_MAX_LENGTH
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 PDF_HEADER = b"%PDF-"
@@ -77,6 +77,21 @@ def filesystem_path_for_storage_key(data_dir: Path, storage_key: str) -> Path:
     candidate = (Path(data_dir).resolve() / Path(relative_key)).resolve()
     if relative_key.is_absolute() or not candidate.is_relative_to(root):
         raise StorageError("stored document path is outside the documents directory")
+    return candidate
+
+
+def resolve_external_source_path(corpus_source_dir: Path, source_ref: str) -> Path:
+    """Resolve a registered corpus reference below its configured local root."""
+    normalized = source_ref.replace("\\", "/").strip()
+    if not normalized.startswith(DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX):
+        raise StorageError("external source reference is not a supported corpus reference")
+    relative_key = PurePosixPath(normalized[len(DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX) :])
+    if relative_key.is_absolute() or any(part in {"", ".", ".."} for part in relative_key.parts):
+        raise StorageError("external source reference is not a safe relative path")
+    root = Path(corpus_source_dir).resolve()
+    candidate = (root / Path(relative_key)).resolve()
+    if not candidate.is_relative_to(root):
+        raise StorageError("external source reference is outside the corpus source directory")
     return candidate
 
 

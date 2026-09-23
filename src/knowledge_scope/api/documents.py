@@ -18,11 +18,13 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from knowledge_scope.chunking.service import CHUNKING_DIRECTORY_NAME
+from knowledge_scope.chunking.models import ChunkedDocument
+from knowledge_scope.chunking.service import CHUNKING_DIRECTORY_NAME, chunk_artifact_path
 from knowledge_scope.documents.models import (
     DOCUMENT_MEDIA_TYPE_PDF,
     DOCUMENT_STATUS_UPLOADED,
@@ -41,6 +43,7 @@ from knowledge_scope.documents.storage import (
     promote_staged_upload,
     remove_file,
     remove_staged_upload,
+    resolve_external_source_path,
     restore_from_trash,
     stage_pdf,
     storage_key_for_document,
@@ -51,7 +54,7 @@ from knowledge_scope.evidence.lifecycle import (
 )
 from knowledge_scope.graph.neo4j import GraphStoreError
 from knowledge_scope.parsing.service import PARSING_DIRECTORY_NAME
-from knowledge_scope.retrieval.qdrant import VectorStoreError
+from knowledge_scope.retrieval.qdrant import ChunkVectorPayload, VectorStoreError
 from knowledge_scope.retrieval.representation_index import (
     RepresentationIndexError,
     RepresentationVisibilitySnapshot,
@@ -60,7 +63,12 @@ from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import get_session
 
 from .knowledge_bases import _get_knowledge_base
-from .schemas import DocumentListResponse, DocumentResponse
+from .schemas import (
+    DocumentChunkListResponse,
+    DocumentChunkResponse,
+    DocumentListResponse,
+    DocumentResponse,
+)
 
 router = APIRouter(
     prefix="/knowledge-bases/{knowledge_base_id}/documents",
@@ -68,8 +76,95 @@ router = APIRouter(
 )
 
 
+class ChunkArtifactError(RuntimeError):
+    """Raised when a persisted chunk artifact cannot be read for preview."""
+
+
 def _runtime_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+async def _get_document(
+    session: AsyncSession,
+    knowledge_base_id: UUID,
+    document_id: UUID,
+) -> Document:
+    document = await session.scalar(
+        select(Document).where(
+            Document.id == document_id,
+            Document.knowledge_base_id == knowledge_base_id,
+        )
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    return document
+
+
+def _resolve_document_source_path(settings: Settings, document: Document) -> Path:
+    """Resolve the source PDF of a managed upload or a registered external corpus."""
+    if document.storage_kind == DOCUMENT_STORAGE_KIND_MANAGED:
+        if document.storage_key is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档文件不可用")
+        try:
+            return filesystem_path_for_storage_key(settings.data_dir, document.storage_key)
+        except StorageError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="文档文件不可用",
+            ) from None
+    if document.storage_kind == DOCUMENT_STORAGE_KIND_EXTERNAL_REFERENCE:
+        if document.source_ref is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档文件不可用")
+        if settings.corpus_source_dir is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="该文档来自外部语料, 未配置原始文件目录",
+            )
+        try:
+            return resolve_external_source_path(settings.corpus_source_dir, document.source_ref)
+        except StorageError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="外部语料原始文件不可用",
+            ) from None
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档文件不可用")
+
+
+async def _list_indexed_chunk_payloads(
+    request: Request,
+    knowledge_base_id: UUID,
+    document_id: UUID,
+) -> tuple[ChunkVectorPayload, ...]:
+    """Fall back to indexed chunks so registered corpora stay previewable."""
+    store = getattr(request.app.state, "vector_store", None)
+    if store is None:
+        return ()
+    try:
+        return await asyncio.to_thread(
+            store.list_document_chunk_payloads,
+            knowledge_base_id=knowledge_base_id,
+            document_id=document_id,
+        )
+    except VectorStoreError:
+        return ()
+
+
+def _read_chunk_artifact(settings: Settings, document_id: UUID) -> ChunkedDocument | None:
+    """Read one persisted chunk artifact, or None when chunking has not run yet."""
+    path = chunk_artifact_path(settings, document_id)
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ChunkArtifactError("文档切片暂时无法读取") from error
+    try:
+        chunked = ChunkedDocument.model_validate_json(payload)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ChunkArtifactError("文档切片数据不可用") from error
+    if chunked.document_id != document_id:
+        raise ChunkArtifactError("文档切片数据不可用")
+    return chunked
 
 
 def _is_duplicate_error(error: IntegrityError) -> bool:
@@ -316,15 +411,80 @@ async def get_document(
     session: AsyncSession = Depends(get_session),
 ) -> Document:
     await _get_knowledge_base(session, knowledge_base_id)
-    document = await session.scalar(
-        select(Document).where(
-            Document.id == document_id,
-            Document.knowledge_base_id == knowledge_base_id,
-        )
+    return await _get_document(session, knowledge_base_id, document_id)
+
+
+@router.get(
+    "/{document_id}/file",
+    response_class=FileResponse,
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def get_document_file(
+    knowledge_base_id: UUID,
+    document_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    """Stream the source PDF so the product UI can preview it in place."""
+    await _get_knowledge_base(session, knowledge_base_id)
+    document = await _get_document(session, knowledge_base_id, document_id)
+    path = _resolve_document_source_path(_runtime_settings(request), document)
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档文件不存在")
+
+    return FileResponse(
+        path,
+        media_type=document.media_type,
+        filename=document.original_filename,
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, max-age=0, must-revalidate"},
     )
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
-    return document
+
+
+@router.get("/{document_id}/chunks", response_model=DocumentChunkListResponse)
+async def list_document_chunks(
+    knowledge_base_id: UUID,
+    document_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> DocumentChunkListResponse:
+    """Expose chunk page ranges so the UI can navigate the source PDF."""
+    await _get_knowledge_base(session, knowledge_base_id)
+    document = await _get_document(session, knowledge_base_id, document_id)
+    settings = _runtime_settings(request)
+    try:
+        chunked = await asyncio.to_thread(_read_chunk_artifact, settings, document.id)
+    except ChunkArtifactError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from None
+
+    if chunked is not None:
+        return DocumentChunkListResponse(
+            document_id=document.id,
+            page_count=chunked.page_count,
+            items=[DocumentChunkResponse.model_validate(chunk) for chunk in chunked.chunks],
+        )
+
+    indexed_payloads = await _list_indexed_chunk_payloads(request, knowledge_base_id, document.id)
+    return DocumentChunkListResponse(
+        document_id=document.id,
+        page_count=None,
+        items=[
+            DocumentChunkResponse(
+                chunk_id=payload.chunk_id,
+                ordinal=ordinal,
+                page_start=payload.page_start,
+                page_end=payload.page_end,
+                section_path=list(payload.section_path),
+                content_types=list(payload.content_types),
+                asset_refs=list(payload.asset_refs),
+                text=payload.text,
+            )
+            for ordinal, payload in enumerate(indexed_payloads)
+        ],
+    )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -335,14 +495,7 @@ async def delete_document(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     await _get_knowledge_base(session, knowledge_base_id)
-    document = await session.scalar(
-        select(Document).where(
-            Document.id == document_id,
-            Document.knowledge_base_id == knowledge_base_id,
-        )
-    )
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    document = await _get_document(session, knowledge_base_id, document_id)
 
     settings = _runtime_settings(request)
     trashed_source: TrashedResource | None = None

@@ -253,6 +253,7 @@ class RAGService:
             task_type="rag_answer",
             temperature=0.0,
             max_tokens=self._settings.rag_max_tokens,
+            reasoning="disabled",
         )
         provider: str | None = None
         model: str | None = None
@@ -260,6 +261,7 @@ class RAGService:
         output_tokens: int | None = None
         finish_reason: str | None = None
         llm_started = perf_counter()
+        has_answer_text = False
         try:
             async with aclosing(self._gateway.stream(llm_request)) as gateway_stream:
                 async for event in gateway_stream:
@@ -272,6 +274,7 @@ class RAGService:
                     if event.finish_reason is not None:
                         finish_reason = event.finish_reason
                     if event.delta:
+                        has_answer_text = has_answer_text or bool(event.delta.strip())
                         yield RAGStreamEvent(
                             event="answer_delta",
                             data={"text": event.delta},
@@ -320,6 +323,31 @@ class RAGService:
             return
 
         llm_latency_ms = (perf_counter() - llm_started) * 1000
+        if not has_answer_text:
+            truncated = finish_reason == "length"
+            events = self._error_events(
+                category="truncated_output" if truncated else "empty_output",
+                message=(
+                    "LLM provider exhausted the output token budget without visible text"
+                    if truncated
+                    else "LLM provider returned an empty response"
+                ),
+                started=started,
+                retrieval_latency_ms=retrieval_latency_ms,
+                llm_latency_ms=llm_latency_ms,
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                finish_reason=finish_reason,
+                retrieval_mode=selection.retrieval_mode,
+                retrieval_degraded=selection_metadata.get("retrieval_degraded"),
+                retrieval_branch_statuses=selection_metadata.get("retrieval_branch_statuses"),
+            )
+            for event in events:
+                yield event
+            return
+
         yield RAGStreamEvent(
             event="citations",
             data={

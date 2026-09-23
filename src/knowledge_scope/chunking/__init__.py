@@ -12,8 +12,10 @@ from .models import (
 )
 from .service import (
     CHUNKING_DIRECTORY_NAME,
+    CHUNKS_ARTIFACT_FILENAME,
     ChunkingError,
     ChunkingResult,
+    chunk_artifact_path,
     chunk_document,
     chunk_document_by_id,
     summarize_chunked_document,
@@ -22,6 +24,7 @@ from .service import (
 __all__ = [
     "CHUNKER_VERSION",
     "CHUNKING_DIRECTORY_NAME",
+    "CHUNKS_ARTIFACT_FILENAME",
     "CHUNK_SCHEMA_VERSION",
     "SPLITTING_POLICY_VERSION",
     "Chunk",
@@ -30,6 +33,7 @@ __all__ = [
     "ChunkingError",
     "ChunkingResult",
     "ContentType",
+    "chunk_artifact_path",
     "chunk_document",
     "chunk_document_by_id",
     "chunking_config_fingerprint",
