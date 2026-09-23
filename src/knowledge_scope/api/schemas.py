@@ -144,6 +144,29 @@ class DocumentListResponse(BaseModel):
     offset: int
 
 
+class DocumentChunkResponse(BaseModel):
+    """Preview metadata for one persisted document chunk."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    chunk_id: str
+    ordinal: int = Field(..., ge=0)
+    page_start: int = Field(..., ge=1)
+    page_end: int = Field(..., ge=1)
+    section_path: list[str]
+    content_types: list[str]
+    asset_refs: list[str]
+    text: str
+
+
+class DocumentChunkListResponse(BaseModel):
+    """Every chunk of one document, or an empty list before chunking has run."""
+
+    document_id: UUID
+    page_count: int | None
+    items: list[DocumentChunkResponse]
+
+
 class QdrantHealthResponse(BaseModel):
     """Non-sensitive vector-store readiness information."""
 

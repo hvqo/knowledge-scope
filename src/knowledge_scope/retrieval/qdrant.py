@@ -363,6 +363,67 @@ class QdrantVectorStore:
         except Exception as error:
             raise VectorStoreError("Qdrant point metadata could not be read") from error
 
+    def list_document_chunk_payloads(
+        self,
+        *,
+        knowledge_base_id: UUID,
+        document_id: UUID,
+    ) -> tuple[ChunkVectorPayload, ...]:
+        """Read every indexed chunk payload for one document inside its KB scope.
+
+        Registered external corpora keep their chunks only in this collection, so the
+        document preview reads them back without trusting payloads from another scope.
+        """
+        readiness = self.readiness()
+        if readiness.status == "available":
+            return ()
+        if readiness.status == "unavailable":
+            raise VectorStoreError(readiness.error or "Qdrant is unavailable")
+
+        document_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=str(document_id)),
+                ),
+                models.FieldCondition(
+                    key="knowledge_base_id",
+                    match=models.MatchValue(value=str(knowledge_base_id)),
+                ),
+            ]
+        )
+        payloads: list[ChunkVectorPayload] = []
+        offset: Any | None = None
+        try:
+            while True:
+                page, offset = self._get_client().scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=document_filter,
+                    limit=QDRANT_SCROLL_PAGE_SIZE,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for record in page:
+                    payload = ChunkVectorPayload.model_validate(record.payload or {})
+                    if (
+                        payload.document_id != document_id
+                        or payload.knowledge_base_id != knowledge_base_id
+                    ):
+                        raise VectorStoreError(
+                            "Qdrant returned a chunk outside the requested scope"
+                        )
+                    payloads.append(payload)
+                if offset is None:
+                    break
+        except VectorStoreError:
+            raise
+        except Exception as error:
+            raise VectorStoreError("Qdrant document chunks could not be read") from error
+
+        payloads.sort(key=lambda payload: (payload.page_start, payload.chunk_id))
+        return tuple(payloads)
+
     def set_point_knowledge_base_ids(
         self,
         point_ids: Sequence[UUID],

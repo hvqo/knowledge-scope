@@ -6,6 +6,7 @@ import type {
   KnowledgeBaseUpdateRequest,
   MetaResponse,
   Document,
+  DocumentChunkListResponse,
   DocumentListResponse,
   ChatBIAnalysisResult,
   ChatBIDataSourceListResponse,
@@ -267,6 +268,44 @@ export function deleteDocument(knowledgeBaseId: string, documentId: string): Pro
   return requestNoContent(
     `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}`,
     { method: "DELETE" },
+  );
+}
+
+export function fetchDocumentChunks(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<DocumentChunkListResponse> {
+  return request<DocumentChunkListResponse>(
+    `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/chunks`,
+  );
+}
+
+export function documentFileUrl(
+  knowledgeBaseId: string,
+  documentId: string,
+  page?: number,
+): string {
+  const base = `${API_BASE_URL}/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/file`;
+  return page === undefined ? base : `${base}#page=${page}`;
+}
+
+/** Confirm that the source PDF is readable before an iframe would render an error body. */
+export async function probeDocumentFile(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<true> {
+  const response = await fetch(documentFileUrl(knowledgeBaseId, documentId), {
+    headers: { Accept: "application/pdf", Range: "bytes=0-0" },
+  });
+  if (response.ok) {
+    return true;
+  }
+  const errorDetail = await readErrorDetail(response);
+  throw new ApiError(
+    response.status,
+    response.statusText,
+    errorDetail.detail,
+    errorDetail.category,
   );
 }
 
@@ -838,7 +877,7 @@ export async function* streamRagQuery(
   const response = await fetch(`${API_BASE_URL}/v1/rag/query`, {
     method: "POST",
     headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, retrieval_mode: payload.retrieval_mode ?? "dense" }),
+    body: JSON.stringify({ ...payload, retrieval_mode: payload.retrieval_mode ?? "unified" }),
     signal,
   });
   if (!response.ok) {

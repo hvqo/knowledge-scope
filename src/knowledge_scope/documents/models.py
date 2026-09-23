@@ -27,6 +27,7 @@ DOCUMENT_STATUS_REGISTERED: Final = "registered"
 DOCUMENT_STORAGE_KIND_MANAGED: Final = "managed"
 DOCUMENT_STORAGE_KIND_EXTERNAL_REFERENCE: Final = "external_reference"
 DOCUMENT_SOURCE_REF_MAX_LENGTH: Final = 2_048
+DOCUMENT_EXTERNAL_SOURCE_REF_PREFIX: Final = "benchmark/a1-5/"
 
 
 class Document(Base):

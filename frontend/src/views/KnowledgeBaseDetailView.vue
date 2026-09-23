@@ -21,6 +21,7 @@ import {
   uploadDocument,
 } from "../api/client";
 import type { Document } from "../api/types";
+import DocumentPreviewDialog from "../components/documents/DocumentPreviewDialog.vue";
 
 const DOCUMENT_PAGE_SIZE = 10;
 
@@ -31,6 +32,8 @@ const knowledgeBaseId = computed(() => String(route.params.id));
 const currentPage = ref(1);
 const fileInput = ref<HTMLInputElement | null>(null);
 const deletingDocumentId = ref<string | null>(null);
+const previewDocument = ref<Document | null>(null);
+const isPreviewOpen = ref(false);
 
 const knowledgeBaseQuery = useQuery({
   queryKey: computed(() => ["knowledge-base", knowledgeBaseId.value]),
@@ -125,9 +128,16 @@ async function onFileSelected(event: Event): Promise<void> {
 }
 
 function handleDocumentAction(command: string | number | object, document: Document): void {
-  if (command === "delete") {
+  if (command === "preview") {
+    openDocumentPreview(document);
+  } else if (command === "delete") {
     void confirmDeleteDocument(document);
   }
+}
+
+function openDocumentPreview(document: Document): void {
+  previewDocument.value = document;
+  isPreviewOpen.value = true;
 }
 
 async function confirmDeleteDocument(document: Document): Promise<void> {
@@ -433,6 +443,12 @@ function statusLabel(documentStatus: Document["status"]): string {
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item
+                      command="preview"
+                      :disabled="isDocumentActionPending"
+                    >
+                      预览 PDF
+                    </el-dropdown-item>
+                    <el-dropdown-item
                       command="delete"
                       :disabled="isDocumentActionPending"
                     >
@@ -460,6 +476,12 @@ function statusLabel(documentStatus: Document["status"]): string {
         </template>
       </section>
     </template>
+
+    <DocumentPreviewDialog
+      v-model="isPreviewOpen"
+      :knowledge-base-id="knowledgeBaseId"
+      :document="previewDocument"
+    />
   </section>
 </template>
 

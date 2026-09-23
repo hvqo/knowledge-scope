@@ -626,7 +626,7 @@ async function searchRag(question: string): Promise<void> {
   let completed = false;
   try {
     for await (const event of streamRagQuery(
-      { query: question, knowledge_base_id: knowledgeBaseId, retrieval_mode: "dense" },
+      { query: question, knowledge_base_id: knowledgeBaseId, retrieval_mode: "unified" },
       controller.signal,
     )) {
       if (run !== ragRun || isUnmounting) {

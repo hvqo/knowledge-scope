@@ -45,6 +45,9 @@ class _TestVectorStore:
     def delete_document(self, _document_id: object) -> int:
         return 0
 
+    def list_document_chunk_payloads(self, **_: object) -> tuple[object, ...]:
+        return ()
+
     def close(self) -> None:
         return None
 
