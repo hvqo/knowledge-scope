@@ -106,6 +106,15 @@ class GraphLinkUpsertResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GraphCanonicalEdge:
+    """Two local entities that A3.3 merged into one canonical entity."""
+
+    canonical_entity_id: str
+    canonical_name: str
+    source_entity_id: str
+    target_entity_id: str
+
+
 class GraphLinkDeleteResult:
     """Counts returned after removing one document's linking records."""
 
@@ -713,12 +722,13 @@ DETACH DELETE canonical
 
 _LIST_RETRIEVAL_ENTITIES_QUERY = """
 MATCH (entity:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
-WHERE EXISTS {
-    MATCH (entity)-[:SUPPORTED_BY]->(
-        support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
-    )
-    WHERE support.document_id = entity.document_id
-}
+WHERE ($document_id IS NULL OR entity.document_id = $document_id)
+  AND EXISTS {
+      MATCH (entity)-[:SUPPORTED_BY]->(
+          support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE support.document_id = entity.document_id
+  }
 WITH entity
 ORDER BY entity.entity_id
 LIMIT $max_entities
@@ -913,6 +923,173 @@ RETURN seed.entity_id AS seed_entity_id,
        seed_evidence,
        neighbor_evidence,
        relation_evidence
+""".strip()
+
+# One evidence-backed local relation between two distinct local entities.  Shared
+# by the relation listing and the degree ranking so both views agree on which
+# edges exist.
+_EVIDENCE_BACKED_RELATION_QUERY = """
+MATCH (source:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
+      -[:SOURCE_OF]->(relation:KnowledgeRelation {knowledge_base_id: $knowledge_base_id})
+      -[:TARGET_OF]->(target:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
+WHERE relation.document_id = source.document_id
+  AND relation.document_id = target.document_id
+  AND source.entity_id <> target.entity_id
+  AND EXISTS {
+      MATCH (source)-[:SUPPORTED_BY]->(
+          source_support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE source_support.document_id = source.document_id
+  }
+  AND EXISTS {
+      MATCH (target)-[:SUPPORTED_BY]->(
+          target_support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE target_support.document_id = target.document_id
+  }
+  AND ($document_id IS NULL OR relation.document_id = $document_id)
+  AND EXISTS {
+      MATCH (relation)-[:SUPPORTED_BY]->(
+          relation_support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE relation_support.document_id = relation.document_id
+  }
+""".strip()
+
+_LIST_RETRIEVAL_RELATIONS_QUERY = f"""
+{_EVIDENCE_BACKED_RELATION_QUERY}
+WITH source, relation, target
+WHERE size($entity_ids) = 0
+   OR (source.entity_id IN $entity_ids AND target.entity_id IN $entity_ids)
+WITH source, relation, target
+ORDER BY relation.relation_id
+LIMIT $max_relations
+RETURN properties(relation) AS relation,
+       properties(source) AS source,
+       properties(target) AS target
+""".strip()
+
+_RANK_RETRIEVAL_ENTITY_IDS_QUERY = f"""
+{_EVIDENCE_BACKED_RELATION_QUERY}
+UNWIND [source.entity_id, target.entity_id] AS entity_id
+RETURN entity_id,
+       count(entity_id) AS degree
+ORDER BY degree DESC, entity_id
+LIMIT $max_entities
+""".strip()
+
+_LIST_RETRIEVAL_CANONICAL_EDGES_QUERY = """
+MATCH (source:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
+      -[source_membership:CANONICAL_MEMBER_OF]->
+      (canonical:CanonicalEntity {knowledge_base_id: $knowledge_base_id})
+      <-[target_membership:CANONICAL_MEMBER_OF]-
+      (target:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
+WHERE source.entity_id < target.entity_id
+  AND source_membership.knowledge_base_id = $knowledge_base_id
+  AND target_membership.knowledge_base_id = $knowledge_base_id
+  AND source_membership.local_entity_id = source.entity_id
+  AND target_membership.local_entity_id = target.entity_id
+  AND source_membership.canonical_entity_id = canonical.canonical_entity_id
+  AND target_membership.canonical_entity_id = canonical.canonical_entity_id
+  AND (size($entity_ids) = 0
+      OR (source.entity_id IN $entity_ids AND target.entity_id IN $entity_ids))
+  AND EXISTS {
+      MATCH (source)-[:SUPPORTED_BY]->(
+          source_support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE source_support.document_id = source.document_id
+  }
+  AND EXISTS {
+      MATCH (target)-[:SUPPORTED_BY]->(
+          target_support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE target_support.document_id = target.document_id
+  }
+RETURN canonical.canonical_entity_id AS canonical_entity_id,
+       canonical.canonical_name AS canonical_name,
+       source.entity_id AS source_entity_id,
+       target.entity_id AS target_entity_id
+ORDER BY canonical_entity_id, source_entity_id, target_entity_id
+LIMIT $max_edges
+""".strip()
+
+_GET_RETRIEVAL_ENTITIES_QUERY = """
+MATCH (entity:KnowledgeEntity {knowledge_base_id: $knowledge_base_id})
+WHERE entity.entity_id IN $entity_ids
+  AND EXISTS {
+      MATCH (entity)-[:SUPPORTED_BY]->(
+          support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+      )
+      WHERE support.document_id = entity.document_id
+  }
+OPTIONAL MATCH (entity)-[membership:CANONICAL_MEMBER_OF]->(
+    canonical:CanonicalEntity {knowledge_base_id: $knowledge_base_id}
+)
+WHERE canonical IS NULL OR (
+    membership.knowledge_base_id = $knowledge_base_id
+    AND membership.local_entity_id = entity.entity_id
+    AND membership.canonical_entity_id = canonical.canonical_entity_id
+)
+WITH entity,
+     collect(DISTINCT CASE
+         WHEN canonical IS NULL THEN null
+         ELSE properties(canonical)
+     END) AS canonical_values
+CALL (entity) {
+    OPTIONAL MATCH (entity)-[:SUPPORTED_BY]->(
+        evidence:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+    )
+    WHERE evidence.document_id = entity.document_id
+    RETURN collect(DISTINCT CASE
+        WHEN evidence IS NULL THEN null
+        ELSE properties(evidence)
+    END) AS evidence_values
+}
+RETURN entity.entity_id AS entity_id,
+       properties(entity) AS entity,
+       canonical_values,
+       evidence_values
+ORDER BY entity_id
+""".strip()
+
+_GET_RETRIEVAL_ENTITY_QUERY = """
+MATCH (entity:KnowledgeEntity {
+    knowledge_base_id: $knowledge_base_id,
+    entity_id: $entity_id
+})
+WHERE EXISTS {
+    MATCH (entity)-[:SUPPORTED_BY]->(
+        support:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+    )
+    WHERE support.document_id = entity.document_id
+}
+OPTIONAL MATCH (entity)-[membership:CANONICAL_MEMBER_OF]->(
+    canonical:CanonicalEntity {knowledge_base_id: $knowledge_base_id}
+)
+WHERE canonical IS NULL OR (
+    membership.knowledge_base_id = $knowledge_base_id
+    AND membership.local_entity_id = entity.entity_id
+    AND membership.canonical_entity_id = canonical.canonical_entity_id
+)
+WITH entity,
+     collect(DISTINCT CASE
+         WHEN canonical IS NULL THEN null
+         ELSE properties(canonical)
+     END) AS canonical_values
+CALL (entity) {
+    OPTIONAL MATCH (entity)-[:SUPPORTED_BY]->(
+        evidence:KnowledgeEvidence {knowledge_base_id: $knowledge_base_id}
+    )
+    WHERE evidence.document_id = entity.document_id
+    RETURN collect(DISTINCT CASE
+        WHEN evidence IS NULL THEN null
+        ELSE properties(evidence)
+    END) AS evidence_values
+}
+RETURN entity.entity_id AS entity_id,
+       properties(entity) AS entity,
+       canonical_values,
+       evidence_values
 """.strip()
 
 
@@ -1699,6 +1876,7 @@ class Neo4jGraphStore:
         self,
         knowledge_base_id: UUID,
         *,
+        document_id: UUID | None = None,
         max_entities: int = 10_000,
     ) -> tuple[GraphEntitySnapshot, ...]:
         """Return a bounded local-entity snapshot for application-side resolution."""
@@ -1707,6 +1885,7 @@ class Neo4jGraphStore:
             raise ValueError("max_entities must be between 1 and 100000")
         params = {
             "knowledge_base_id": str(knowledge_base_id),
+            "document_id": str(document_id) if document_id is not None else None,
             "max_entities": max_entities,
         }
 
@@ -1749,6 +1928,154 @@ class Neo4jGraphStore:
                 for record in session.run(_GET_RETRIEVAL_NEIGHBORS_QUERY, **params)
             ]
             return tuple(neighbors)
+
+        return self._read(read)
+
+    def get_retrieval_entity(
+        self,
+        knowledge_base_id: UUID,
+        entity_id: str,
+    ) -> GraphEntitySnapshot | None:
+        """Return one evidence-backed local-entity snapshot, if present."""
+
+        params = {
+            "knowledge_base_id": str(knowledge_base_id),
+            "entity_id": entity_id,
+        }
+
+        def read(session: Any) -> GraphEntitySnapshot | None:
+            record = _single_or_none(session.run(_GET_RETRIEVAL_ENTITY_QUERY, **params))
+            return _retrieval_snapshot_from_record(record) if record is not None else None
+
+        return self._read(read)
+
+    def list_retrieval_relations(
+        self,
+        knowledge_base_id: UUID,
+        *,
+        entity_ids: Sequence[str] | None = None,
+        document_id: UUID | None = None,
+        max_relations: int = 5_000,
+    ) -> tuple[GraphRelationReference, ...]:
+        """Return evidence-backed local relations, optionally inside one node set.
+
+        Passing ``entity_ids`` keeps both endpoints inside the requested nodes,
+        so a bounded canvas never receives edges pointing outside itself, and
+        ``document_id`` narrows the edges to one document.  Self-referencing
+        relations are skipped: they cannot be rendered as a canvas edge and
+        would distort degree counts.
+        """
+
+        if not 1 <= max_relations <= 50_000:
+            raise ValueError("max_relations must be between 1 and 50000")
+        params = {
+            "knowledge_base_id": str(knowledge_base_id),
+            "entity_ids": sorted({value for value in (entity_ids or ()) if value.strip()}),
+            "document_id": str(document_id) if document_id is not None else None,
+            "max_relations": max_relations,
+        }
+
+        def read(session: Any) -> tuple[GraphRelationReference, ...]:
+            relations: list[GraphRelationReference] = []
+            for record in session.run(_LIST_RETRIEVAL_RELATIONS_QUERY, **params):
+                relation = _retrieval_relation_from_properties(_record_value(record, "relation"))
+                if relation is None:  # pragma: no cover - always node-backed.
+                    continue
+                relations.append(relation)
+            return tuple(relations)
+
+        return self._read(read)
+
+    def list_retrieval_canonical_edges(
+        self,
+        knowledge_base_id: UUID,
+        *,
+        entity_ids: Sequence[str] | None = None,
+        max_edges: int = 5_000,
+    ) -> tuple[GraphCanonicalEdge, ...]:
+        """Return the cross-document pairs that A3.3 merged into one entity."""
+
+        if not 1 <= max_edges <= 50_000:
+            raise ValueError("max_edges must be between 1 and 50000")
+        params = {
+            "knowledge_base_id": str(knowledge_base_id),
+            "entity_ids": sorted({value for value in (entity_ids or ()) if value.strip()}),
+            "max_edges": max_edges,
+        }
+
+        def read(session: Any) -> tuple[GraphCanonicalEdge, ...]:
+            edges: list[GraphCanonicalEdge] = []
+            for record in session.run(_LIST_RETRIEVAL_CANONICAL_EDGES_QUERY, **params):
+                canonical_id = _record_value(record, "canonical_entity_id")
+                source_id = _record_value(record, "source_entity_id")
+                target_id = _record_value(record, "target_entity_id")
+                identifiers = (canonical_id, source_id, target_id)
+                if not all(isinstance(value, str) and value for value in identifiers):
+                    raise GraphStoreError("Neo4j returned malformed canonical bridge")
+                edges.append(
+                    GraphCanonicalEdge(
+                        canonical_entity_id=canonical_id,
+                        canonical_name=str(_record_value(record, "canonical_name")),
+                        source_entity_id=source_id,
+                        target_entity_id=target_id,
+                    )
+                )
+            return tuple(edges)
+
+        return self._read(read)
+
+    def list_retrieval_entity_ids_by_degree(
+        self,
+        knowledge_base_id: UUID,
+        *,
+        document_id: UUID | None = None,
+        max_entities: int = 200,
+    ) -> tuple[str, ...]:
+        """Return local entity ids ordered by their evidence-backed degree.
+
+        The ranking counts the same edges the canvas renders, so the busiest
+        entities come first and the resulting subgraph stays connected.
+        """
+
+        if not 1 <= max_entities <= 5_000:
+            raise ValueError("max_entities must be between 1 and 5000")
+        params = {
+            "knowledge_base_id": str(knowledge_base_id),
+            "document_id": str(document_id) if document_id is not None else None,
+            "max_entities": max_entities,
+        }
+
+        def read(session: Any) -> tuple[str, ...]:
+            entity_ids: list[str] = []
+            for record in session.run(_RANK_RETRIEVAL_ENTITY_IDS_QUERY, **params):
+                entity_id = _record_value(record, "entity_id")
+                if not isinstance(entity_id, str) or not entity_id.strip():
+                    raise GraphStoreError("Neo4j returned malformed entity ranking")
+                entity_ids.append(entity_id)
+            return tuple(entity_ids)
+
+        return self._read(read)
+
+    def get_retrieval_entities(
+        self,
+        knowledge_base_id: UUID,
+        entity_ids: Sequence[str],
+    ) -> tuple[GraphEntitySnapshot, ...]:
+        """Return the bounded snapshots of exactly the requested local entities."""
+
+        unique_ids = sorted({entity_id for entity_id in entity_ids if entity_id.strip()})
+        if not unique_ids:
+            return ()
+        params = {
+            "knowledge_base_id": str(knowledge_base_id),
+            "entity_ids": unique_ids,
+        }
+
+        def read(session: Any) -> tuple[GraphEntitySnapshot, ...]:
+            return tuple(
+                _retrieval_snapshot_from_record(record)
+                for record in session.run(_GET_RETRIEVAL_ENTITIES_QUERY, **params)
+            )
 
         return self._read(read)
 

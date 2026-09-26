@@ -16,6 +16,14 @@ const router = createRouter({
       },
     },
     {
+      path: "/knowledge-graph",
+      name: "knowledge-graph",
+      component: () => import("../views/KnowledgeGraphView.vue"),
+      meta: {
+        title: "知识图谱",
+      },
+    },
+    {
       path: "/chat",
       name: "chat",
       component: () => import("../views/ChatView.vue"),
