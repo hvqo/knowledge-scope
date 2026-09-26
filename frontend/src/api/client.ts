@@ -8,6 +8,8 @@ import type {
   Document,
   DocumentChunkListResponse,
   DocumentListResponse,
+  GraphEntityDetail,
+  GraphOverview,
   ChatBIAnalysisResult,
   ChatBIDataSourceListResponse,
   ChatBIResultScalar,
@@ -232,6 +234,46 @@ export function deleteKnowledgeBase(id: string): Promise<void> {
   return requestNoContent(`/v1/knowledge-bases/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+export interface GraphOverviewParams {
+  search?: string;
+  entityType?: string;
+  documentId?: string;
+  limit?: number;
+}
+
+export function fetchGraphOverview(
+  knowledgeBaseId: string,
+  { search, entityType, documentId, limit = 200 }: GraphOverviewParams = {},
+): Promise<GraphOverview> {
+  const searchParams = new URLSearchParams({ limit: String(limit) });
+  if (search) {
+    searchParams.set("search", search);
+  }
+  if (entityType) {
+    searchParams.set("entity_type", entityType);
+  }
+  if (documentId) {
+    searchParams.set("document_id", documentId);
+  }
+  return request<GraphOverview>(
+    `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph?${searchParams.toString()}`,
+  );
+}
+
+export interface GraphEntityDetailParams {
+  maxNeighbors?: number;
+}
+
+export function fetchGraphEntityDetail(
+  knowledgeBaseId: string,
+  entityId: string,
+  { maxNeighbors = 20 }: GraphEntityDetailParams = {},
+): Promise<GraphEntityDetail> {
+  const searchParams = new URLSearchParams({ max_neighbors: String(maxNeighbors) });
+  const base = `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph/entities/${encodeURIComponent(entityId)}`;
+  return request<GraphEntityDetail>(`${base}?${searchParams.toString()}`);
 }
 
 export interface DocumentListParams {
