@@ -9,7 +9,9 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
 
-LLMMessageRole = Literal["system", "user"]
+# ``assistant`` is used when earlier turns of one conversation are replayed for
+# follow-up questions; single-shot tasks keep using only system and user.
+LLMMessageRole = Literal["system", "user", "assistant"]
 # Provider-neutral reasoning controls.  Adapters translate these semantic
 # values to the provider-specific request shape at their HTTP boundary.
 LLMReasoningMode = Literal["enabled", "disabled", "low", "high"]
@@ -74,7 +76,7 @@ def _non_empty(value: str) -> str:
 
 
 class LLMMessage(_StrictModel):
-    """A system or user message accepted by the gateway."""
+    """A system, user, or replayed assistant message accepted by the gateway."""
 
     role: LLMMessageRole
     content: str = Field(min_length=1)

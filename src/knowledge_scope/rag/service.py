@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 from knowledge_scope.llm.errors import LLMError
@@ -22,9 +24,27 @@ from knowledge_scope.retrieval.unified import (
 )
 from knowledge_scope.shared.config import Settings
 
+from .cache import (
+    CachedRetrieval,
+    RetrievalCache,
+    build_retrieval_cache_key,
+    build_rewrite_cache_key,
+    decode_retrieval,
+    encode_retrieval,
+)
 from .context import ContextSelection, assemble_context
+from .history import HistoryCompressor
 from .prompt import RAG_PROMPT_VERSION, build_rag_messages
-from .schemas import RAGQueryRequest, RAGRetrievalMode, RAGStreamEvent
+from .rewrite import QueryRewriteService
+from .routing import covers_subject, direct_answer, resolve_route, term_coverage
+from .schemas import (
+    RAGQueryRequest,
+    RAGRequestedRetrievalMode,
+    RAGRetrievalMode,
+    RAGStreamEvent,
+)
+
+logger = logging.getLogger(__name__)
 
 RAG_INSUFFICIENT_EVIDENCE = "当前检索到的资料不足以回答该问题。"
 
@@ -38,6 +58,9 @@ class RAGSelection:
     dense_result: RetrievalResult | None = None
     reranked: tuple[RerankedChunk, ...] = ()
     unified_result: UnifiedRetrievalResult | None = None
+    from_cache: bool = False
+    # True when an automatic fast lookup was upgraded to unified retrieval.
+    escalated: bool = False
 
 
 class RAGService:
@@ -51,15 +74,119 @@ class RAGService:
         settings: Settings,
         *,
         unified_retrieval: UnifiedRetrievalService | None = None,
+        cache: RetrievalCache | None = None,
+        rewrite: QueryRewriteService | None = None,
     ) -> None:
         self._retrieval = retrieval
         self._reranking = reranking
         self._gateway = gateway
         self._settings = settings
         self._unified_retrieval = unified_retrieval
+        self._cache = cache
+        self._rewrite = rewrite
+        self._history = HistoryCompressor(gateway, settings, cache=cache)
         # Avoid queueing cancelled requests into the thread pool while keeping
         # synchronous local model work off the event loop.
         self._selection_gate = asyncio.Semaphore(1)
+
+    def _cached_retrieval(
+        self,
+        request: RAGQueryRequest,
+        requested_mode: RAGRequestedRetrievalMode,
+    ) -> CachedRetrieval | None:
+        """Return the cached result for the requested scope, if any.
+
+        The key uses the scope the caller asked for: an ``auto`` question is
+        cached once, whichever path ended up producing the context, and the
+        stored payload records the path that was used.
+        """
+
+        if self._cache is None:
+            return None
+        payload = self._safe_cache_get(
+            build_retrieval_cache_key(
+                knowledge_base_id=request.knowledge_base_id,
+                document_id=request.document_id,
+                retrieval_mode=requested_mode,
+                query=request.query,
+            )
+        )
+        if payload is None:
+            return None
+        try:
+            return decode_retrieval(payload)
+        except (ValueError, KeyError, TypeError):
+            logger.debug("discarding an unreadable cached retrieval result")
+            return None
+
+    def _safe_cache_get(self, key: str) -> str | None:
+        try:
+            return self._cache.get(key) if self._cache is not None else None
+        except Exception as error:  # pragma: no cover - defensive, cache is optional
+            logger.debug("retrieval cache read failed (%s)", type(error).__name__)
+            return None
+
+    def _store_retrieval(
+        self,
+        request: RAGQueryRequest,
+        requested_mode: RAGRequestedRetrievalMode,
+        *,
+        retrieval_mode: RAGRetrievalMode,
+        escalated: bool,
+        context: ContextSelection,
+    ) -> None:
+        if self._cache is None:
+            return
+        # Misses are cached too, with a shorter ttl: a question the corpus
+        # cannot answer yet is the most expensive one to repeat.
+        ttl_seconds = (
+            self._settings.rag_cache_ttl_seconds
+            if context.items
+            else self._settings.rag_cache_empty_ttl_seconds
+        )
+        try:
+            self._cache.set(
+                build_retrieval_cache_key(
+                    knowledge_base_id=request.knowledge_base_id,
+                    document_id=request.document_id,
+                    retrieval_mode=requested_mode,
+                    query=request.query,
+                ),
+                encode_retrieval(
+                    CachedRetrieval(
+                        retrieval_mode=retrieval_mode,
+                        escalated=escalated,
+                        context=context,
+                    )
+                ),
+                ttl_seconds,
+            )
+        except Exception as error:  # pragma: no cover - defensive, cache is optional
+            logger.debug("retrieval cache write failed (%s)", type(error).__name__)
+
+    @staticmethod
+    def _context_text(context: ContextSelection) -> str:
+        return " ".join(
+            " ".join((" ".join(item.citation.section_path), item.text)) for item in context.items
+        )
+
+    def _needs_escalation(self, query: str, context: ContextSelection) -> bool:
+        """Return whether the fast path clearly missed the question's subject.
+
+        The vector path is good enough when its context talks about the thing
+        the question is about (the leading content term) and still covers at
+        least `rag_auto_escalate_min_coverage` of the question's other content
+        terms.  Otherwise the full retrieval path gets a chance to find the
+        material the lookup needs.
+        """
+
+        if not context.items:
+            return True
+        text = self._context_text(context)
+        if not covers_subject(query, text):
+            return True
+        minimum = self._settings.rag_auto_escalate_min_coverage
+        return minimum > 0 and term_coverage(query, text) < minimum
 
     def _select_dense_context(self, request: RAGQueryRequest) -> RAGSelection:
         dense_result = self._retrieval.search(
@@ -105,17 +232,79 @@ class RAGService:
             unified_result=unified_result,
         )
 
+    async def _resolve_selection(
+        self,
+        request: RAGQueryRequest,
+        *,
+        requested_mode: RAGRequestedRetrievalMode,
+        search_query: str,
+        effective_mode: RAGRetrievalMode,
+    ) -> RAGSelection:
+        """Run the retrieval path, upgrading an automatic lookup when needed.
+
+        With ``auto`` the cheap vector path is tried first; if its context does
+        not even mention the subject the question asked about, the full
+        retrieval path runs on top of it.  An explicit ``dense`` choice is
+        never upgraded.
+        """
+
+        cached = self._cached_retrieval(request, requested_mode)
+        if cached is not None:
+            return RAGSelection(
+                retrieval_mode=cached.retrieval_mode,
+                context=cached.context,
+                from_cache=True,
+                escalated=cached.escalated,
+            )
+
+        retrieval_request = request.model_copy(
+            update={"query": search_query, "retrieval_mode": effective_mode}
+        )
+        if effective_mode == "unified":
+            selection = await self._select_unified_context(retrieval_request)
+        else:
+            selection = await asyncio.to_thread(self._select_dense_context, retrieval_request)
+
+        escalated = False
+        if (
+            requested_mode == "auto"
+            and effective_mode == "dense"
+            and self._unified_retrieval is not None
+            and request.knowledge_base_id is not None
+            and self._needs_escalation(search_query, selection.context)
+        ):
+            selection = await self._select_unified_context(retrieval_request)
+            escalated = True
+
+        self._store_retrieval(
+            request,
+            requested_mode,
+            retrieval_mode=selection.retrieval_mode,
+            escalated=escalated,
+            context=selection.context,
+        )
+        return replace(selection, escalated=escalated)
+
     @staticmethod
     def _selection_metadata(selection: RAGSelection) -> dict[str, object]:
-        if selection.unified_result is None:
-            return {"retrieval_mode": "dense"}
-        return {
-            "retrieval_mode": "unified",
-            "retrieval_degraded": selection.unified_result.degraded,
-            "retrieval_branch_statuses": {
-                branch.branch: branch.status for branch in selection.unified_result.branches
-            },
+        metadata: dict[str, object] = {
+            "route": selection.retrieval_mode,
+            "retrieval_mode": selection.retrieval_mode,
+            "retrieval_cached": selection.from_cache,
+            "retrieval_escalated": selection.escalated,
         }
+        if selection.unified_result is None:
+            return metadata
+        # Cached contexts keep no branch detail, so degraded stays unknown.
+        metadata["retrieval_degraded"] = (
+            None if selection.from_cache else selection.unified_result.degraded
+        )
+        metadata["retrieval_branch_statuses"] = (
+            None
+            if selection.from_cache
+            else {branch.branch: branch.status for branch in selection.unified_result.branches}
+        )
+        return metadata
 
     @staticmethod
     def _retrieval_error_category(error: BaseException) -> str:
@@ -174,6 +363,7 @@ class RAGService:
                 event="complete",
                 data={
                     "status": "error",
+                    "route": retrieval_mode,
                     "prompt_version": RAG_PROMPT_VERSION,
                     "provider": provider,
                     "model": model,
@@ -190,16 +380,103 @@ class RAGService:
             ),
         )
 
+    async def _rewrite_query(
+        self,
+        request: RAGQueryRequest,
+    ) -> tuple[str | None, float | None]:
+        """Return the standalone search query and the rewrite latency, if any."""
+
+        if self._rewrite is None or not request.history:
+            return None, None
+        history = tuple(request.history)
+        cache_key = build_rewrite_cache_key(
+            query=request.query,
+            history_digest=hashlib.sha256(
+                "\n".join(f"{turn.role}:{turn.content}" for turn in history).encode("utf-8")
+            ).hexdigest(),
+        )
+        cached = self._safe_cache_get(cache_key)
+        if cached is not None:
+            return (cached or None), 0.0
+        started = perf_counter()
+        try:
+            rewritten = await asyncio.wait_for(
+                self._rewrite.rewrite(request.query, history),
+                timeout=self._settings.rag_rewrite_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.debug("query rewrite exceeded its budget")
+            return None, None
+        latency_ms = (perf_counter() - started) * 1000
+        if self._cache is not None:
+            try:
+                self._cache.set(
+                    cache_key,
+                    rewritten or "",
+                    self._settings.rag_cache_ttl_seconds,
+                )
+            except Exception as error:  # pragma: no cover - defensive
+                logger.debug("rewrite cache write failed (%s)", type(error).__name__)
+        return rewritten, latency_ms
+
     async def stream(self, request: RAGQueryRequest) -> AsyncIterator[RAGStreamEvent]:
         """Yield answer, citation, and terminal status events for one question."""
         started = perf_counter()
+        route, intent = resolve_route(request.query, request.retrieval_mode)
+        if route == "direct":
+            answer = direct_answer(intent) if intent is not None else ""
+            yield RAGStreamEvent(event="answer_delta", data={"text": answer})
+            yield RAGStreamEvent(
+                event="citations",
+                data={"prompt_version": RAG_PROMPT_VERSION, "items": []},
+            )
+            yield RAGStreamEvent(
+                event="complete",
+                data={
+                    "status": "completed",
+                    "route": "direct",
+                    "prompt_version": RAG_PROMPT_VERSION,
+                    "provider": None,
+                    "model": None,
+                    # Nothing was retrieved, so the mode is reported for context only.
+                    "retrieval_mode": (
+                        "dense" if request.retrieval_mode == "auto" else request.retrieval_mode
+                    ),
+                    "retrieval_degraded": None,
+                    "retrieval_branch_statuses": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "finish_reason": None,
+                    "retrieval_latency_ms": 0.0,
+                    "llm_latency_ms": None,
+                    "latency_ms": (perf_counter() - started) * 1000,
+                },
+            )
+            return
+
+        # Older turns are compressed first so both the rewrite and the answer
+        # work on a bounded window, with the summary riding along as background.
+        history_plan = await self._history.prepare(tuple(request.history))
+        # A follow-up is rewritten first, so both the routing decision and the
+        # retrieval itself work on a standalone question.
+        rewritten_query, rewrite_latency_ms = await self._rewrite_query(
+            request.model_copy(update={"history": list(history_plan.recent_turns)}),
+        )
+        search_query = rewritten_query if rewritten_query is not None else request.query
+        search_route, _ = resolve_route(search_query, request.retrieval_mode)
+        effective_mode: RAGRetrievalMode = "dense" if search_route == "direct" else search_route
+        if effective_mode == "unified" and request.knowledge_base_id is None:
+            effective_mode = "dense"
+
         selection_started = perf_counter()
         try:
             async with self._selection_gate:
-                if request.retrieval_mode == "unified":
-                    selection = await self._select_unified_context(request)
-                else:
-                    selection = await asyncio.to_thread(self._select_dense_context, request)
+                selection = await self._resolve_selection(
+                    request,
+                    requested_mode=request.retrieval_mode,
+                    search_query=search_query,
+                    effective_mode=effective_mode,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -213,14 +490,22 @@ class RAGService:
                 ),
                 started=started,
                 retrieval_latency_ms=retrieval_latency_ms,
-                retrieval_mode=request.retrieval_mode,
+                retrieval_mode=effective_mode,
             )
             for event in events:
                 yield event
             return
 
         retrieval_latency_ms = (perf_counter() - selection_started) * 1000
-        selection_metadata = self._selection_metadata(selection)
+        selection_metadata = {
+            **self._selection_metadata(selection),
+            "rewritten_query": rewritten_query,
+            "rewrite_latency_ms": rewrite_latency_ms,
+            "history_compressed_turns": history_plan.compressed_turns,
+            "history_cache_hit": history_plan.cache_hit,
+            "history_summary_used": history_plan.summary is not None,
+            "memories_used": len(request.memories),
+        }
         if not selection.context.items:
             yield RAGStreamEvent(
                 event="answer_delta",
@@ -249,7 +534,13 @@ class RAGService:
             return
 
         llm_request = LLMRequest(
-            messages=build_rag_messages(request.query, selection.context),
+            messages=build_rag_messages(
+                request.query,
+                selection.context,
+                history_plan.recent_turns,
+                summary=history_plan.summary,
+                memories=request.memories,
+            ),
             task_type="rag_answer",
             temperature=0.0,
             max_tokens=self._settings.rag_max_tokens,

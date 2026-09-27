@@ -2,6 +2,13 @@
 
 from knowledge_scope.rag.context import ContextSelection, SelectedContextItem, assemble_context
 from knowledge_scope.rag.prompt import RAG_PROMPT_VERSION, build_rag_messages
+from knowledge_scope.rag.routing import (
+    RAG_DIRECT_QUERY_MAX_CHARACTERS,
+    RAGRoute,
+    classify_direct_intent,
+    direct_answer,
+    resolve_route,
+)
 from knowledge_scope.rag.schemas import (
     RAGAnswerDeltaData,
     RAGCitation,
@@ -14,6 +21,7 @@ from knowledge_scope.rag.schemas import (
 from knowledge_scope.rag.service import RAGService
 
 __all__ = [
+    "RAG_DIRECT_QUERY_MAX_CHARACTERS",
     "RAG_PROMPT_VERSION",
     "ContextSelection",
     "RAGAnswerDeltaData",
@@ -22,9 +30,13 @@ __all__ = [
     "RAGCompleteData",
     "RAGErrorData",
     "RAGQueryRequest",
+    "RAGRoute",
     "RAGService",
     "RAGStreamEvent",
     "SelectedContextItem",
     "assemble_context",
     "build_rag_messages",
+    "classify_direct_intent",
+    "direct_answer",
+    "resolve_route",
 ]

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import brandIcon from "../../imgs/icon.jpg";
 import { RouterLink } from "vue-router";
 
 import { useUiStore } from "../stores/ui";
@@ -21,16 +22,17 @@ const uiStore = useUiStore();
             class="brand-link"
             aria-label="KnowledgeScope 知识库"
           >
-            <span
+            <img
               class="brand-mark"
+              :src="brandIcon"
+              alt=""
               aria-hidden="true"
-            >K</span>
+            >
             <div
               v-if="!uiStore.sidebarCollapsed"
               class="brand-copy"
             >
               <span class="brand-name">KnowledgeScope</span>
-              <span class="brand-caption">行业文档</span>
             </div>
           </RouterLink>
           <button
@@ -188,24 +190,15 @@ const uiStore = useUiStore();
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
   flex: 0 0 34px;
   width: 34px;
   height: 34px;
-  place-items: center;
-  color: var(--ks-surface);
-  font-size: 15px;
-  font-weight: 750;
-  letter-spacing: -0.04em;
+  object-fit: cover;
   background: var(--ks-ink);
   border-radius: 9px;
 }
 
-.brand-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
 
 .brand-name {
   color: var(--ks-ink);
@@ -214,10 +207,6 @@ const uiStore = useUiStore();
   letter-spacing: -0.02em;
 }
 
-.brand-caption {
-  color: var(--ks-muted);
-  font-size: 11px;
-}
 
 .side-nav {
   display: flex;

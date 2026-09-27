@@ -92,6 +92,34 @@ class Settings(BaseSettings):
     rag_rerank_limit: int = Field(default=5, ge=1, le=100)
     rag_context_budget_chars: int = Field(default=6_000, ge=1)
     rag_max_tokens: int = Field(default=1_024, ge=1)
+    # Follow-up rewriting turns an elliptical question into a searchable one.
+    rag_followup_rewrite_enabled: bool = True
+    rag_rewrite_timeout_seconds: float = Field(default=2.5, gt=0, le=60)
+    # Long-term chat memories, scoped to one knowledge base.
+    chat_memory_enabled: bool = True
+    chat_memory_max_items: int = Field(default=50, ge=1, le=500)
+    chat_memory_extract_chars: int = Field(default=6_000, ge=200)
+    # How much remembered context rides along with each question.
+    rag_memory_inject_items: int = Field(default=6, ge=0, le=50)
+    rag_memory_inject_max_chars: int = Field(default=1_200, ge=100)
+    # History windowing: recent turns stay verbatim, older turns are compressed.
+    rag_history_recent_turns: int = Field(default=8, ge=1, le=100)
+    rag_history_recent_chars: int = Field(default=4_000, ge=200, le=50_000)
+    rag_history_summary_ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
+    # An automatic fast lookup is upgraded to unified retrieval when its context
+    # never mentions the question's leading content term, or covers less than
+    # this share of the remaining content terms.  Set 0 to only use the subject
+    # check.
+    rag_auto_escalate_min_coverage: float = Field(default=0.5, ge=0, le=1)
+    # Retrieval caching: "memory" is process-local, "redis" is shared, "off" disables.
+    rag_cache_backend: Literal["memory", "redis", "off"] = "memory"
+    rag_cache_url: str | None = None
+    rag_cache_ttl_seconds: int = Field(default=300, ge=1, le=86_400)
+    # Questions the corpus cannot answer yet are cached for less time, so newly
+    # indexed material becomes visible quickly.
+    rag_cache_empty_ttl_seconds: int = Field(default=60, ge=1, le=86_400)
+    rag_cache_max_entries: int = Field(default=256, ge=1, le=100_000)
+    rag_cache_timeout_seconds: float = Field(default=0.5, gt=0, le=10)
     graph_retrieval_max_seed_entities: int = Field(default=5, ge=1, le=50)
     graph_retrieval_max_hops: int = Field(default=2, ge=1, le=2)
     graph_retrieval_max_neighbors: int = Field(default=20, ge=1, le=100)
