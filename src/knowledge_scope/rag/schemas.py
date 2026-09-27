@@ -15,8 +15,29 @@ RAGCompletionStatus = Literal["completed", "insufficient_evidence", "error"]
 RAGRetrievalMode = Literal["dense", "unified"]
 RAGBranchStatus = Literal["success", "empty", "failed", "timed_out", "cancelled"]
 RAGCitationModality = Literal["text", "image", "table", "formula"]
+# ``auto`` lets the service pick the retrieval path for each question.
+RAGRequestedRetrievalMode = Literal["auto", "dense", "unified"]
 RAGCitationBranchName = Literal["dense", "sparse", "graph", "multimodal"]
 RAGCitationSnippetKind = Literal["source", "representation"]
+RAG_HISTORY_MAX_TURNS = 200
+RAG_HISTORY_MAX_CHARACTERS = 60_000
+RAG_HISTORY_TURN_MAX_CHARACTERS = 4_000
+
+
+class RAGHistoryTurn(BaseModel):
+    """One earlier question or answer sent along for follow-up context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=RAG_HISTORY_TURN_MAX_CHARACTERS)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("history content must contain non-whitespace characters")
+        return value
 
 
 class RAGQueryRequest(BaseModel):
@@ -27,7 +48,13 @@ class RAGQueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4_000)
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
-    retrieval_mode: RAGRetrievalMode = "dense"
+    retrieval_mode: RAGRequestedRetrievalMode = "dense"
+    # Long-term memories injected by the API layer, scoped to one knowledge base.
+    memories: tuple[str, ...] = ()
+    history: list[RAGHistoryTurn] = Field(
+        default_factory=list,
+        max_length=RAG_HISTORY_MAX_TURNS,
+    )
 
     @field_validator("query")
     @classmethod
@@ -36,6 +63,14 @@ class RAGQueryRequest(BaseModel):
         if not normalized:
             raise ValueError("query must contain non-whitespace characters")
         return normalized
+
+    @field_validator("history")
+    @classmethod
+    def validate_history_budget(cls, values: list[RAGHistoryTurn]) -> list[RAGHistoryTurn]:
+        total = sum(len(turn.content) for turn in values)
+        if total > RAG_HISTORY_MAX_CHARACTERS:
+            raise ValueError("history exceeds the supported size")
+        return values
 
     @model_validator(mode="after")
     def validate_retrieval_mode_scope(self) -> Self:
@@ -213,6 +248,22 @@ class RAGCompleteData(BaseModel):
     provider: str | None = None
     model: str | None = None
     retrieval_mode: RAGRetrievalMode = "dense"
+    # The route actually taken: ``direct`` means the turn was answered without
+    # retrieving any material, ``dense``/``unified`` mirror the retrieval mode.
+    route: Literal["direct", "dense", "unified"] | None = None
+    # The follow-up question as rewritten for retrieval, when one was needed.
+    rewritten_query: str | None = None
+    # Whether the assembled context was served from the retrieval cache.
+    retrieval_cached: bool | None = None
+    # True when an automatic fast lookup was upgraded to unified retrieval.
+    retrieval_escalated: bool | None = None
+    # Latency of the follow-up rewrite call, when one was made.
+    rewrite_latency_ms: float | None = Field(default=None, ge=0)
+    # History compression: how the conversation context was assembled.
+    history_compressed_turns: int | None = Field(default=None, ge=0)
+    history_cache_hit: bool | None = None
+    history_summary_used: bool | None = None
+    memories_used: int | None = Field(default=None, ge=0)
     retrieval_degraded: bool | None = None
     retrieval_branch_statuses: dict[str, RAGBranchStatus] | None = None
     input_tokens: int | None = Field(default=None, ge=0)

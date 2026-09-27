@@ -327,6 +327,7 @@ export interface ReportAIDraftResponse {
 }
 
 export type RAGRetrievalMode = "dense" | "unified";
+export type RAGRequestedRetrievalMode = "auto" | RAGRetrievalMode;
 export type RAGCitationModality = "text" | "image" | "table" | "formula";
 export type RAGCitationSnippetKind = "source" | "representation";
 export type RAGCompletionStatus = "completed" | "insufficient_evidence" | "error";
@@ -367,6 +368,10 @@ export interface RAGCompleteData {
   provider: string | null;
   model: string | null;
   retrieval_mode: RAGRetrievalMode;
+  rewritten_query: string | null;
+  retrieval_cached: boolean | null;
+  retrieval_escalated: boolean | null;
+  rewrite_latency_ms: number | null;
   retrieval_degraded: boolean | null;
   retrieval_branch_statuses: Record<string, "success" | "empty" | "failed" | "timed_out" | "cancelled"> | null;
   input_tokens: number | null;
@@ -387,6 +392,65 @@ export type RAGStreamEvent =
   | { event: "citations"; data: RAGCitationsData }
   | { event: "complete"; data: RAGCompleteData }
   | { event: "error"; data: { category: string; message: string } };
+
+export type ChatMessageRole = "user" | "assistant";
+export type ChatMessageStatus = "complete" | "error";
+
+export interface ChatConversation {
+  id: string;
+  title: string;
+  knowledge_base_id: string | null;
+  project_id: string | null;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatProject {
+  id: string;
+  title: string;
+  description: string | null;
+  conversation_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMemory {
+  id: string;
+  knowledge_base_id: string;
+  content: string;
+  source_conversation_id: string | null;
+  created_at: string;
+}
+
+export interface ChatConversationListResponse {
+  items: ChatConversation[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ChatMessageRecord {
+  id: string;
+  role: ChatMessageRole;
+  status: ChatMessageStatus;
+  content: string;
+  citations: RAGCitation[];
+  position: number;
+  created_at: string;
+}
+
+export interface ChatConversationDetail {
+  conversation: ChatConversation;
+  messages: ChatMessageRecord[];
+}
+
+/** Persisted statuses plus the client-side state of a streaming answer. */
+export type ChatMessageViewStatus = ChatMessageStatus | "streaming";
+
+export interface ChatMessageView extends Omit<ChatMessageRecord, "status"> {
+  status: ChatMessageViewStatus;
+}
 
 export type GraphNeighborDirection = "forward" | "reverse" | "canonical_bridge";
 
