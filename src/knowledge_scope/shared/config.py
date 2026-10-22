@@ -82,6 +82,16 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(default=0, ge=0, le=2)
     llm_input_cost_per_1k_tokens: Decimal | None = Field(default=None, ge=0)
     llm_output_cost_per_1k_tokens: Decimal | None = Field(default=None, ge=0)
+    # Optional vision model adapter, deliberately separate from the text LLM gateway.
+    # It stays disabled unless an operator explicitly enables and configures it.
+    vlm_enabled: bool = False
+    vlm_base_url: str = ""
+    vlm_model: str = ""
+    vlm_api_key: SecretStr | None = None
+    vlm_reasoning_effort: str = Field(default="", max_length=20)
+    vlm_timeout_seconds: float = Field(default=90.0, gt=0, le=300)
+    vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    vlm_max_output_tokens: int = Field(default=2_048, ge=1, le=4_096)
     graph_extraction_max_tokens: int = Field(default=1024, ge=1)
     graph_extraction_max_parse_retries: int = Field(default=1, ge=0, le=1)
     # The first budget is derived from graph_extraction_max_tokens when this
@@ -218,6 +228,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "qdrant_collection_name and qdrant_representation_collection_name must differ"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_vlm_configuration(self) -> Self:
+        """Keep the optional vision adapter fully configured or plainly disabled."""
+
+        if not self.vlm_enabled:
+            return self
+        if not self.vlm_base_url.strip():
+            raise ValueError("vlm_base_url is required when vlm_enabled is true")
+        if not self.vlm_model.strip():
+            raise ValueError("vlm_model is required when vlm_enabled is true")
         return self
 
     @property
