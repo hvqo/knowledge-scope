@@ -243,6 +243,53 @@ describe("ChatView", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
+  it("sends agent mode and keeps the tool trace answer grounded", async () => {
+    const backend = createChatBackend();
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/rag/query")) {
+          backend.calls.push({ url, method: "POST", body: JSON.parse(String(init?.body)) });
+          return streamResponse([
+            'event: tool_status\ndata: {"tool":"retrieval","status":"running","summary":"正在检索知识库","step":1}\n\n',
+            'event: tool_status\ndata: {"tool":"retrieval","status":"completed","summary":"已检索到 1 条候选来源","step":1}\n\n',
+            'event: tool_status\ndata: {"tool":"analyze_table","status":"running","summary":"正在计算表格增长率","step":2}\n\n',
+            'event: tool_status\ndata: {"tool":"analyze_table","status":"completed","summary":"表格计算完成（growth）","step":2}\n\n',
+            'event: answer_delta\ndata: {"text":"表格计算得到增长率为 10.6977% [C1]"}\n\n',
+            `event: citations\ndata: ${JSON.stringify({ prompt_version: "agent-rag-v1", items: [citation] })}\n\n`,
+            'event: complete\ndata: {"status":"completed","prompt_version":"agent-rag-v1","retrieval_mode":"unified","answer_mode":"agent","tool_calls":1,"latency_ms":6}\n\n',
+          ]);
+        }
+        return backend.handle(url, init);
+      },
+    );
+
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get(".composer__agent").trigger("click");
+    const textarea = wrapper.get("textarea");
+    await textarea.setValue("各国 GDP 增长率是多少？");
+    await textarea.trigger("keydown", { key: "Enter", shiftKey: false });
+    await vi.waitFor(() => expect(wrapper.text()).toContain("10.6977%"));
+    await flushPromises();
+
+    const ragCall = backend.calls.find((call) => call.url.includes("/rag/query"));
+    expect(ragCall?.body).toMatchObject({
+      query: "各国 GDP 增长率是多少？",
+      knowledge_base_id: "kb-1",
+      answer_mode: "agent",
+    });
+    const assistantCall = backend.calls.find(
+      (call) =>
+        call.url.endsWith("/messages") && (call.body as { role: string }).role === "assistant",
+    );
+    expect(assistantCall?.body).toMatchObject({
+      status: "complete",
+      content: "表格计算得到增长率为 10.6977% [C1]",
+    });
+    expect((assistantCall?.body as { citations: unknown[] }).citations).toHaveLength(1);
+  });
+
   it("plays cached answers back at a pace instead of one burst", async () => {
     // Motion allowed: the pacer reveals the answer over several ticks.
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: false }));

@@ -167,6 +167,7 @@ async def _test_client(
     max_upload_size_bytes: int = 50 * 1024 * 1024,
     llm_gateway: object | None = None,
     vlm_provider: object | None = None,
+    agent_service: object | None = None,
 ) -> AsyncIterator[AsyncClient]:
     settings = Settings(
         _env_file=None,
@@ -182,6 +183,7 @@ async def _test_client(
         graph_store=_TestGraphStore(),  # type: ignore[arg-type]
         llm_gateway=llm_gateway,  # type: ignore[arg-type]
         vlm_provider=vlm_provider,  # type: ignore[arg-type]
+        agent_service=agent_service,  # type: ignore[arg-type]
     )
 
     async with postgres_test_engine.connect() as connection:
@@ -256,6 +258,25 @@ def vlm_client_factory(
             postgres_test_engine,
             test_data_dir,
             vlm_provider=vlm_provider,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def agent_client_factory(
+    postgres_test_database: str,
+    postgres_test_engine: AsyncEngine,
+    test_data_dir: Path,
+) -> Callable[[object], AbstractAsyncContextManager[AsyncClient]]:
+    """Build an API client whose app carries the supplied agent service."""
+
+    def factory(agent_service: object) -> AbstractAsyncContextManager[AsyncClient]:
+        return _test_client(
+            postgres_test_database,
+            postgres_test_engine,
+            test_data_dir,
+            agent_service=agent_service,
         )
 
     return factory

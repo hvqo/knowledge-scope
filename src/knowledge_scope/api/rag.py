@@ -11,7 +11,10 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
+from knowledge_scope.agent.service import AgentChatService
+from knowledge_scope.agent.tools import DocumentLoader
 from knowledge_scope.chat.service import load_recent_memories
+from knowledge_scope.documents.models import Document
 from knowledge_scope.rag.schemas import RAGQueryRequest, RAGStreamEvent
 from knowledge_scope.rag.service import RAGService
 from knowledge_scope.shared.config import Settings
@@ -74,15 +77,38 @@ async def _event_stream(
             yield encode_sse(event)
 
 
+def _document_loader(request: Request) -> DocumentLoader:
+    """Build a request-scoped document resolver for agent tool execution."""
+
+    session_factory = getattr(request.app.state, "db_session_factory", None)
+
+    async def load(knowledge_base_id: UUID, document_id: UUID) -> Document | None:
+        if session_factory is None:
+            return None
+        async with session_factory() as session:
+            document = await session.get(Document, document_id)
+            if document is None or document.knowledge_base_id != knowledge_base_id:
+                return None
+            return document
+
+    return load
+
+
+async def _agent_event_stream(
+    service: AgentChatService,
+    payload: RAGQueryRequest,
+    request: Request,
+) -> AsyncIterator[str]:
+    async with aclosing(
+        service.stream(payload, document_loader=_document_loader(request))
+    ) as event_stream:
+        async for event in event_stream:
+            yield encode_sse(event)
+
+
 @router.post("/query", response_class=StreamingResponse)
 async def query(payload: RAGQueryRequest, request: Request) -> StreamingResponse:
     """Stream a grounded answer and application-generated citation metadata."""
-    service = getattr(request.app.state, "rag_service", None)
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG service is not initialized",
-        )
     settings: Settings = request.app.state.settings
     memories = await _load_memories(
         settings,
@@ -91,6 +117,24 @@ async def query(payload: RAGQueryRequest, request: Request) -> StreamingResponse
     )
     if memories:
         payload = payload.model_copy(update={"memories": memories})
+    if payload.answer_mode == "agent":
+        agent_service = getattr(request.app.state, "agent_service", None)
+        if agent_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Agent service is not initialized",
+            )
+        return StreamingResponse(
+            _agent_event_stream(agent_service, payload, request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    service = getattr(request.app.state, "rag_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RAG service is not initialized",
+        )
     return StreamingResponse(
         _event_stream(service, payload),
         media_type="text/event-stream",
