@@ -30,6 +30,7 @@ import ChatComposer from "../components/chat/ChatComposer.vue";
 import ChatMessageList from "../components/chat/ChatMessageList.vue";
 import ChatSidebar from "../components/chat/ChatSidebar.vue";
 import { referencedCitations } from "../components/chat/citations";
+import AssetPreviewDialog from "../components/chat/AssetPreviewDialog.vue";
 import EvidencePanel from "../components/chat/EvidencePanel.vue";
 import { useChatStore } from "../stores/chat";
 
@@ -39,6 +40,8 @@ const pendingMessage = ref<ChatMessageView | null>(null);
 const selectedMarker = ref<string | null>(null);
 const isSourceOpen = ref(false);
 const drawerCitations = ref<RAGCitation[]>([]);
+const previewCitation = ref<RAGCitation | null>(null);
+const isPreviewOpen = ref(false);
 const rewrittenQuery = ref<string | null>(null);
 const retrievalEscalated = ref(false);
 const isStreaming = ref(false);
@@ -675,6 +678,15 @@ function selectCitationInDrawer(marker: string): void {
   selectedMarker.value = marker;
 }
 
+function openCitationPreview(marker: string): void {
+  const citation = drawerCitations.value.find((item) => item.marker === marker) ?? null;
+  if (citation === null || citation.evidence_id === null) {
+    return;
+  }
+  previewCitation.value = citation;
+  isPreviewOpen.value = true;
+}
+
 function openSources(citations: RAGCitation[]): void {
   if (citations.length === 0) {
     return;
@@ -831,8 +843,17 @@ onBeforeUnmount(() => {
           :rewritten-query="rewrittenQuery"
           :escalated="retrievalEscalated"
           @select-citation="selectCitationInDrawer"
+          @preview-citation="openCitationPreview"
         />
       </aside>
+      <AssetPreviewDialog
+        v-model="isPreviewOpen"
+        :knowledge-base-id="selectedKnowledgeBaseId"
+        :citation="previewCitation"
+        :document-title="
+          previewCitation ? documentTitles[previewCitation.document_id] ?? null : null
+        "
+      />
     </div>
   </section>
 </template>

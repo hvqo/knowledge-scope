@@ -167,6 +167,49 @@ class DocumentChunkListResponse(BaseModel):
     items: list[DocumentChunkResponse]
 
 
+class EvidenceAssetResponse(BaseModel):
+    """Preview availability for one original asset declared by an evidence item."""
+
+    index: int = Field(..., ge=0)
+    media_type: Literal["image/jpeg", "image/png", "image/webp"] | None
+    size_bytes: int | None = Field(default=None, ge=0)
+    available: bool
+
+
+class EvidenceRepresentationResponse(BaseModel):
+    """One canonical, searchable-or-reference representation of an evidence item."""
+
+    representation_id: str = Field(..., pattern=r"^representation_v1_[0-9a-f]{64}$")
+    representation_type: Literal[
+        "text",
+        "caption",
+        "context",
+        "markdown",
+        "html",
+        "latex",
+        "asset_ref",
+        "visual_embedding_ref",
+    ]
+    content: str | None
+    searchable: bool
+
+
+class EvidenceDetailResponse(BaseModel):
+    """Evidence metadata and canonical content needed to preview an original asset."""
+
+    document_id: UUID
+    knowledge_base_id: UUID
+    evidence_id: str = Field(..., pattern=r"^evidence_v1_[0-9a-f]{64}$")
+    modality: Literal["text", "image", "table", "formula"]
+    page_start: int = Field(..., ge=1)
+    page_end: int = Field(..., ge=1)
+    source_block_ids: list[str]
+    section_path: list[str]
+    source_fingerprint: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    representations: list[EvidenceRepresentationResponse]
+    assets: list[EvidenceAssetResponse]
+
+
 class QdrantHealthResponse(BaseModel):
     """Non-sensitive vector-store readiness information."""
 
