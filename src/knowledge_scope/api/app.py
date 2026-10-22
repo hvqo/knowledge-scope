@@ -55,6 +55,7 @@ from .knowledge_bases import router as knowledge_bases_router
 from .rag import router as rag_router
 from .retrieval import router as retrieval_router
 from .schemas import HealthResponse, MetaResponse, Neo4jHealthResponse, QdrantHealthResponse
+from .table_analysis import router as table_analysis_router
 
 API_PREFIX: Final = "/api/v1"
 CURRENT_PHASE: Final = "A3.1"
@@ -306,6 +307,7 @@ def create_app(
     application.include_router(rag_router, prefix=API_PREFIX)
     application.include_router(chatbi_router, prefix=API_PREFIX)
     application.include_router(reports_router, prefix=API_PREFIX)
+    application.include_router(table_analysis_router, prefix=API_PREFIX)
     return application
 
 
