@@ -49,6 +49,8 @@ from knowledge_scope.retrieval.unified import UnifiedRetrievalConfig, UnifiedRet
 from knowledge_scope.shared import build_health_report, get_settings
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import create_database_engine, create_session_factory
+from knowledge_scope.vision.errors import VisionConfigurationError
+from knowledge_scope.vision.provider import VLMProvider, create_vlm_provider
 
 from .documents import router as documents_router
 from .knowledge_bases import router as knowledge_bases_router
@@ -56,6 +58,7 @@ from .rag import router as rag_router
 from .retrieval import router as retrieval_router
 from .schemas import HealthResponse, MetaResponse, Neo4jHealthResponse, QdrantHealthResponse
 from .table_analysis import router as table_analysis_router
+from .vision import router as vision_router
 
 API_PREFIX: Final = "/api/v1"
 CURRENT_PHASE: Final = "A3.1"
@@ -66,6 +69,14 @@ PROJECT_STATUS: Final = "foundation"
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Initialize the default RAG graph and dispose owned clients on shutdown."""
     provider = None
+    owned_vlm_provider: VLMProvider | None = None
+    runtime_settings: Settings = application.state.settings
+    if application.state.vlm_provider is None and runtime_settings.vlm_enabled:
+        try:
+            owned_vlm_provider = create_vlm_provider(runtime_settings)
+            application.state.vlm_provider = owned_vlm_provider
+        except VisionConfigurationError:
+            application.state.vlm_provider = None
     gateway: LLMGateway | None = getattr(application.state, "llm_gateway", None)
     try:
         if application.state.representation_store is None:
@@ -186,6 +197,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     finally:
         if provider is not None:
             await provider.aclose()
+        if owned_vlm_provider is not None:
+            await owned_vlm_provider.aclose()
         await application.state.db_engine.dispose()
         application.state.vector_store.close()
         if application.state.representation_store is not None:
@@ -207,6 +220,7 @@ def create_app(
     sparse_store: SparseIndexStore | None = None,
     chatbi_agent_service: ChatBIAgentService | None = None,
     llm_gateway: LLMGateway | None = None,
+    vlm_provider: VLMProvider | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -232,6 +246,7 @@ def create_app(
     application.state.llm_gateway = llm_gateway
     application.state.report_generation_service = None
     application.state.llm_provider = None
+    application.state.vlm_provider = vlm_provider
     application.add_middleware(
         CORSMiddleware,
         allow_origins=runtime_settings.cors_origins,
@@ -308,6 +323,7 @@ def create_app(
     application.include_router(chatbi_router, prefix=API_PREFIX)
     application.include_router(reports_router, prefix=API_PREFIX)
     application.include_router(table_analysis_router, prefix=API_PREFIX)
+    application.include_router(vision_router, prefix=API_PREFIX)
     return application
 
 
