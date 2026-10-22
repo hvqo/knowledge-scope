@@ -9,7 +9,11 @@ const props = defineProps<{
   documentTitle: string | null;
 }>();
 
-const emit = defineEmits<{ select: [] }>();
+const emit = defineEmits<{ select: []; preview: [] }>();
+
+const canPreview = computed(
+  () => props.citation.candidate_kind === "evidence" && props.citation.evidence_id !== null,
+);
 
 const modalityLabel = computed(() => {
   if (props.citation.candidate_kind === "chunk") {
@@ -37,73 +41,87 @@ const branchLabel = computed(() => {
 </script>
 
 <template>
-  <button
+  <div
     class="evidence-card"
     :class="{ 'is-selected': selected }"
-    type="button"
-    @click="emit('select')"
   >
-    <div class="evidence-card__topline">
-      <span class="evidence-card__marker">{{ citation.marker }}</span>
-      <span class="evidence-card__type">{{ modalityLabel }}</span>
-      <span class="evidence-card__branch">{{ branchLabel }}</span>
-    </div>
-    <strong class="evidence-card__title">
-      {{ documentTitle || "当前知识库文档" }}
-    </strong>
-    <span class="evidence-card__section-title">
-      {{ citation.section_title || "未命名章节" }}
-    </span>
-    <div class="evidence-card__meta">
-      <span>{{ pageLabel }}</span>
-      <span>{{ citation.source_block_ids.length }} 个来源块</span>
-    </div>
-    <p
-      v-if="sectionLabel"
-      class="evidence-card__section"
+    <button
+      class="evidence-card__hit"
+      type="button"
+      @click="emit('select')"
     >
-      {{ sectionLabel }}
-    </p>
-    <p class="evidence-card__note">
-      <template v-if="citation.snippet">
-        <span class="evidence-card__snippet-label">
-          {{ citation.snippet_kind === "representation" ? "检索表示" : "原始片段" }}
-        </span>
-        <span class="evidence-card__snippet">{{ citation.snippet }}</span>
-        <span v-if="citation.snippet_kind === 'representation'">
-          检索表示不替代原始来源。
-        </span>
-      </template>
-      <template v-else-if="citation.candidate_kind === 'evidence'">
-        该卡片锚定原始 Evidence；当前接口未提供可展示的表示片段。
-      </template>
-      <template v-else>
-        当前接口未提供可展示的原始文本片段。
-      </template>
-    </p>
-    <div
-      v-if="citation.candidate_kind === 'evidence'"
-      class="evidence-card__detail"
-    >
-      <span v-if="citation.asset_refs.length > 0">含原始资产引用</span>
-      <span v-if="citation.representation_ids.length > 0">
-        {{ citation.representation_ids.length }} 个检索表示
+      <span class="evidence-card__topline">
+        <span class="evidence-card__marker">{{ citation.marker }}</span>
+        <span class="evidence-card__type">{{ modalityLabel }}</span>
+        <span class="evidence-card__branch">{{ branchLabel }}</span>
       </span>
+      <strong class="evidence-card__title">
+        {{ documentTitle || "当前知识库文档" }}
+      </strong>
+      <span class="evidence-card__section-title">
+        {{ citation.section_title || "未命名章节" }}
+      </span>
+      <span class="evidence-card__meta">
+        <span>{{ pageLabel }}</span>
+        <span>{{ citation.source_block_ids.length }} 个来源块</span>
+      </span>
+      <span
+        v-if="sectionLabel"
+        class="evidence-card__section"
+      >
+        {{ sectionLabel }}
+      </span>
+      <span class="evidence-card__note">
+        <template v-if="citation.snippet">
+          <span class="evidence-card__snippet-label">
+            {{ citation.snippet_kind === "representation" ? "检索表示" : "原始片段" }}
+          </span>
+          <span class="evidence-card__snippet">{{ citation.snippet }}</span>
+          <span v-if="citation.snippet_kind === 'representation'">
+            检索表示不替代原始来源。
+          </span>
+        </template>
+        <template v-else-if="citation.candidate_kind === 'evidence'">
+          该卡片锚定原始 Evidence；当前接口未提供可展示的表示片段。
+        </template>
+        <template v-else>
+          当前接口未提供可展示的原始文本片段。
+        </template>
+      </span>
+      <span
+        v-if="citation.candidate_kind === 'evidence'"
+        class="evidence-card__detail"
+      >
+        <span v-if="citation.asset_refs.length > 0">含原始资产引用</span>
+        <span v-if="citation.representation_ids.length > 0">
+          {{ citation.representation_ids.length }} 个检索表示
+        </span>
+      </span>
+    </button>
+    <div
+      v-if="canPreview"
+      class="evidence-card__actions"
+    >
+      <button
+        class="evidence-card__action"
+        type="button"
+        @click="emit('preview')"
+      >
+        查看来源素材
+      </button>
     </div>
-  </button>
+  </div>
 </template>
 
 <style scoped>
 .evidence-card {
   display: block;
   width: 100%;
-  padding: 14px;
   color: var(--ks-text);
   text-align: left;
   background: var(--ks-surface);
   border: 1px solid var(--ks-border);
   border-radius: var(--ks-radius-md);
-  cursor: pointer;
 }
 
 .evidence-card:hover,
@@ -114,6 +132,25 @@ const branchLabel = computed(() => {
 
 .evidence-card.is-selected {
   background: #fbfdfb;
+}
+
+.evidence-card__hit {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--ks-radius-md);
+  cursor: pointer;
+}
+
+.evidence-card__hit:focus-visible,
+.evidence-card__action:focus-visible {
+  outline: 2px solid var(--ks-accent);
+  outline-offset: 2px;
 }
 
 .evidence-card__topline,
@@ -180,18 +217,22 @@ const branchLabel = computed(() => {
 }
 
 .evidence-card__meta {
+  display: flex;
   margin-top: 8px;
+  gap: 7px;
 }
 
 .evidence-card__section {
-  margin: 7px 0 0;
+  display: block;
+  margin-top: 7px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .evidence-card__note {
-  margin: 10px 0 0;
+  display: block;
+  margin-top: 10px;
   line-height: 1.55;
 }
 
@@ -213,7 +254,32 @@ const branchLabel = computed(() => {
 }
 
 .evidence-card__detail {
+  display: flex;
   margin-top: 8px;
   color: var(--ks-accent-strong);
+  gap: 7px;
+}
+
+.evidence-card__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 14px 10px;
+}
+
+.evidence-card__action {
+  padding: 3px 8px;
+  color: var(--ks-accent-strong);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 660;
+  background: var(--ks-accent-soft);
+  border: 0;
+  border-radius: var(--ks-radius-sm);
+  cursor: pointer;
+}
+
+.evidence-card__action:hover {
+  background: var(--ks-accent);
+  color: #fff;
 }
 </style>
