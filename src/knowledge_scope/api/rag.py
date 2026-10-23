@@ -1,9 +1,12 @@
+# ruff: noqa: RUF001
 """Streaming HTTP endpoint for retrieval-augmented question answering."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from uuid import UUID
@@ -15,7 +18,12 @@ from knowledge_scope.agent.service import AgentChatService
 from knowledge_scope.agent.tools import DocumentLoader
 from knowledge_scope.chat.service import load_recent_memories
 from knowledge_scope.documents.models import Document
-from knowledge_scope.rag.schemas import RAGQueryRequest, RAGStreamEvent
+from knowledge_scope.rag.schemas import (
+    RAGCompleteData,
+    RAGErrorData,
+    RAGQueryRequest,
+    RAGStreamEvent,
+)
 from knowledge_scope.rag.service import RAGService
 from knowledge_scope.shared.config import Settings
 
@@ -94,16 +102,55 @@ def _document_loader(request: Request) -> DocumentLoader:
     return load
 
 
+def _agent_timeout(settings: Settings) -> float:
+    """Return the wall-clock guard for one agentic turn."""
+
+    return settings.agent_timeout_seconds
+
+
 async def _agent_event_stream(
     service: AgentChatService,
     payload: RAGQueryRequest,
     request: Request,
 ) -> AsyncIterator[str]:
-    async with aclosing(
-        service.stream(payload, document_loader=_document_loader(request))
-    ) as event_stream:
-        async for event in event_stream:
-            yield encode_sse(event)
+    settings: Settings = request.app.state.settings
+    timeout_seconds = _agent_timeout(settings)
+    started = time.perf_counter()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            async with aclosing(
+                service.stream(payload, document_loader=_document_loader(request))
+            ) as event_stream:
+                async for event in event_stream:
+                    yield encode_sse(event)
+    except TimeoutError:
+        logger.warning("agent turn timed out after %ss", timeout_seconds)
+        yield encode_sse(
+            RAGStreamEvent(
+                event="error",
+                data=RAGErrorData(
+                    category="agent",
+                    message=(
+                        f"智能体执行超过 {int(timeout_seconds)} 秒，已终止本轮问答。"
+                        "请重试或切换为标准问答。"
+                    ),
+                ).model_dump(mode="json"),
+            )
+        )
+        yield encode_sse(
+            RAGStreamEvent(
+                event="complete",
+                data=RAGCompleteData(
+                    status="error",
+                    prompt_version="agent-rag-v1",
+                    retrieval_mode="unified",
+                    route="unified",
+                    answer_mode="agent",
+                    tool_calls=0,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                ).model_dump(mode="json"),
+            )
+        )
 
 
 @router.post("/query", response_class=StreamingResponse)

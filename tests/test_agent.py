@@ -25,10 +25,12 @@ from knowledge_scope.agent.tools import AgentRetrievalTool, AgentToolExecutor, p
 from knowledge_scope.api.app import create_app
 from knowledge_scope.documents.models import Document
 from knowledge_scope.llm.schemas import LLMRequest, LLMResult, LLMStreamEvent
+from knowledge_scope.rag.history import HistoryPlan
 from knowledge_scope.rag.schemas import (
     RAGCitation,
     RAGCitationsData,
     RAGCompleteData,
+    RAGHistoryTurn,
     RAGQueryRequest,
     RAGStreamEvent,
     RAGToolStatusData,
@@ -206,6 +208,8 @@ class _StubAgentService(AgentChatService):
         retrieval: Any,
         executor: Any,
         rag_service: Any = None,
+        history_compressor: Any = None,
+        query_rewrite: Any = None,
     ) -> None:
         super().__init__(
             settings,
@@ -214,6 +218,8 @@ class _StubAgentService(AgentChatService):
             vision_service=object(),  # type: ignore[arg-type]
             table_service=object(),  # type: ignore[arg-type]
             rag_service=rag_service,
+            history_compressor=history_compressor,
+            query_rewrite=query_rewrite,
         )
         self._retrieval = retrieval
         self._executor = executor
@@ -736,6 +742,8 @@ def _service(
     executor: Any,
     rag_service: Any = None,
     settings: Settings | None = None,
+    history_compressor: Any = None,
+    query_rewrite: Any = None,
 ) -> AgentChatService:
     return _StubAgentService(
         settings or _settings(),
@@ -743,6 +751,8 @@ def _service(
         retrieval=retrieval,
         executor=executor,
         rag_service=rag_service,
+        history_compressor=history_compressor,
+        query_rewrite=query_rewrite,
     )
 
 
@@ -792,13 +802,18 @@ def test_agent_service_emits_visible_tool_status_and_answer_citations() -> None:
     assert statuses[2]["status"] == "running"
     assert statuses[3]["status"] == "completed"
     citation_event = next(event for event in events if event.event == "citations")
-    assert [item["marker"] for item in citation_event.data["items"]] == ["C1", "C2"]
+    # C1 is both cited by the answer and consumed by the tool; C2 was neither.
+    assert [item["marker"] for item in citation_event.data["items"]] == ["C1"]
     complete = next(event for event in events if event.event == "complete")
     assert complete.data["status"] == "completed"
     assert complete.data["answer_mode"] == "agent"
     assert complete.data["tool_calls"] == 1
     assert complete.data["route"] == "unified"
     assert complete.data["provider"] == "fake"
+    assert complete.data["agent_degraded"] is False
+    assert [item["marker"] for item in complete.data["agent_candidates"]] == ["C1", "C2"]
+    assert complete.data["agent_tool_trace"][0]["tool"] == "retrieval"
+    assert complete.data["agent_tool_trace"][1]["tool"] == "analyze_image"
 
 
 def test_agent_service_falls_back_to_rag_when_planner_fails() -> None:
@@ -823,11 +838,16 @@ def test_agent_service_falls_back_to_rag_when_planner_fails() -> None:
     assert names[0] == "tool_status"
     assert names[1] == "tool_status"  # retrieval completed before planning
     statuses = [event.data for event in events if event.event == "tool_status"]
-    assert statuses[-1]["status"] == "skipped"
+    assert [item["status"] for item in statuses] == ["running", "completed"]
     assert "answer_delta" in names
+    first_delta = next(event for event in events if event.event == "answer_delta")
+    assert "未执行视觉分析或确定性计算" in first_delta.data["text"]
     complete = next(event for event in events if event.event == "complete")
     assert complete.data["answer_mode"] == "agent"
     assert complete.data["tool_calls"] == 0
+    assert complete.data["agent_degraded"] is True
+    assert complete.data["agent_degraded_reason"] == "工具规划失败"
+    assert complete.data["agent_tool_trace"][0]["tool"] == "retrieval"
 
 
 def test_agent_service_skips_repeated_identical_tool_call() -> None:
@@ -867,6 +887,151 @@ def test_agent_service_skips_repeated_identical_tool_call() -> None:
     complete = next(event for event in events if event.event == "complete")
     assert complete.data["tool_calls"] == 1
     assert executor.calls == [("analyze_image", 1)]
+
+
+class _FailAfterFirstPlanner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def plan(self, *args: object, **kwargs: object) -> AgentPlan:
+        self.calls += 1
+        if self.calls == 1:
+            return AgentPlan(
+                action="call_tool",
+                tool="analyze_image",
+                evidence_index=1,
+                vision_task="describe_image",
+            )
+        raise AgentPlanningError("规划结果不符合工具调用约定")
+
+
+def test_agent_service_strips_invalid_citation_markers() -> None:
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 1,
+                "vision_task": "describe_image",
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["图片[C9]展示", "了两个空位。[C1]"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([_candidate(1, marker="C1")])),
+        executor=_StubExecutor([_completed_outcome()]),
+    )
+    request = RAGQueryRequest(query="图里有什么？", knowledge_base_id=KB_ID, answer_mode="agent")
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    assert "[C9]" not in answer
+    assert "[C1]" in answer
+    citation_event = next(event for event in events if event.event == "citations")
+    assert [item["marker"] for item in citation_event.data["items"]] == ["C1"]
+
+
+def test_agent_service_filters_unused_candidates_from_citations() -> None:
+    candidates = (
+        _candidate(1, marker="C1"),
+        _candidate(2, marker="C2", evidence_id="evidence_v1_" + "e" * 64),
+    )
+    gateway = _FakeGateway(
+        plans=[{"action": "final", "reason": "直接回答"}], deltas=["[C2] 是相关证据。"]
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result(list(candidates))),
+        executor=_StubExecutor([]),
+    )
+    request = RAGQueryRequest(query="问题", knowledge_base_id=KB_ID, answer_mode="agent")
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    citation_event = next(event for event in events if event.event == "citations")
+    assert [item["marker"] for item in citation_event.data["items"]] == ["C2"]
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["tool_calls"] == 0
+    assert complete.data["agent_degraded"] is False
+
+
+def test_agent_service_fallback_after_tool_keeps_tool_count() -> None:
+    gateway = _FakeGateway(plans=[], deltas=[])
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([_candidate(1, marker="C1")])),
+        executor=_StubExecutor([_completed_outcome()]),
+        rag_service=_FakeRAGService(),
+    )
+    service._planner = _FailAfterFirstPlanner()  # type: ignore[assignment]
+    request = RAGQueryRequest(query="问题", knowledge_base_id=KB_ID, answer_mode="agent")
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["answer_mode"] == "agent"
+    assert complete.data["tool_calls"] == 1
+    assert complete.data["agent_degraded"] is True
+    trace = complete.data["agent_tool_trace"]
+    assert [item["tool"] for item in trace] == ["retrieval", "analyze_image"]
+    assert trace[1]["status"] == "completed"
+
+
+class _StubHistory:
+    async def prepare(self, history: tuple[RAGHistoryTurn, ...]) -> HistoryPlan:
+        return HistoryPlan(
+            summary="用户问过越南GDP",
+            recent_turns=(RAGHistoryTurn(role="user", content="越南 2023 年 GDP 是多少？"),),
+            compressed_turns=3,
+            cache_hit=True,
+        )
+
+
+class _StubRewrite:
+    def __init__(self, rewritten: str) -> None:
+        self._rewritten = rewritten
+
+    async def rewrite(
+        self,
+        query: str,
+        history: tuple[RAGHistoryTurn, ...],
+    ) -> str | None:
+        return self._rewritten
+
+
+def test_agent_service_uses_rewritten_query_and_history() -> None:
+    gateway = _FakeGateway(
+        plans=[{"action": "final", "reason": "直接回答"}], deltas=["4300 亿美元。"]
+    )
+    retrieval = _StubRetrieval(_retrieval_result([_candidate(1, marker="C1", modality="text")]))
+    service = _service(
+        gateway=gateway,
+        retrieval=retrieval,
+        executor=_StubExecutor([]),
+        history_compressor=_StubHistory(),
+        query_rewrite=_StubRewrite("2024年越南GDP"),
+    )
+    request = RAGQueryRequest(
+        query="那 2024 年呢？",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+        history=(
+            RAGHistoryTurn(role="user", content="2023 年越南的 GDP 是多少？"),
+            RAGHistoryTurn(role="assistant", content="4300 亿美元。"),
+        ),
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    assert retrieval.calls[0][0] == "2024年越南GDP"
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["rewritten_query"] == "2024年越南GDP"
+    assert complete.data["history_compressed_turns"] == 3
+    assert complete.data["history_cache_hit"] is True
+    assert complete.data["history_summary_used"] is True
+    planner_contents = [
+        message.content for request_ in gateway.requests for message in request_.messages
+    ]
+    assert any("较早对话摘要：用户问过越南GDP" in content for content in planner_contents)
 
 
 def test_agent_service_falls_back_when_retrieval_returns_no_candidates() -> None:
@@ -1011,3 +1176,41 @@ async def test_agent_api_routes_agent_mode_to_agent_service(agent_client_factory
     ]
     assert service.payloads[0].answer_mode == "agent"
     assert service.loader_created is True
+
+
+class _SlowAgentAPIService:
+    def __init__(self) -> None:
+        self.payloads: list[RAGQueryRequest] = []
+
+    async def stream(
+        self, payload: RAGQueryRequest, *, document_loader: Any
+    ) -> AsyncIterator[RAGStreamEvent]:
+        self.payloads.append(payload)
+        await anyio.sleep(0.2)
+        yield RAGStreamEvent(event="answer_delta", data={"text": "迟到回答"})
+
+
+@pytest.mark.anyio
+async def test_agent_api_times_out_stalled_turn(
+    agent_client_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from knowledge_scope.api import rag as rag_api
+
+    monkeypatch.setattr(rag_api, "_agent_timeout", lambda settings: 0.02)
+    service = _SlowAgentAPIService()
+    async with agent_client_factory(service) as client:
+        response = await client.post(
+            "/api/v1/rag/query",
+            json={
+                "query": "问题",
+                "knowledge_base_id": str(KB_ID),
+                "answer_mode": "agent",
+            },
+        )
+    assert response.status_code == 200
+    frames = _sse_frames(response)
+    assert frames[0] == "event: error"
+    assert "智能体执行超过" in response.text
+    assert frames[-1] == "event: complete"
+    assert '"answer_mode":"agent"' in response.text

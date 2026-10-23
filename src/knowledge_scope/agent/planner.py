@@ -125,15 +125,19 @@ class AgentPlanner:
         observations: Sequence[AgentToolObservation],
         *,
         round_number: int,
+        history_context: str | None = None,
     ) -> AgentPlan:
         if not candidates:
             raise AgentPlanningError("没有可用于规划的检索候选来源")
+        history_block = ""
+        if history_context:
+            history_block = f"对话历史（用于理解指代，不代表新的证据）：\n{history_context}\n\n"
         messages = [
             LLMMessage(role="system", content=_PLANNER_SYSTEM_PROMPT),
             LLMMessage(
                 role="user",
                 content=(
-                    f"用户问题：{query}\n\n"
+                    history_block + f"用户问题：{query}\n\n"
                     f"第 {round_number} 轮规划。\n\n"
                     "候选来源：\n"
                     + "\n".join(_candidate_line(candidate) for candidate in candidates)
@@ -167,11 +171,12 @@ class AgentPlanner:
                 return plan
             except AgentPlanningError as error:
                 last_error = error.message
+                # Never log raw model output or user content: only the bounded
+                # validation error and attempt metadata are safe to keep.
                 logger.warning(
-                    "agent planner attempt %s failed: %s | raw=%s",
+                    "agent planner attempt %s failed: %s",
                     attempt + 1,
                     last_error,
-                    result.text[:500],
                 )
                 if attempt == 0:
                     messages = [

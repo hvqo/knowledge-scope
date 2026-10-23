@@ -141,6 +141,9 @@ class Settings(BaseSettings):
     agent_context_budget_chars: int = Field(default=6_000, ge=500)
     agent_question_max_chars: int = Field(default=500, ge=1, le=2_000)
     agent_tool_result_max_chars: int = Field(default=3_000, ge=200, le=20_000)
+    # Wall-clock guard for one agentic turn; the standard fallback path keeps
+    # its own RAG budget, so this only bounds the pre-answer planning/tool loop.
+    agent_timeout_seconds: float = Field(default=180.0, ge=15, le=600)
     graph_retrieval_max_seed_entities: int = Field(default=5, ge=1, le=50)
     graph_retrieval_max_hops: int = Field(default=2, ge=1, le=2)
     graph_retrieval_max_neighbors: int = Field(default=20, ge=1, le=100)
