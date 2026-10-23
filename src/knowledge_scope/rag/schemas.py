@@ -10,15 +10,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from knowledge_scope.graph.retrieval import GraphPath
 
-RAGEventName = Literal["answer_delta", "citations", "complete", "error"]
+RAGEventName = Literal["answer_delta", "citations", "complete", "error", "tool_status"]
 RAGCompletionStatus = Literal["completed", "insufficient_evidence", "error"]
 RAGRetrievalMode = Literal["dense", "unified"]
 RAGBranchStatus = Literal["success", "empty", "failed", "timed_out", "cancelled"]
 RAGCitationModality = Literal["text", "image", "table", "formula"]
 # ``auto`` lets the service pick the retrieval path for each question.
 RAGRequestedRetrievalMode = Literal["auto", "dense", "unified"]
+# ``agent`` enables the deterministic multimodal tool router; ``standard`` keeps
+# the classic single-pass RAG answer path.
+RAGAnswerMode = Literal["standard", "agent"]
 RAGCitationBranchName = Literal["dense", "sparse", "graph", "multimodal"]
 RAGCitationSnippetKind = Literal["source", "representation"]
+RAGToolName = Literal["retrieval", "analyze_image", "analyze_table"]
+RAGToolStatusValue = Literal["running", "completed", "failed", "skipped"]
 RAG_HISTORY_MAX_TURNS = 200
 RAG_HISTORY_MAX_CHARACTERS = 60_000
 RAG_HISTORY_TURN_MAX_CHARACTERS = 4_000
@@ -49,6 +54,7 @@ class RAGQueryRequest(BaseModel):
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
     retrieval_mode: RAGRequestedRetrievalMode = "dense"
+    answer_mode: RAGAnswerMode = "standard"
     # Long-term memories injected by the API layer, scoped to one knowledge base.
     memories: tuple[str, ...] = ()
     history: list[RAGHistoryTurn] = Field(
@@ -76,6 +82,8 @@ class RAGQueryRequest(BaseModel):
     def validate_retrieval_mode_scope(self) -> Self:
         if self.retrieval_mode == "unified" and self.knowledge_base_id is None:
             raise ValueError("knowledge_base_id is required for unified retrieval")
+        if self.answer_mode == "agent" and self.knowledge_base_id is None:
+            raise ValueError("knowledge_base_id is required for agent mode")
         return self
 
 
@@ -221,6 +229,55 @@ class RAGAnswerDeltaData(BaseModel):
     text: str = Field(min_length=1)
 
 
+class RAGToolStatusData(BaseModel):
+    """Typed payload for one visible agent tool progress step.
+
+    The payload is deliberately limited to tool name, coarse status, and a short
+    human-readable summary.  No model reasoning or internal prompt content is
+    exposed on the wire.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: RAGToolName
+    status: RAGToolStatusValue
+    summary: str = Field(min_length=1, max_length=200)
+    step: int = Field(default=1, ge=1, le=12)
+
+
+class RAGAgentCandidateData(BaseModel):
+    """One retrieval candidate exposed for tracing and evaluation.
+
+    This is deliberately limited to identifiers and source coordinates; it does
+    not expose prompts, model reasoning, or full document text.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    marker: str = Field(pattern=r"^C[1-9][0-9]*$")
+    document_id: UUID
+    evidence_id: str | None = None
+    modality: RAGCitationModality | None = None
+    page_start: int = Field(ge=1)
+    page_end: int = Field(ge=1)
+
+
+class RAGAgentToolTraceData(BaseModel):
+    """Sanitized record of one executed or skipped agent tool step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: RAGToolName
+    status: RAGToolStatusValue
+    summary: str = Field(min_length=1, max_length=200)
+    evidence_id: str | None = None
+    document_id: UUID | None = None
+    # Only the bounded, validated tool contract parameters (never free-form
+    # model text) are echoed for auditability.
+    parameters: dict[str, Any] | None = None
+    error_code: str | None = None
+
+
 class RAGCitationsData(BaseModel):
     """Typed payload for application-controlled citation metadata."""
 
@@ -251,6 +308,16 @@ class RAGCompleteData(BaseModel):
     # The route actually taken: ``direct`` means the turn was answered without
     # retrieving any material, ``dense``/``unified`` mirror the retrieval mode.
     route: Literal["direct", "dense", "unified"] | None = None
+    # Whether the answer came from the standard RAG path or the agent tool router.
+    answer_mode: RAGAnswerMode = "standard"
+    # Number of deterministic tools executed while answering an agent-mode turn.
+    tool_calls: int = Field(default=0, ge=0, le=12)
+    # Agent-only audit trail: retrieval candidates, executed tool steps, and
+    # whether the turn degraded to the standard RAG answer.
+    agent_degraded: bool = False
+    agent_degraded_reason: str | None = Field(default=None, max_length=200)
+    agent_candidates: list[RAGAgentCandidateData] | None = None
+    agent_tool_trace: list[RAGAgentToolTraceData] | None = None
     # The follow-up question as rewritten for retrieval, when one was needed.
     rewritten_query: str | None = None
     # Whether the assembled context was served from the retrieval cache.
@@ -298,13 +365,17 @@ class RAGStreamEvent(BaseModel):
             "citations": RAGCitationsData,
             "complete": RAGCompleteData,
             "error": RAGErrorData,
+            "tool_status": RAGToolStatusData,
         }
         event_models[self.event].model_validate(self.data)
         return self
 
 
 __all__ = [
+    "RAGAgentCandidateData",
+    "RAGAgentToolTraceData",
     "RAGAnswerDeltaData",
+    "RAGAnswerMode",
     "RAGBranchStatus",
     "RAGCitation",
     "RAGCitationBranch",
@@ -319,4 +390,7 @@ __all__ = [
     "RAGQueryRequest",
     "RAGRetrievalMode",
     "RAGStreamEvent",
+    "RAGToolName",
+    "RAGToolStatusData",
+    "RAGToolStatusValue",
 ]

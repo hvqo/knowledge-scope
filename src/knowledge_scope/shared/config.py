@@ -130,6 +130,20 @@ class Settings(BaseSettings):
     rag_cache_empty_ttl_seconds: int = Field(default=60, ge=1, le=86_400)
     rag_cache_max_entries: int = Field(default=256, ge=1, le=100_000)
     rag_cache_timeout_seconds: float = Field(default=0.5, gt=0, le=10)
+    # Multimodal agentic QA: a deterministic tool router sits in front of the
+    # existing retrieval, vision, and table-analysis capabilities.  The standard
+    # RAG path is always kept as the fallback and is not changed by this switch.
+    agent_enabled: bool = True
+    agent_max_rounds: int = Field(default=2, ge=1, le=3)
+    agent_max_tool_calls: int = Field(default=3, ge=1, le=5)
+    agent_planner_max_tokens: int = Field(default=512, ge=64, le=2_048)
+    agent_retrieval_limit: int = Field(default=6, ge=1, le=20)
+    agent_context_budget_chars: int = Field(default=6_000, ge=500)
+    agent_question_max_chars: int = Field(default=500, ge=1, le=2_000)
+    agent_tool_result_max_chars: int = Field(default=3_000, ge=200, le=20_000)
+    # Wall-clock guard for one agentic turn; the standard fallback path keeps
+    # its own RAG budget, so this only bounds the pre-answer planning/tool loop.
+    agent_timeout_seconds: float = Field(default=180.0, ge=15, le=600)
     graph_retrieval_max_seed_entities: int = Field(default=5, ge=1, le=50)
     graph_retrieval_max_hops: int = Field(default=2, ge=1, le=2)
     graph_retrieval_max_neighbors: int = Field(default=20, ge=1, le=100)

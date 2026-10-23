@@ -1,19 +1,21 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
 
-import type { RAGRetrievalMode } from "../../api/types";
+import type { RAGAnswerMode, RAGRetrievalMode } from "../../api/types";
 
 const props = defineProps<{
   disabled: boolean;
   canSend: boolean;
   placeholder?: string;
   retrievalMode: RAGRetrievalMode | "auto";
+  answerMode: RAGAnswerMode;
 }>();
 
 const emit = defineEmits<{
   send: [query: string];
   stop: [];
   "update:retrievalMode": [mode: RAGRetrievalMode | "auto"];
+  "update:answerMode": [mode: RAGAnswerMode];
 }>();
 
 const RETRIEVAL_MODES = [
@@ -107,24 +109,39 @@ defineExpose({ fill, focus: () => inputElement.value?.focus() });
       </button>
     </div>
     <div class="composer__footer">
-      <div
-        class="composer__modes"
-        role="radiogroup"
-        aria-label="检索范围"
-      >
+      <div class="composer__footer-left">
         <button
-          v-for="mode in RETRIEVAL_MODES"
-          :key="mode.value"
           type="button"
-          role="radio"
-          class="composer__mode"
-          :class="{ 'is-active': retrievalMode === mode.value }"
-          :aria-checked="retrievalMode === mode.value"
-          :title="mode.hint"
-          @click="emit('update:retrievalMode', mode.value)"
+          class="composer__agent"
+          :class="{ 'is-active': answerMode === 'agent' }"
+          :aria-pressed="answerMode === 'agent'"
+          title="智能体问答：自动检索，并在需要时调用图片理解或表格计算工具"
+          @click="
+            emit('update:answerMode', answerMode === 'agent' ? 'standard' : 'agent')
+          "
         >
-          {{ mode.label }}
+          <span aria-hidden="true">✦</span>
+          智能体
         </button>
+        <div
+          class="composer__modes"
+          role="radiogroup"
+          aria-label="检索范围"
+        >
+          <button
+            v-for="mode in RETRIEVAL_MODES"
+            :key="mode.value"
+            type="button"
+            role="radio"
+            class="composer__mode"
+            :class="{ 'is-active': retrievalMode === mode.value }"
+            :aria-checked="retrievalMode === mode.value"
+            :title="mode.hint"
+            @click="emit('update:retrievalMode', mode.value)"
+          >
+            {{ mode.label }}
+          </button>
+        </div>
       </div>
       <p class="composer__hint">
         Enter 发送 · Shift + Enter 换行
@@ -222,6 +239,40 @@ defineExpose({ fill, focus: () => inputElement.value?.focus() });
   justify-content: space-between;
   gap: 12px;
   margin: 8px auto 0;
+}
+
+.composer__footer-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer__agent {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  color: var(--ks-muted);
+  font-size: 11px;
+  font-weight: 650;
+  background: var(--ks-surface-subtle);
+  border: 1px solid var(--ks-border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color var(--ks-duration-fast) var(--ks-ease-out),
+    background-color var(--ks-duration-fast) var(--ks-ease-out),
+    border-color var(--ks-duration-fast) var(--ks-ease-out);
+}
+
+.composer__agent:hover {
+  color: var(--ks-ink);
+}
+
+.composer__agent.is-active {
+  color: var(--ks-surface);
+  background: var(--ks-accent);
+  border-color: var(--ks-accent);
 }
 
 .composer__modes {

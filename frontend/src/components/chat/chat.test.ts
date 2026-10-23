@@ -153,7 +153,9 @@ describe("chat sidebar", () => {
 
 describe("chat composer", () => {
   it("sends with Enter and stops while streaming", async () => {
-    const wrapper = mount(ChatComposer, { props: { disabled: false, canSend: true, retrievalMode: "unified" } });
+    const wrapper = mount(ChatComposer, {
+      props: { disabled: false, canSend: true, retrievalMode: "unified", answerMode: "standard" },
+    });
 
     await wrapper.get("textarea").setValue("查找资料");
     await wrapper.get("textarea").trigger("keydown", { key: "Enter", shiftKey: false });
@@ -167,7 +169,7 @@ describe("chat composer", () => {
 
   it("switches the retrieval scope", async () => {
     const wrapper = mount(ChatComposer, {
-      props: { disabled: false, canSend: true, retrievalMode: "auto" },
+      props: { disabled: false, canSend: true, retrievalMode: "auto", answerMode: "standard" },
     });
 
     expect(wrapper.get(".composer__mode.is-active").text()).toBe("智能");
@@ -179,8 +181,25 @@ describe("chat composer", () => {
     expect(wrapper.emitted("update:retrievalMode")?.[1]).toEqual(["unified"]);
   });
 
+  it("toggles agent answer mode", async () => {
+    const wrapper = mount(ChatComposer, {
+      props: { disabled: false, canSend: true, retrievalMode: "auto", answerMode: "standard" },
+    });
+
+    expect(wrapper.get(".composer__agent").attributes("aria-pressed")).toBe("false");
+    await wrapper.get(".composer__agent").trigger("click");
+    expect(wrapper.emitted("update:answerMode")?.[0]).toEqual(["agent"]);
+
+    await wrapper.setProps({ answerMode: "agent" });
+    expect(wrapper.get(".composer__agent").attributes("aria-pressed")).toBe("true");
+    await wrapper.get(".composer__agent").trigger("click");
+    expect(wrapper.emitted("update:answerMode")?.[1]).toEqual(["standard"]);
+  });
+
   it("keeps Shift + Enter for new lines and blocks empty sends", async () => {
-    const wrapper = mount(ChatComposer, { props: { disabled: false, canSend: true, retrievalMode: "unified" } });
+    const wrapper = mount(ChatComposer, {
+      props: { disabled: false, canSend: true, retrievalMode: "unified", answerMode: "standard" },
+    });
 
     await wrapper.get("textarea").setValue("草稿");
     await wrapper.get("textarea").trigger("keydown", { key: "Enter", shiftKey: true });
