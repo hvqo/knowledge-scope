@@ -17,6 +17,7 @@ const emit = defineEmits<{
   selectCitation: [marker: string, citations: RAGCitation[]];
   selectPrompt: [text: string];
   openSources: [citations: RAGCitation[]];
+  insertReport: [message: { content: string; citations: RAGCitation[] }];
 }>();
 
 const EXAMPLE_PROMPTS = [
@@ -159,6 +160,19 @@ defineExpose({ scrollToBottom });
                 @click="emit('openSources', sourcesByMessage[message.id] ?? [])"
               >
                 来源 {{ (sourcesByMessage[message.id] ?? []).length }}
+              </button>
+              <button
+                v-if="(sourcesByMessage[message.id] ?? []).length > 0"
+                type="button"
+                class="message-action"
+                @click="
+                  emit('insertReport', {
+                    content: message.content,
+                    citations: sourcesByMessage[message.id] ?? [],
+                  })
+                "
+              >
+                插入报告
               </button>
             </div>
           </div>

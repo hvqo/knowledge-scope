@@ -370,6 +370,75 @@ def test_planner_rejects_invalid_table_parameters_before_execution() -> None:
         )
 
 
+def test_planner_normalizes_mismatched_table_operation_label() -> None:
+    planner = AgentPlanner(_FakeGateway([]), _settings())  # type: ignore[arg-type]
+    table_candidate = AgentCandidate(
+        index=1,
+        marker="C1",
+        citation=_citation("C1", modality="table", evidence_id="evidence_v1_" + "d" * 64),
+        document_title="sample.pdf",
+        table_columns=("国家", "2024年GDP"),
+        table_rows=("越南",),
+    )
+    plan = AgentPlan(
+        action="call_tool",
+        tool="analyze_table",
+        evidence_index=1,
+        operation="select",
+        parameters={"column": "2024年GDP", "functions": ["sum"]},
+    )
+    planner._validate_plan(plan, [table_candidate])
+    assert plan.operation == "aggregate"
+
+
+def test_planner_sanitizes_mixed_parameter_keys_on_operation_normalization() -> None:
+    planner = AgentPlanner(_FakeGateway([]), _settings())  # type: ignore[arg-type]
+    table_candidate = AgentCandidate(
+        index=1,
+        marker="C1",
+        citation=_citation("C1", modality="table", evidence_id="evidence_v1_" + "d" * 64),
+        document_title="sample.pdf",
+        table_columns=("国家", "2023年GDP", "2024年GDP"),
+        table_rows=("越南", "泰国", "文莱"),
+    )
+    plan = AgentPlan(
+        action="call_tool",
+        tool="analyze_table",
+        evidence_index=1,
+        operation="select",
+        parameters={
+            "column": "2024年GDP",
+            "functions": ["sum", "avg"],
+            "columns": ["国家"],
+        },
+    )
+    planner._validate_plan(plan, [table_candidate])
+    assert plan.operation == "aggregate"
+    assert plan.parameters == {"column": "2024年GDP", "functions": ["sum", "avg"]}
+
+
+def test_planner_normalizes_aggregate_function_synonyms() -> None:
+    planner = AgentPlanner(_FakeGateway([]), _settings())  # type: ignore[arg-type]
+    table_candidate = AgentCandidate(
+        index=1,
+        marker="C1",
+        citation=_citation("C1", modality="table", evidence_id="evidence_v1_" + "d" * 64),
+        document_title="sample.pdf",
+        table_columns=("国家", "2024年GDP"),
+        table_rows=("越南", "泰国", "文莱"),
+    )
+    plan = AgentPlan(
+        action="call_tool",
+        tool="analyze_table",
+        evidence_index=1,
+        operation="select",
+        parameters={"column": "2024年GDP", "functions": ["average"]},
+    )
+    planner._validate_plan(plan, [table_candidate])
+    assert plan.operation == "aggregate"
+    assert plan.parameters == {"column": "2024年GDP", "functions": ["avg"]}
+
+
 def test_planner_repairs_malformed_model_output_once() -> None:
     calls: list[LLMRequest] = []
 

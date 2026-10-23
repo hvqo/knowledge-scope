@@ -1,0 +1,612 @@
+{
+  "name": "M5 multimodal agentic RAG business evaluation",
+  "knowledge_base_id": "3ddd57cf-5db5-4a92-9241-b8c05a6cc73b",
+  "documents": {
+    "V": "808c30b3-df23-4352-8c24-51db420d8fa3",
+    "A": "c8deb761-ec4e-4c87-adbf-376957acf147",
+    "B": "cfbb945f-5d66-4b7d-aff3-165cf8d07a5f",
+    "M": "df6beeac-951a-41fa-aeab-74161311c22d"
+  },
+  "questions": [
+    {
+      "id": "rag-01",
+      "category": "rag",
+      "query": "文档第一页的季度销售额图表标题是什么？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": [
+        "Quarterly Sales 2023",
+        "Quarterly Sales"
+      ],
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "quarterly sales"
+      ]
+    },
+    {
+      "id": "rag-02",
+      "category": "rag",
+      "query": "这份文档一共包含哪些主要图表内容？",
+      "history": [],
+      "expected_tools": [
+        "none",
+        "analyze_image"
+      ],
+      "expected_numbers": null,
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "rag-03",
+      "category": "rag",
+      "query": "排列数公式 A_n^m 是什么？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [
+        "M"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "n(n-1)",
+        "n!/(n-m)!"
+      ]
+    },
+    {
+      "id": "rag-04",
+      "category": "rag",
+      "query": "组合数公式 C_n^m 用阶乘如何表示？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [
+        "M"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "m!(n-m)!",
+        "m!(n−m)!"
+      ]
+    },
+    {
+      "id": "rag-05",
+      "category": "rag",
+      "query": "表 1 中各列数据的单位是什么？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": [
+        "亿美元"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "亿美元"
+      ]
+    },
+    {
+      "id": "rag-06",
+      "category": "rag",
+      "query": "二项式定理的展开式是什么？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [
+        "M"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "(a+b)^n",
+        "cn0",
+        "c_n^0"
+      ]
+    },
+    {
+      "id": "rag-07",
+      "category": "rag",
+      "query": "文档第二页的表格标题是什么？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "table 1",
+        "country gdp"
+      ]
+    },
+    {
+      "id": "image-01",
+      "category": "image",
+      "query": "分析图 1 的季度销售趋势，并指出峰值所在的季度。",
+      "history": [],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_numbers": [
+        "上升",
+        "Q4"
+      ],
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "q4",
+        "上升"
+      ]
+    },
+    {
+      "id": "image-02",
+      "category": "image",
+      "query": "描述文档第 3 页流程图的结构与各环节。",
+      "history": [],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_numbers": null,
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "流程图理解",
+      "expected_phrases": [
+        "pdf",
+        "evidence"
+      ]
+    },
+    {
+      "id": "image-03",
+      "category": "image",
+      "query": "图 1 中销售额最低的季度具体数值是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_numbers": null,
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "图片未标注最低季度数值时不得编造数字，需说明无法确认",
+      "expected_phrases": [
+        "无法确定",
+        "无法确认",
+        "未明确",
+        "未给出",
+        "不能确定",
+        "需人工核对"
+      ]
+    },
+    {
+      "id": "image-04",
+      "category": "image",
+      "query": "图 6.2-3 说明了什么？",
+      "history": [],
+      "expected_tools": [
+        "analyze_image"
+      ],
+      "expected_numbers": null,
+      "expected_docs": [
+        "M"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": [
+        "排列",
+        "空位"
+      ]
+    },
+    {
+      "id": "image-table-01",
+      "category": "image_table",
+      "query": "提取第二页表格中的国家 GDP 数值。",
+      "history": [],
+      "expected_tools": [
+        "analyze_image",
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4300",
+        "4760"
+      ],
+      "expected_docs": [
+        "V"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "图片型表格提取（分析图片或表格工具均可）",
+      "expected_phrases": null
+    },
+    {
+      "id": "table-01",
+      "category": "table",
+      "query": "越南 2024 年 GDP 是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4760"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "table-02",
+      "category": "table",
+      "query": "泰国 2023 年 GDP 是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "5000"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "table-03",
+      "category": "table",
+      "query": "文莱 2024 年的预测 GDP 是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "40"
+      ],
+      "expected_docs": [
+        "B"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "growth-01",
+      "category": "growth",
+      "query": "表 1（m2-pdf-a.pdf）中越南 2023 到 2024 年 GDP 增长了百分之几？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10.6977"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "growth-02",
+      "category": "growth",
+      "query": "表 1（m2-pdf-a.pdf）中文莱 2023 到 2024 年 GDP 增长率是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": null,
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "基期为 0，代理应说明无法计算增长率而不是编造数字",
+      "expected_phrases": [
+        "无法计算",
+        "不能计算",
+        "除数为零",
+        "分母为零",
+        "不能确定"
+      ]
+    },
+    {
+      "id": "growth-03",
+      "category": "growth",
+      "query": "表 2（m2-pdf-b.pdf）中越南 2023 到 2024 年预测 GDP 增长率是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4.4444"
+      ],
+      "expected_docs": [
+        "B"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "agg-01",
+      "category": "aggregate",
+      "query": "表 1 中 2024 年三个国家的 GDP 总和是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10010"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "agg-02",
+      "category": "aggregate",
+      "query": "表 2 中 2024 年三个国家的预测 GDP 平均值是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "3346.67",
+        "3346.6667",
+        "3346"
+      ],
+      "expected_docs": [
+        "B"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "agg-03",
+      "category": "aggregate",
+      "query": "表 1 中 2023 年三国 GDP 的平均值是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "3100"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "compare-01",
+      "category": "compare",
+      "query": "对比表 1 和表 2 中 2024 年越南和泰国的 GDP 数值，并说明差异。",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "60",
+        "-100"
+      ],
+      "expected_docs": [
+        "A",
+        "B"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "compare-02",
+      "category": "compare",
+      "query": "对比表 1 和表 2 中 2023 年三国的 GDP 数值。",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "-200",
+        "100",
+        "-10"
+      ],
+      "expected_docs": [
+        "A",
+        "B"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "compare-03",
+      "category": "compare",
+      "query": "第二页的表格与表 1 的 2024 年 GDP 是否一致？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "0"
+      ],
+      "expected_docs": [
+        "V",
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "followup-01",
+      "category": "followup",
+      "query": "2023 年越南的 GDP 是多少？",
+      "history": [],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4300"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "followup-02",
+      "category": "followup",
+      "query": "那 2024 年呢？",
+      "history": [
+        {
+          "role": "user",
+          "content": "2023 年越南的 GDP 是多少？"
+        },
+        {
+          "role": "assistant",
+          "content": "根据表格工具，2023 年越南 GDP 为 4300 亿美元。"
+        }
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "4760"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "followup-03",
+      "category": "followup",
+      "query": "相比 2023 年增长了百分之几？",
+      "history": [
+        {
+          "role": "user",
+          "content": "2023 年越南的 GDP 是多少？"
+        },
+        {
+          "role": "assistant",
+          "content": "2023 年越南 GDP 为 4300 亿美元。"
+        },
+        {
+          "role": "user",
+          "content": "那 2024 年呢？"
+        },
+        {
+          "role": "assistant",
+          "content": "2024 年越南 GDP 为 4760 亿美元。"
+        }
+      ],
+      "expected_tools": [
+        "analyze_table"
+      ],
+      "expected_numbers": [
+        "10.6977"
+      ],
+      "expected_docs": [
+        "A"
+      ],
+      "citation_required": true,
+      "expect_insufficient": false,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "negative-01",
+      "category": "negative",
+      "query": "文档中关于欧盟 2024 年 GDP 的数据是多少？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [],
+      "citation_required": false,
+      "expect_insufficient": true,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "negative-02",
+      "category": "negative",
+      "query": "2025 年越南 GDP 是多少？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [],
+      "citation_required": false,
+      "expect_insufficient": true,
+      "notes": "",
+      "expected_phrases": null
+    },
+    {
+      "id": "negative-03",
+      "category": "negative",
+      "query": "表 9 的数据是多少？",
+      "history": [],
+      "expected_tools": null,
+      "expected_numbers": null,
+      "expected_docs": [],
+      "citation_required": false,
+      "expect_insufficient": true,
+      "notes": "",
+      "expected_phrases": null
+    }
+  ]
+}

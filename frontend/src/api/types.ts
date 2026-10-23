@@ -291,6 +291,17 @@ export interface ReportSourceInsertRequest {
   content_append: string;
 }
 
+export interface ReportAgentAnswerInsertRequest {
+  content_append: string;
+  sources: ReportSourceCreateRequest[];
+}
+
+export interface ReportAgentAnswerInsertResponse {
+  section: ReportSection;
+  sources: ReportSourceReference[];
+  warnings: string[];
+}
+
 export interface ReportAIContextRequest {
   source_ids?: string[];
   instruction?: string | null;
