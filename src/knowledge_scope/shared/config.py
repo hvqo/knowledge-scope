@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     vlm_reasoning_effort: str = Field(default="", max_length=20)
     vlm_timeout_seconds: float = Field(default=90.0, gt=0, le=300)
     vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
-    vlm_max_output_tokens: int = Field(default=2_048, ge=1, le=4_096)
+    vlm_max_output_tokens: int = Field(default=2_048, ge=1, le=8_192)
     graph_extraction_max_tokens: int = Field(default=1024, ge=1)
     graph_extraction_max_parse_retries: int = Field(default=1, ge=0, le=1)
     # The first budget is derived from graph_extraction_max_tokens when this

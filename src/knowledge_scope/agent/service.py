@@ -78,6 +78,7 @@ _ANSWER_SYSTEM_PROMPT = (
     "4. 只引用真正支持当前论断的候选证据；与问题无关的候选不要引用。\n"
     "工具结果规则：\n"
     "5. 表格工具给出的是确定性计算结果；引用数值时保留原单位，并说明使用的公式或口径。\n"
+    "   引用工具数值时必须保留工具输出的原始精度（例如 10.6977%），不要四舍五入或改写。\n"
     "6. 视觉模型结果仅供参考，须说明其来自视觉模型、可能需要人工核对；不要把它当作精确统计数据。\n"
     "7. 不要自行推算或计算数值。涉及增长率、增量、求和、平均等计算时，"
     "只能引用表格工具给出的结果；如果表格工具未成功执行，请明确说明无法计算，"
@@ -87,7 +88,8 @@ _ANSWER_SYSTEM_PROMPT = (
 
 _FALLBACK_NOTICE = (
     "（智能体未能完成必要的工具步骤：{reason}。以下为常规检索回答，"
-    "未执行视觉分析或确定性计算，请以证据原文为准。）\n\n"
+    "未执行视觉分析或确定性计算；回答中若出现汇总、增长率等计算数值，"
+    "均不是确定性工具结果，请以证据原文为准。）\n\n"
 )
 
 
@@ -356,7 +358,7 @@ class AgentChatService:
                         summary=outcome.summary,
                         evidence_id=candidate.evidence_id,
                         document_id=candidate.citation.document_id,
-                        parameters=_trace_parameters(plan),
+                        parameters=_trace_parameters(plan, candidate, second_candidate),
                         error_code=outcome.error_code,
                     )
                 )
@@ -625,7 +627,11 @@ class AgentChatService:
                 yield event
 
 
-def _trace_parameters(plan: AgentPlan) -> dict[str, Any] | None:
+def _trace_parameters(
+    plan: AgentPlan,
+    candidate: AgentCandidate | None = None,
+    second_candidate: AgentCandidate | None = None,
+) -> dict[str, Any] | None:
     parameters: dict[str, Any] = {}
     if plan.operation is not None:
         parameters["operation"] = plan.operation
@@ -639,6 +645,12 @@ def _trace_parameters(plan: AgentPlan) -> dict[str, Any] | None:
         parameters["second_evidence_index"] = plan.second_evidence_index
     if plan.parameters is not None:
         parameters["parameters"] = plan.parameters
+    if candidate is not None:
+        parameters["document_id"] = str(candidate.citation.document_id)
+        parameters["evidence_id"] = candidate.evidence_id
+    if second_candidate is not None:
+        parameters["second_document_id"] = str(second_candidate.citation.document_id)
+        parameters["second_evidence_id"] = second_candidate.evidence_id
     return parameters or None
 
 

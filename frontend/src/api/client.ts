@@ -24,6 +24,8 @@ import type {
   ChatBIDataSourceListResponse,
   ChatBIResultScalar,
   Report,
+  ReportAgentAnswerInsertRequest,
+  ReportAgentAnswerInsertResponse,
   ReportAIContextRequest,
   ReportAIDraftResponse,
   ReportAIEditRequest,
@@ -856,6 +858,17 @@ export function insertReportSource(
 ): Promise<ReportSourceReference> {
   return request<ReportSourceReference>(
     `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/sources/insert`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function insertAgentAnswer(
+  reportId: string,
+  sectionId: string,
+  payload: ReportAgentAnswerInsertRequest,
+): Promise<ReportAgentAnswerInsertResponse> {
+  return request<ReportAgentAnswerInsertResponse>(
+    `/v1/reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/agent-answers/insert`,
     { method: "POST", body: JSON.stringify(payload) },
   );
 }

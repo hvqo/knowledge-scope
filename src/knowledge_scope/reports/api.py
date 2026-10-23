@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Annotated
@@ -18,8 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_scope.chatbi.execution import redact_sql_literals
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
+from knowledge_scope.documents.assets import AssetAccessError, get_evidence
 from knowledge_scope.documents.models import Document
 from knowledge_scope.knowledge_bases.models import KnowledgeBase
+from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import get_session
 
 from .export import ReportExportError, build_docx, build_pdf, safe_report_filename
@@ -32,6 +35,8 @@ from .models import (
 )
 from .schemas import (
     REPORT_AI_MAX_SOURCE_REFERENCES,
+    ReportAgentAnswerInsertCreate,
+    ReportAgentAnswerInsertResponse,
     ReportAIContextRequest,
     ReportAIDraftResponse,
     ReportAIEditRequest,
@@ -768,6 +773,124 @@ async def insert_source_reference(
         raise
     await session.refresh(reference)
     return _source_response(reference)
+
+
+async def _validate_agent_answer_sources(
+    session: AsyncSession,
+    report: Report,
+    sources: list[ReportRagSourceCreate],
+    settings: Settings,
+) -> list[str]:
+    """Validate agent-provided source references instead of trusting the browser."""
+
+    warnings: list[str] = []
+    for source in sources:
+        if report.knowledge_base_id is None or report.knowledge_base_id != source.knowledge_base_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="请先为报告选择与证据一致的知识库",
+            )
+        document = await session.scalar(
+            select(Document).where(
+                Document.id == source.document_id,
+                Document.knowledge_base_id == source.knowledge_base_id,
+            )
+        )
+        if document is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="证据文档不存在")
+        if source.evidence_id is None:
+            continue
+        try:
+            snapshot = await asyncio.to_thread(
+                get_evidence,
+                settings,
+                document,
+                source.evidence_id,
+            )
+        except AssetAccessError as error:
+            message = str(error)
+            if "尚未完成解析" in message:
+                warnings.append(
+                    f"{source.title}：历史文档缺少解析产物，无法核验 Evidence 元数据，"
+                    "仅保留引用信息"
+                )
+                continue
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="证据来源无效或已过期，已拒绝插入",
+            ) from error
+        lineage = snapshot.evidence.lineage
+        if (lineage.page_start, lineage.page_end) != (source.page_start, source.page_end):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="证据页码与服务器记录不一致",
+            )
+        if set(lineage.source_block_ids) != set(source.source_block_ids):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="证据来源块与服务器记录不一致",
+            )
+    return warnings
+
+
+@router.post(
+    "/{report_id}/sections/{section_id}/agent-answers/insert",
+    response_model=ReportAgentAnswerInsertResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def insert_agent_answer_references(
+    report_id: UUID,
+    section_id: UUID,
+    payload: ReportAgentAnswerInsertCreate,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> ReportAgentAnswerInsertResponse:
+    """Append one agent answer and its validated Evidence references to a section."""
+
+    report = await _get_report(session, report_id)
+    section = await _get_section(session, report_id, section_id)
+    settings: Settings = request.app.state.settings
+    warnings = await _validate_agent_answer_sources(
+        session,
+        report,
+        payload.sources,
+        settings,
+    )
+    references: list[ReportSourceReference] = []
+    for source in payload.sources:
+        _report, _section, reference = await _build_source_reference(
+            session,
+            report_id,
+            section_id,
+            source,
+        )
+        references.append(reference)
+    now = datetime.now(UTC)
+    section.content = _append_source_content(section.content, payload.content_append)
+    section.updated_at = now
+    report.updated_at = now
+    session.add_all(references)
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    for reference in references:
+        await session.refresh(reference)
+    return ReportAgentAnswerInsertResponse(
+        section=ReportSectionResponse(
+            id=section.id,
+            report_id=section.report_id,
+            title=section.title,
+            content=section.content,
+            position=section.position,
+            sources=[],
+            created_at=section.created_at.isoformat(),
+            updated_at=section.updated_at.isoformat(),
+        ),
+        sources=[_source_response(reference) for reference in references],
+        warnings=warnings,
+    )
 
 
 @router.delete(

@@ -1,0 +1,1264 @@
+{
+  "schema": "m5-eval-dataset/v2",
+  "version": "2.0",
+  "name": "M5 strict multimodal agentic RAG evaluation",
+  "description": "30 questions over four PDFs (generated chart/table/flow PDF, generated GDP table PDFs A/B, frozen A1.5 math textbook PDF). UUIDs are resolved through the fixture file, never baked in.",
+  "scoring_notes": {
+    "retrieval_hit_at_k": "UNVERIFIED: the public SSE contract does not expose retrieval-stage Top-K candidates; report Cited Document Coverage instead.",
+    "citation_semantic_support": "UNVERIFIED: structural citation validation cannot prove that each cited source semantically supports every sentence.",
+    "numbers": "Each group is an OR-list of equivalent formats; every group must match an extracted number within the question tolerance. Percent signs are stripped and compared numerically.",
+    "needs_review": "Visual table extraction is always needs_review and is never counted as a deterministic calculation."
+  },
+  "document_aliases": {
+    "V": "m3-vision-acceptance.pdf",
+    "A": "m2-pdf-a.pdf",
+    "B": "m2-pdf-b.pdf",
+    "M": "m5-math.pdf"
+  },
+  "questions": [
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "quarterly sales 2023",
+          "quarterly sales"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "图表标题属于文本；不得调用图片工具。",
+      "id": "rag-01",
+      "category": "rag",
+      "query": "文档第一页的季度销售额图表标题是什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [
+          "analyze_image"
+        ],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": null,
+      "required_text_groups": [
+        [
+          "图",
+          "chart",
+          "figure"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "允许直接基于文本证据回答，也允许一次图片理解。",
+      "id": "rag-02",
+      "category": "rag",
+      "query": "这份文档一共包含哪些主要图表内容？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "M"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "n(n-1)",
+          "n(n−1)",
+          "n!/(n-m)!",
+          "n!/(n−m)!",
+          "n! / (n-m)!"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "排列数公式可用连乘或阶乘形式表达，二者等价。",
+      "id": "rag-03",
+      "category": "rag",
+      "query": "排列数公式 A_n^m 是什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "M"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "m!(n-m)!",
+          "m!(n−m)!"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "rag-04",
+      "category": "rag",
+      "query": "组合数公式 C_n^m 用阶乘如何表示？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "亿美元"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "rag-05",
+      "category": "rag",
+      "query": "表 1 中各列数据的单位是什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "M"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "(a+b)^n",
+          "(a+b)ⁿ",
+          "cn0",
+          "c_n^0"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "rag-06",
+      "category": "rag",
+      "query": "二项式定理的展开式是什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "table 1"
+        ],
+        [
+          "country gdp"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "rag-07",
+      "category": "rag",
+      "query": "文档第二页的表格标题是什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [
+          "analyze_image"
+        ],
+        "allowed": [
+          "analyze_image"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": "analyze_chart",
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "q4"
+        ],
+        [
+          "上升",
+          "增长",
+          "上涨"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "image-01",
+      "category": "image",
+      "query": "分析图 1 的季度销售趋势，并指出峰值所在的季度。"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [
+          "analyze_image"
+        ],
+        "allowed": [
+          "analyze_image"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": "describe_image",
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "input pdf",
+          "输入pdf"
+        ],
+        [
+          "parse layout",
+          "解析版面"
+        ],
+        [
+          "evidence"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "image-02",
+      "category": "image",
+      "query": "描述文档第 3 页流程图的结构与各环节。"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [
+          "analyze_image"
+        ],
+        "allowed": [
+          "analyze_image"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": "analyze_chart",
+      "numbers": {
+        "groups": [],
+        "kind": "visual_refusal"
+      },
+      "required_text_groups": [
+        [
+          "无法确定",
+          "无法确认",
+          "未明确",
+          "未给出",
+          "不能确定",
+          "无法读取",
+          "图中未标注",
+          "无法给出"
+        ]
+      ],
+      "forbid_any_number": true,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "VLM 无法读数时必须受控拒答，且不得编造具体数值（禁止数字仅针对视觉数值）。",
+      "id": "image-03",
+      "category": "image",
+      "query": "图 1 中销售额最低的季度具体数值是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "M"
+      ],
+      "tools": {
+        "required": [
+          "analyze_image"
+        ],
+        "allowed": [
+          "analyze_image"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": "describe_image",
+      "numbers": {
+        "groups": [],
+        "kind": "text"
+      },
+      "required_text_groups": [
+        [
+          "排列"
+        ],
+        [
+          "第 1 位",
+          "第一位",
+          "第1位",
+          "位置",
+          "选择"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "允许“第 1 位/位置/选择”等不同表述。",
+      "id": "image-04",
+      "category": "image",
+      "query": "图 6.2-3 说明了什么？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V"
+      ],
+      "tools": {
+        "required": [],
+        "allowed": [
+          "analyze_table",
+          "analyze_image"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": "extract_table",
+      "numbers": {
+        "groups": [
+          [
+            "4300"
+          ],
+          [
+            "4760"
+          ]
+        ],
+        "kind": "visual_number",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "若走 analyze_table（MinerU 已产出结构化 HTML）按确定性结果计分；若走 analyze_image 则结果必须 needs_review。",
+      "id": "image-table-01",
+      "category": "image_table",
+      "query": "提取第二页表格中的国家 GDP 数值。"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "select",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "4760"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": "0.0001"
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "表 1 是 m2-pdf-a.pdf；允许 select 或 filter 取数，但目标文档必须是 A。",
+      "id": "table-01",
+      "category": "table",
+      "query": "表 1（m2-pdf-a.pdf）中越南 2024 年 GDP 是多少？",
+      "expected_operations": [
+        "select",
+        "filter"
+      ]
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "select",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "5000"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": "0.0001"
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "表 1 是 m2-pdf-a.pdf；允许 select 或 filter 取数，但目标文档必须是 A。",
+      "id": "table-02",
+      "category": "table",
+      "query": "表 1（m2-pdf-a.pdf）中泰国 2023 年 GDP 是多少？",
+      "expected_operations": [
+        "select",
+        "filter"
+      ]
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "B"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "select",
+      "expected_parameter_docs": [
+        "B"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "40"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": "0.0001"
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "表 2 是 m2-pdf-b.pdf 的预测值；允许 select 或 filter。",
+      "id": "table-03",
+      "category": "table",
+      "query": "表 2（m2-pdf-b.pdf）中文莱 2024 年的预测 GDP 是多少？",
+      "expected_operations": [
+        "select",
+        "filter"
+      ]
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "growth",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "10.6977"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "growth-01",
+      "category": "growth",
+      "query": "表 1（m2-pdf-a.pdf）中越南 2023 到 2024 年 GDP 增长了百分之几？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "growth",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "controlled_error"
+      },
+      "required_text_groups": [
+        [
+          "无法计算",
+          "不能计算",
+          "除数为零",
+          "分母为零",
+          "不能确定",
+          "无法给出"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": "division_by_zero",
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "growth-02",
+      "category": "growth",
+      "query": "表 1（m2-pdf-a.pdf）中文莱 2023 到 2024 年 GDP 增长率是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "B"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "growth",
+      "expected_parameter_docs": [
+        "B"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "4.4444"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "growth-03",
+      "category": "growth",
+      "query": "表 2（m2-pdf-b.pdf）中越南 2023 到 2024 年预测 GDP 增长率是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "aggregate",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "10010"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "agg-01",
+      "category": "aggregate",
+      "query": "表 1 中 2024 年三个国家的 GDP 总和是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "B"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "aggregate",
+      "expected_parameter_docs": [
+        "B"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "3346.6667"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "agg-02",
+      "category": "aggregate",
+      "query": "表 2 中 2024 年三个国家的预测 GDP 平均值是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "aggregate",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "3100"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "agg-03",
+      "category": "aggregate",
+      "query": "表 1 中 2023 年三国 GDP 的平均值是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A",
+        "B"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "compare",
+      "expected_parameter_docs": [
+        "A",
+        "B"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "4760"
+          ],
+          [
+            "4700"
+          ],
+          [
+            "60"
+          ],
+          [
+            "100"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": "0.0001"
+      },
+      "required_text_groups": [
+        [
+          "高"
+        ],
+        [
+          "低"
+        ],
+        [
+          "1.2766"
+        ],
+        [
+          "1.8868"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "负数差异在回答中用“低 100 亿美元”表达，因此以文本方向词 + 绝对差值共同判定。",
+      "id": "compare-01",
+      "category": "compare",
+      "query": "对比表 1 和表 2 中 2024 年越南和泰国的 GDP 数值，并说明差异。"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A",
+        "B"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "compare",
+      "expected_parameter_docs": [
+        "A",
+        "B"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "-200"
+          ],
+          [
+            "100"
+          ],
+          [
+            "-10"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": "0.0001"
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "回答应给出有符号差异 -200、100、-10。",
+      "id": "compare-02",
+      "category": "compare",
+      "query": "对比表 1 和表 2 中 2023 年三国的 GDP 数值。"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "V",
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "compare",
+      "expected_parameter_docs": [
+        "V",
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "exact_calc"
+      },
+      "required_text_groups": [
+        [
+          "一致"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "该题验证跨文档一致性，不要求回答重复差值 0；以“一致”表述与工具成功为准。",
+      "id": "compare-03",
+      "category": "compare",
+      "query": "第二页的表格与表 1 的 2024 年 GDP 是否一致？"
+    },
+    {
+      "history": [],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "select",
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "4300"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "首轮问题未指定表 1/表 2，允许任一口径；后续追问必须继承该口径。",
+      "id": "followup-01",
+      "category": "followup",
+      "query": "2023 年越南的 GDP 是多少？"
+    },
+    {
+      "history": [
+        {
+          "role": "user",
+          "content": "2023 年越南的 GDP 是多少？"
+        },
+        {
+          "role": "assistant",
+          "content": "2023 年越南 GDP 为 4300 亿美元。"
+        }
+      ],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "select",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "4760"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "追问需要继承上一轮的国家与指标；允许 select/filter。",
+      "id": "followup-02",
+      "category": "followup",
+      "query": "那 2024 年呢？",
+      "expected_operations": [
+        "select",
+        "filter"
+      ]
+    },
+    {
+      "history": [
+        {
+          "role": "user",
+          "content": "2023 年越南的 GDP 是多少？"
+        },
+        {
+          "role": "assistant",
+          "content": "2023 年越南 GDP 为 4300 亿美元。"
+        },
+        {
+          "role": "user",
+          "content": "那 2024 年呢？"
+        },
+        {
+          "role": "assistant",
+          "content": "2024 年越南 GDP 为 4760 亿美元。"
+        }
+      ],
+      "required_docs": [
+        "A"
+      ],
+      "tools": {
+        "required": [
+          "analyze_table"
+        ],
+        "allowed": [
+          "analyze_table"
+        ],
+        "allow_none": false
+      },
+      "expected_operation": "growth",
+      "expected_parameter_docs": [
+        "A"
+      ],
+      "vision_task": null,
+      "numbers": {
+        "groups": [
+          [
+            "10.6977"
+          ]
+        ],
+        "kind": "exact_calc",
+        "tolerance": 0.0001
+      },
+      "required_text_groups": [],
+      "forbid_any_number": false,
+      "citation_required": true,
+      "expect_insufficient": false,
+      "expected_tool_error": null,
+      "deterministic_calc": true,
+      "needs_review_expected": false,
+      "notes": "",
+      "id": "followup-03",
+      "category": "followup",
+      "query": "相比 2023 年增长了百分之几？"
+    },
+    {
+      "history": [],
+      "required_docs": [],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text_refusal"
+      },
+      "required_text_groups": [
+        [
+          "没有",
+          "未找到",
+          "无法",
+          "不足",
+          "不存在",
+          "未提供"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": false,
+      "expect_insufficient": true,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "期望回答明确表示知识库没有欧盟数据；结构化 insufficient_evidence 或显式拒答均可。",
+      "id": "negative-01",
+      "category": "negative",
+      "query": "文档中关于欧盟 2024 年 GDP 的数据是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text_refusal"
+      },
+      "required_text_groups": [
+        [
+          "没有",
+          "未找到",
+          "无法",
+          "不足",
+          "不存在",
+          "未提供"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": false,
+      "expect_insufficient": true,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "期望回答明确表示没有 2025 年数据；引用其它年份数字不算编造。",
+      "id": "negative-02",
+      "category": "negative",
+      "query": "2025 年越南 GDP 是多少？"
+    },
+    {
+      "history": [],
+      "required_docs": [],
+      "tools": {
+        "required": [],
+        "allowed": [],
+        "allow_none": true
+      },
+      "expected_operation": null,
+      "expected_parameter_docs": [],
+      "vision_task": null,
+      "numbers": {
+        "groups": [],
+        "kind": "text_refusal"
+      },
+      "required_text_groups": [
+        [
+          "没有",
+          "未找到",
+          "无法",
+          "不足",
+          "不存在",
+          "未提供"
+        ]
+      ],
+      "forbid_any_number": false,
+      "citation_required": false,
+      "expect_insufficient": true,
+      "expected_tool_error": null,
+      "deterministic_calc": false,
+      "needs_review_expected": false,
+      "notes": "期望回答明确表示没有表 9；不得编造表 9 内容。",
+      "id": "negative-03",
+      "category": "negative",
+      "query": "表 9 的数据是多少？"
+    }
+  ]
+}
