@@ -358,7 +358,7 @@ class AgentChatService:
                         summary=outcome.summary,
                         evidence_id=candidate.evidence_id,
                         document_id=candidate.citation.document_id,
-                        parameters=_trace_parameters(plan),
+                        parameters=_trace_parameters(plan, candidate, second_candidate),
                         error_code=outcome.error_code,
                     )
                 )
@@ -627,7 +627,11 @@ class AgentChatService:
                 yield event
 
 
-def _trace_parameters(plan: AgentPlan) -> dict[str, Any] | None:
+def _trace_parameters(
+    plan: AgentPlan,
+    candidate: AgentCandidate | None = None,
+    second_candidate: AgentCandidate | None = None,
+) -> dict[str, Any] | None:
     parameters: dict[str, Any] = {}
     if plan.operation is not None:
         parameters["operation"] = plan.operation
@@ -641,6 +645,12 @@ def _trace_parameters(plan: AgentPlan) -> dict[str, Any] | None:
         parameters["second_evidence_index"] = plan.second_evidence_index
     if plan.parameters is not None:
         parameters["parameters"] = plan.parameters
+    if candidate is not None:
+        parameters["document_id"] = str(candidate.citation.document_id)
+        parameters["evidence_id"] = candidate.evidence_id
+    if second_candidate is not None:
+        parameters["second_document_id"] = str(second_candidate.citation.document_id)
+        parameters["second_evidence_id"] = second_candidate.evidence_id
     return parameters or None
 
 

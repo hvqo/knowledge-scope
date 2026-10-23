@@ -234,3 +234,41 @@ async def test_insert_agent_answer_requires_at_least_one_source(client: AsyncCli
         json={"content_append": "没有来源", "sources": []},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_insert_agent_answer_accepts_chunk_source_without_evidence_claim(
+    client: AsyncClient,
+    test_data_dir: object,
+) -> None:
+    """Chunk-only sources are allowed, but must not claim Evidence-level validation."""
+    state = await _prepare_report(client, test_data_dir)
+    report = state["report"]
+    response = await client.post(
+        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}/agent-answers/insert",
+        json={
+            "content_append": "该结论来自文本片段 [C1]。",
+            "sources": [
+                {
+                    "kind": "rag_evidence",
+                    "title": "文本片段 #12",
+                    "knowledge_base_id": state["knowledge_base_id"],
+                    "document_id": state["document"]["id"],
+                    "document_title": state["document"]["original_filename"],
+                    "evidence_id": None,
+                    "chunk_id": "chunk-000012",
+                    "page_start": 1,
+                    "page_end": 1,
+                    "evidence_type": "text",
+                    "snippet": "来自文本片段的引用。",
+                    "section_path": ["第 5 章"],
+                    "source_block_ids": [],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["warnings"] == []
+    assert body["sources"][0]["evidence_id"] is None
+    assert body["sources"][0]["chunk_id"] == "chunk-000012"

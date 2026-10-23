@@ -12,7 +12,7 @@
 
 REST API 位于 `/api/v1/reports`：报告和章节支持列表、创建、更新、删除；章节来源支持有界创建和删除。创建来源时，服务端会重新校验报告与知识库/数据源的关联，并确认 RAG 文档属于当前知识库。删除报告或章节会级联删除其来源引用；报告本身对关联知识库和数据源使用 `RESTRICT`，避免静默改变报告上下文。
 
-章节正文和来源引用的写入由前端的显式操作触发。插入来源使用 `/sources/insert` 在一个数据库事务中同时校验上下文、写入来源引用和追加正文；标题或普通正文保存仍是独立请求。智能体回答使用扩展接口 `POST /reports/{report_id}/sections/{section_id}/agent-answers/insert`：正文与多条 `rag_evidence` 来源一次写入，服务端重新校验知识库、文档和 Evidence 页码/来源块，历史文档缺少解析产物时以 warning 保留引用信息，其余不一致返回 409/422。该接口不触发新的模型调用，也不修改报告结构。跨 PostgreSQL、文件响应、Qdrant 和 LLM 的操作不构成全局分布式事务。数据库迁移由 Alembic `0007_create_reports` 管理。
+章节正文和来源引用的写入由前端的显式操作触发。插入来源使用 `/sources/insert` 在一个数据库事务中同时校验上下文、写入来源引用和追加正文；标题或普通正文保存仍是独立请求。智能体回答使用扩展接口 `POST /reports/{report_id}/sections/{section_id}/agent-answers/insert`：正文与多条 `rag_evidence` 来源一次写入，服务端重新校验知识库、文档和 Evidence 页码/来源块，历史文档缺少解析产物时以 warning 保留引用信息，其余不一致返回 409/422。该接口不触发新的模型调用，也不修改报告结构。校验范围是来源元数据（知识库归属、文档、页码、来源块）和接口输入，不能据此推断正文由 Agent 真实生成，也不能证明正文中的每一句话都被引用来源支持；该边界同样适用于 Chunk 来源——没有 Evidence ID 的 Chunk 只做文档/页码校验，不宣称完成 Evidence 级核验。服务端不会为回答正文生成签名，也不会把 Agent 工具调用轨迹持久化进报告。跨 PostgreSQL、文件响应、Qdrant 和 LLM 的操作不构成全局分布式事务。数据库迁移由 Alembic `0007_create_reports` 管理。
 
 ## 前端工作区
 
