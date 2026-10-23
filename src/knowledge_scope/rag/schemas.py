@@ -262,6 +262,40 @@ class RAGAgentCandidateData(BaseModel):
     page_end: int = Field(ge=1)
 
 
+RAGFactStatus = Literal[
+    "source_verified",
+    "visual_estimate",
+    "unverified",
+    "not_available",
+]
+RAGSafetyGate = Literal[
+    "none",
+    "visual_numeric_withheld",
+    "visual_unverified",
+    "vision_unavailable",
+]
+
+
+class RAGVisualSource(BaseModel):
+    """One image the agent actually analysed, exposed for direct display.
+
+    Only identifiers that the server already validated are included; the
+    client builds image URLs through the existing Evidence asset endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    knowledge_base_id: UUID
+    document_id: UUID
+    evidence_id: str = Field(pattern=r"^evidence_v1_[0-9a-f]{64}$")
+    page_start: int = Field(ge=1)
+    page_end: int = Field(ge=1)
+    source_block_ids: list[str] = Field(default_factory=list, max_length=64)
+    asset_index: int = Field(default=0, ge=0, le=255)
+    label: str | None = Field(default=None, max_length=200)
+    fact_status: RAGFactStatus = "visual_estimate"
+
+
 class RAGAgentToolTraceData(BaseModel):
     """Sanitized record of one executed or skipped agent tool step."""
 
@@ -318,6 +352,12 @@ class RAGCompleteData(BaseModel):
     agent_degraded_reason: str | None = Field(default=None, max_length=200)
     agent_candidates: list[RAGAgentCandidateData] | None = None
     agent_tool_trace: list[RAGAgentToolTraceData] | None = None
+    # Application-assigned fact provenance and safety-gate outcome. These are
+    # always decided by server code, never by the model or the browser.
+    fact_status: RAGFactStatus | None = None
+    safety_gate: RAGSafetyGate = "none"
+    safety_notice: str | None = Field(default=None, max_length=400)
+    visual_sources: list[RAGVisualSource] = Field(default_factory=list)
     # The follow-up question as rewritten for retrieval, when one was needed.
     rewritten_query: str | None = None
     # Whether the assembled context was served from the retrieval cache.
@@ -387,10 +427,13 @@ __all__ = [
     "RAGCompletionStatus",
     "RAGErrorData",
     "RAGEventName",
+    "RAGFactStatus",
     "RAGQueryRequest",
     "RAGRetrievalMode",
+    "RAGSafetyGate",
     "RAGStreamEvent",
     "RAGToolName",
     "RAGToolStatusData",
     "RAGToolStatusValue",
+    "RAGVisualSource",
 ]

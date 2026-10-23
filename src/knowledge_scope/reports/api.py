@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from knowledge_scope.chat.models import ChatConversation, ChatMessage
 from knowledge_scope.chatbi.execution import redact_sql_literals
 from knowledge_scope.chatbi.models import ChatBIDataSourceRecord
 from knowledge_scope.documents.assets import AssetAccessError, get_evidence
@@ -24,6 +25,7 @@ from knowledge_scope.documents.models import Document
 from knowledge_scope.knowledge_bases.models import KnowledgeBase
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import get_session
+from knowledge_scope.vision.safety import answer_has_numeric_claims
 
 from .export import ReportExportError, build_docx, build_pdf, safe_report_filename
 from .generation import ReportGenerationError, ReportGenerationService
@@ -833,6 +835,68 @@ async def _validate_agent_answer_sources(
     return warnings
 
 
+async def _agent_answer_sources_from_message(
+    session: AsyncSession,
+    message: ChatMessage,
+) -> list[ReportRagSourceCreate]:
+    """Derive report sources from a persisted chat answer, never from the client."""
+
+    sources: list[ReportRagSourceCreate] = []
+    document_titles: dict[UUID, str] = {}
+    for index, raw in enumerate(message.citations or [], start=1):
+        if not isinstance(raw, dict) or len(sources) >= 12:
+            continue
+        try:
+            knowledge_base_id = UUID(str(raw["knowledge_base_id"]))
+            document_id = UUID(str(raw["document_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        evidence_id = raw.get("evidence_id")
+        chunk_id = raw.get("chunk_id")
+        if not evidence_id and not chunk_id:
+            continue
+        if document_id not in document_titles:
+            document = await session.get(Document, document_id)
+            document_titles[document_id] = (
+                document.original_filename if document is not None else ""
+            )
+        modality = str(raw.get("modality") or "text")
+        evidence_type = modality if modality in {"text", "image", "table", "formula"} else "text"
+        try:
+            page_start = max(int(raw.get("page_start") or 1), 1)
+            page_end = max(int(raw.get("page_end") or page_start), page_start)
+        except (TypeError, ValueError):
+            continue
+        raw_title = raw.get("section_title") or raw.get("snippet") or f"智能体引用 {index}"
+        raw_snippet = raw.get("snippet")
+        sources.append(
+            ReportRagSourceCreate(
+                kind="rag_evidence",
+                title=str(raw_title)[:200],
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                evidence_id=str(evidence_id)[:200] if evidence_id else None,
+                chunk_id=str(chunk_id)[:200] if chunk_id else None,
+                document_title=document_titles[document_id][:300] or "未命名文档",
+                page_start=page_start,
+                page_end=page_end,
+                evidence_type=evidence_type,
+                snippet=str(raw_snippet)[:3_000] if raw_snippet else None,
+                section_path=[
+                    str(item)[:200]
+                    for item in raw.get("section_path") or []
+                    if isinstance(item, str)
+                ][:32],
+                source_block_ids=[
+                    str(item)[:200]
+                    for item in raw.get("source_block_ids") or []
+                    if isinstance(item, str)
+                ][:64],
+            )
+        )
+    return sources
+
+
 @router.post(
     "/{report_id}/sections/{section_id}/agent-answers/insert",
     response_model=ReportAgentAnswerInsertResponse,
@@ -845,19 +909,59 @@ async def insert_agent_answer_references(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> ReportAgentAnswerInsertResponse:
-    """Append one agent answer and its validated Evidence references to a section."""
+    """Append one stored agent answer and its server-derived sources."""
 
     report = await _get_report(session, report_id)
     section = await _get_section(session, report_id, section_id)
     settings: Settings = request.app.state.settings
+    message = await session.get(ChatMessage, payload.chat_message_id)
+    if message is None or message.role != "assistant":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="智能体回答不存在",
+        )
+    conversation = await session.get(ChatConversation, message.conversation_id)
+    if conversation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="智能体回答所属对话不存在",
+        )
+    if (
+        report.knowledge_base_id is None
+        or conversation.knowledge_base_id != report.knowledge_base_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="请先为报告选择与智能体回答一致的知识库",
+        )
+    sources = await _agent_answer_sources_from_message(session, message)
+    if not sources:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="该智能体回答没有可关联的引用来源，已拒绝插入",
+        )
+    citations = [dict(item) for item in message.citations if isinstance(item, dict)]
+    has_image_source = any(item.get("modality") == "image" for item in citations)
+    if has_image_source and answer_has_numeric_claims(message.content):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "该回答包含未经核验的视觉数值，不能自动插入为已核实分析；"
+                "请人工核对原始图片后手动编辑"
+            ),
+        )
     warnings = await _validate_agent_answer_sources(
         session,
         report,
-        payload.sources,
+        sources,
         settings,
     )
+    content_append = message.content
+    if has_image_source:
+        content_append = "> ⚠️ 视觉分析草稿，需人工核对，不作为精确统计结论。\n\n" + content_append
+        warnings.append("已插入视觉分析草稿，正文已标记为待核对")
     references: list[ReportSourceReference] = []
-    for source in payload.sources:
+    for source in sources:
         _report, _section, reference = await _build_source_reference(
             session,
             report_id,
@@ -866,7 +970,7 @@ async def insert_agent_answer_references(
         )
         references.append(reference)
     now = datetime.now(UTC)
-    section.content = _append_source_content(section.content, payload.content_append)
+    section.content = _append_source_content(section.content, content_append)
     section.updated_at = now
     report.updated_at = now
     session.add_all(references)

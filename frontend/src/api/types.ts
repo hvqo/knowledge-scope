@@ -292,8 +292,7 @@ export interface ReportSourceInsertRequest {
 }
 
 export interface ReportAgentAnswerInsertRequest {
-  content_append: string;
-  sources: ReportSourceCreateRequest[];
+  chat_message_id: string;
 }
 
 export interface ReportAgentAnswerInsertResponse {
@@ -471,6 +470,24 @@ export interface VisionAnalyzeRequest {
 export type RAGAnswerMode = "standard" | "agent";
 export type RAGToolName = "retrieval" | "analyze_image" | "analyze_table";
 export type RAGToolStatusValue = "running" | "completed" | "failed" | "skipped";
+export type RAGFactStatus = "source_verified" | "visual_estimate" | "unverified" | "not_available";
+export type RAGSafetyGate =
+  | "none"
+  | "visual_numeric_withheld"
+  | "visual_unverified"
+  | "vision_unavailable";
+
+export interface RAGVisualSource {
+  knowledge_base_id: string;
+  document_id: string;
+  evidence_id: string;
+  page_start: number;
+  page_end: number;
+  source_block_ids: string[];
+  asset_index: number;
+  label: string | null;
+  fact_status: RAGFactStatus;
+}
 
 export interface RAGToolStatusData {
   tool: RAGToolName;
@@ -487,6 +504,10 @@ export interface RAGCompleteData {
   retrieval_mode: RAGRetrievalMode;
   answer_mode?: RAGAnswerMode;
   tool_calls?: number;
+  fact_status?: RAGFactStatus | null;
+  safety_gate?: RAGSafetyGate;
+  safety_notice?: string | null;
+  visual_sources?: RAGVisualSource[];
   rewritten_query: string | null;
   retrieval_cached: boolean | null;
   retrieval_escalated: boolean | null;
@@ -570,6 +591,10 @@ export type ChatMessageViewStatus = ChatMessageStatus | "streaming";
 
 export interface ChatMessageView extends Omit<ChatMessageRecord, "status"> {
   status: ChatMessageViewStatus;
+  safetyNotice?: string | null;
+  safetyGate?: RAGSafetyGate;
+  factStatus?: RAGFactStatus | null;
+  visualSources?: RAGVisualSource[];
 }
 
 export type GraphNeighborDirection = "forward" | "reverse" | "canonical_bridge";

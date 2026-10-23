@@ -26,6 +26,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from typing import Any, Protocol
+from uuid import UUID
 
 from knowledge_scope.agent.planner import AgentPlanner
 from knowledge_scope.agent.schemas import (
@@ -57,10 +58,15 @@ from knowledge_scope.rag.schemas import (
     RAGQueryRequest,
     RAGStreamEvent,
     RAGToolStatusData,
+    RAGVisualSource,
 )
 from knowledge_scope.retrieval.unified import UnifiedRetrievalService
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.table_analysis.service import TableAnalysisService
+from knowledge_scope.vision.safety import (
+    assess_visual_risk,
+    build_gated_visual_answer,
+)
 from knowledge_scope.vision.service import VisionAnalysisService
 
 logger = logging.getLogger(__name__)
@@ -211,6 +217,10 @@ class AgentChatService:
         trace: list[RAGAgentToolTraceData] = []
         candidates: tuple[AgentCandidate, ...] = ()
         used_candidates: set[int] = set()
+        visual_candidate: AgentCandidate | None = None
+        visual_outcome: AgentToolOutcome | None = None
+        table_verified = False
+        risk = assess_visual_risk(request.query)
 
         if request.knowledge_base_id is None:  # validated by the request schema
             yield _error_event("agent", "智能体问答需要指定知识库")
@@ -239,6 +249,22 @@ class AgentChatService:
                 )
             )
             yield _tool_status("retrieval", "failed", "检索阶段失败，已降级为常规检索问答", step)
+            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_candidate=None,
+                    visual_outcome=None,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "检索阶段失败",
@@ -264,6 +290,22 @@ class AgentChatService:
                     summary="未检索到可引用来源，已降级为常规检索问答",
                 )
             )
+            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_candidate=None,
+                    visual_outcome=None,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "未检索到可引用来源",
@@ -351,6 +393,11 @@ class AgentChatService:
                     second_candidate,
                 )
                 yield _tool_status(tool, outcome.status, outcome.summary, step)
+                if outcome.tool == "analyze_image":
+                    visual_candidate = candidate
+                    visual_outcome = outcome
+                elif outcome.tool == "analyze_table" and outcome.status == "completed":
+                    table_verified = True
                 trace.append(
                     RAGAgentToolTraceData(
                         tool=outcome.tool,
@@ -371,6 +418,22 @@ class AgentChatService:
                 )
         except AgentPlanningError:
             logger.warning("agent planning failed after %s tool calls", tool_calls)
+            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+                async for event in self._safety_gated_events(
+                    request,
+                    risk=risk,
+                    candidates=candidates,
+                    trace=trace,
+                    tool_calls=tool_calls,
+                    visual_candidate=visual_candidate,
+                    visual_outcome=visual_outcome,
+                    retrieval_latency_ms=retrieval_latency_ms,
+                    retrieval_degraded=retrieval_degraded,
+                    branch_statuses=branch_statuses,
+                    started=started,
+                ):
+                    yield event
+                return
             async for event in self._fallback_events(
                 request,
                 "工具规划失败",
@@ -383,6 +446,23 @@ class AgentChatService:
                 yield event
             return
 
+        if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+            async for event in self._safety_gated_events(
+                request,
+                risk=risk,
+                candidates=candidates,
+                trace=trace,
+                tool_calls=tool_calls,
+                visual_candidate=visual_candidate,
+                visual_outcome=visual_outcome,
+                retrieval_latency_ms=retrieval_latency_ms,
+                retrieval_degraded=retrieval_degraded,
+                branch_statuses=branch_statuses,
+                started=started,
+            ):
+                yield event
+            return
+
         async for event in self._answer_events(
             request,
             candidates=candidates,
@@ -390,6 +470,9 @@ class AgentChatService:
             tool_calls=tool_calls,
             trace=trace,
             used_candidates=used_candidates,
+            visual_candidate=visual_candidate,
+            visual_outcome=visual_outcome,
+            table_verified=table_verified,
             history_context=history_context,
             history_plan=history_plan,
             rewritten=rewritten,
@@ -400,6 +483,106 @@ class AgentChatService:
             started=started,
         ):
             yield event
+
+    @staticmethod
+    def _needs_visual_number_gate(
+        risk: object,
+        visual_outcome: AgentToolOutcome | None,
+        table_verified: bool,
+    ) -> bool:
+        """Decide whether the turn must be answered without untrusted visual numbers."""
+
+        if table_verified:
+            return False
+        high_risk = bool(getattr(risk, "high_risk", False))
+        visual_intent = bool(getattr(risk, "visual_intent", False))
+        if not high_risk:
+            return False
+        return visual_intent or visual_outcome is not None
+
+    async def _safety_gated_events(
+        self,
+        request: RAGQueryRequest,
+        *,
+        risk: object,
+        candidates: tuple[AgentCandidate, ...],
+        trace: list[RAGAgentToolTraceData],
+        tool_calls: int,
+        visual_candidate: AgentCandidate | None,
+        visual_outcome: AgentToolOutcome | None,
+        retrieval_latency_ms: float,
+        retrieval_degraded: bool,
+        branch_statuses: dict[str, str] | None,
+        started: float,
+    ) -> AsyncIterator[RAGStreamEvent]:
+        """Return a deterministic, number-free answer instead of trusting the VLM.
+
+        The normal streaming answer is never started for this turn, so an
+        unverified visual number cannot leak through ``answer_delta``.
+        """
+
+        vision_completed = visual_outcome is not None and visual_outcome.status == "completed"
+        description: str | None = None
+        if vision_completed and visual_outcome is not None:
+            payload = visual_outcome.payload or {}
+            answer = payload.get("answer")
+            if isinstance(answer, str):
+                description = answer
+        answer, notice = build_gated_visual_answer(
+            description=description,
+            vision_completed=vision_completed,
+        )
+        used = {visual_candidate.index} if visual_candidate is not None else set()
+        citations = _select_citations(
+            candidates,
+            used_markers=set(),
+            used_candidates=used,
+        )
+        if citations:
+            yield RAGStreamEvent(
+                event="citations",
+                data=RAGCitationsData(
+                    prompt_version=AGENT_PROMPT_VERSION,
+                    items=citations,
+                ).model_dump(mode="json"),
+            )
+        yield _delta_event(answer)
+        fact_status = (
+            visual_outcome.fact_status
+            if vision_completed and visual_outcome is not None
+            else "not_available"
+        )
+        gate = "visual_numeric_withheld" if vision_completed else "vision_unavailable"
+        yield RAGStreamEvent(
+            event="complete",
+            data=RAGCompleteData(
+                status="completed",
+                prompt_version=AGENT_PROMPT_VERSION,
+                provider=None,
+                model=None,
+                retrieval_mode="unified",
+                route="unified",
+                answer_mode="agent",
+                tool_calls=tool_calls,
+                agent_candidates=_candidate_records(candidates),
+                agent_tool_trace=trace or None,
+                agent_degraded=False,
+                fact_status=fact_status,
+                safety_gate=gate,
+                safety_notice=notice,
+                visual_sources=_visual_sources(visual_candidate, visual_outcome),
+                rewritten_query=None,
+                retrieval_cached=False,
+                retrieval_escalated=False,
+                memories_used=len(request.memories) if request.memories else 0,
+                retrieval_degraded=retrieval_degraded,
+                retrieval_branch_statuses=branch_statuses,
+                finish_reason="safety_gate",
+                retrieval_latency_ms=retrieval_latency_ms,
+                llm_latency_ms=0.0,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            ).model_dump(mode="json"),
+        )
 
     async def _prepare_history(
         self,
@@ -460,6 +643,9 @@ class AgentChatService:
         tool_calls: int,
         trace: list[RAGAgentToolTraceData],
         used_candidates: set[int],
+        visual_candidate: AgentCandidate | None,
+        visual_outcome: AgentToolOutcome | None,
+        table_verified: bool,
         history_context: str,
         history_plan: HistoryPlan | None,
         rewritten: str | None,
@@ -556,6 +742,22 @@ class AgentChatService:
             ).model_dump(mode="json"),
         )
         history_fields = _history_fields(history_plan)
+        if table_verified:
+            fact_status = "source_verified"
+            safety_gate = "none"
+            safety_notice = None
+        elif visual_outcome is not None:
+            fact_status = (
+                visual_outcome.fact_status
+                if visual_outcome.status == "completed" and visual_outcome.fact_status
+                else "not_available"
+            )
+            safety_gate = "visual_unverified"
+            safety_notice = "视觉分析结果仅供参考，需人工核对，不能作为精确统计数据使用。"
+        else:
+            fact_status = "not_available"
+            safety_gate = "none"
+            safety_notice = None
         yield RAGStreamEvent(
             event="complete",
             data=RAGCompleteData(
@@ -570,6 +772,10 @@ class AgentChatService:
                 agent_candidates=_candidate_records(candidates),
                 agent_tool_trace=trace or None,
                 agent_degraded=False,
+                fact_status=fact_status,
+                safety_gate=safety_gate,
+                safety_notice=safety_notice,
+                visual_sources=_visual_sources(visual_candidate, visual_outcome),
                 rewritten_query=rewritten,
                 retrieval_cached=False,
                 retrieval_escalated=False,
@@ -622,6 +828,8 @@ class AgentChatService:
                 data["agent_degraded"] = True
                 data["agent_degraded_reason"] = reason[:200]
                 data["agent_tool_trace"] = [item.model_dump(mode="json") for item in trace] or None
+                data["fact_status"] = data.get("fact_status") or "not_available"
+                data.setdefault("safety_gate", "none")
                 yield RAGStreamEvent(event="complete", data=data)
             else:
                 yield event
@@ -652,6 +860,65 @@ def _trace_parameters(
         parameters["second_document_id"] = str(second_candidate.citation.document_id)
         parameters["second_evidence_id"] = second_candidate.evidence_id
     return parameters or None
+
+
+def _visual_sources(
+    candidate: AgentCandidate | None,
+    outcome: AgentToolOutcome | None,
+) -> list[RAGVisualSource]:
+    """Expose only the image Evidence that the analyze_image tool actually read."""
+
+    if candidate is None or outcome is None or outcome.status != "completed":
+        return []
+    knowledge_base_id = candidate.citation.knowledge_base_id
+    if knowledge_base_id is None or candidate.evidence_id is None:
+        return []
+    raw_sources = outcome.payload.get("sources")
+    sources: list[RAGVisualSource] = []
+    if isinstance(raw_sources, list):
+        for raw in raw_sources:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                page_start = int(raw["page_start"])
+                page_end = int(raw["page_end"])
+                sources.append(
+                    RAGVisualSource(
+                        knowledge_base_id=UUID(str(raw["knowledge_base_id"])),
+                        document_id=UUID(str(raw["document_id"])),
+                        evidence_id=str(raw["evidence_id"]),
+                        page_start=page_start,
+                        page_end=page_end,
+                        source_block_ids=[str(item) for item in raw.get("source_block_ids") or []][
+                            :64
+                        ],
+                        asset_index=0,
+                        label=f"第 {page_start} 页图片",
+                        fact_status="visual_estimate",
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    if not sources:
+        page_start = candidate.citation.page_start
+        page_end = candidate.citation.page_end
+        try:
+            sources.append(
+                RAGVisualSource(
+                    knowledge_base_id=knowledge_base_id,
+                    document_id=candidate.citation.document_id,
+                    evidence_id=candidate.evidence_id,
+                    page_start=page_start,
+                    page_end=page_end,
+                    source_block_ids=list(candidate.citation.source_block_ids)[:64],
+                    asset_index=0,
+                    label=f"第 {page_start} 页图片",
+                    fact_status="visual_estimate",
+                )
+            )
+        except ValueError:
+            return []
+    return sources
 
 
 def _candidate_records(

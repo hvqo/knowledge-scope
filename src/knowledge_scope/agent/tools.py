@@ -268,6 +268,8 @@ class AgentToolExecutor:
                 status="completed",
                 summary=summary,
                 payload=payload,
+                fact_status=result.fact_status,
+                numeric_claims=[claim.model_dump(mode="json") for claim in result.numeric_claims],
             )
         return AgentToolOutcome(
             tool="analyze_image",
@@ -276,6 +278,8 @@ class AgentToolExecutor:
             payload=payload,
             error_code=result.error_code or "vision_tool_failed",
             error_message=result.message,
+            fact_status=result.fact_status,
+            numeric_claims=[claim.model_dump(mode="json") for claim in result.numeric_claims],
         )
 
     async def analyze_table(
@@ -339,6 +343,7 @@ class AgentToolExecutor:
                 status="completed",
                 summary=f"表格计算完成（{plan.operation}）",
                 payload=result_payload,
+                fact_status="source_verified",
             )
         return AgentToolOutcome(
             tool="analyze_table",

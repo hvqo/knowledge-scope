@@ -14,6 +14,13 @@ from .errors import VisionResponseFormatError
 
 VisionTaskType = Literal["describe_image", "analyze_chart", "extract_table"]
 VisionStatus = Literal["ok", "needs_review", "not_configured", "failed"]
+# Application-assigned provenance, never a model self-assessment.
+VisualFactStatus = Literal[
+    "source_verified",  # deterministic structured table evidence / calculation
+    "visual_estimate",  # read from an image by the VLM; estimate only
+    "unverified",  # extracted but not validated (e.g. image-table extraction)
+    "not_available",  # no trustworthy visual data is available
+]
 
 EVIDENCE_ID_PATTERN: str = r"^evidence_v1_[0-9a-f]{64}$"
 MAX_QUESTION_CHARS: int = 2_000
@@ -76,11 +83,22 @@ class ExtractedTable(BaseModel):
     extraction_method: Literal["vlm"] = "vlm"
 
 
+class VisionNumericClaim(BaseModel):
+    """One numeric claim extracted from untrusted visual-model output."""
+
+    value: str = Field(min_length=1, max_length=64)
+    context: str | None = Field(default=None, max_length=200)
+    fact_status: VisualFactStatus = "visual_estimate"
+
+
 class VisionAnalysisResult(BaseModel):
     """Uniform, JSON-serializable result for every vision task outcome."""
 
     status: VisionStatus
     task_type: VisionTaskType
+    # Application-assigned provenance of the result; never trust model claims.
+    fact_status: VisualFactStatus = "not_available"
+    numeric_claims: list[VisionNumericClaim] = Field(default_factory=list)
     answer: str | None = None
     chart_analysis: ChartAnalysis | None = None
     extracted_table: ExtractedTable | None = None

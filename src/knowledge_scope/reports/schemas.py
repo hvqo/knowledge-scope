@@ -255,18 +255,14 @@ class ReportSourceInsertCreate(_ReportModel):
 
 
 class ReportAgentAnswerInsertCreate(_ReportModel):
-    """Insert one agent answer plus its validated Evidence references."""
+    """Reference one persisted chat answer; the server reads the body itself.
 
-    content_append: str = Field(
-        min_length=1,
-        max_length=REPORT_SECTION_CONTENT_MAX_LENGTH,
-    )
-    sources: list[ReportRagSourceCreate] = Field(min_length=1, max_length=12)
+    The browser supplies only the message identifier.  Body text, citations,
+    and source ownership are resolved server-side from the stored chat message
+    so a client cannot claim an arbitrary body is a verified agent answer.
+    """
 
-    @field_validator("content_append")
-    @classmethod
-    def normalize_content_append(cls, value: str) -> str:
-        return _trimmed(value, "content_append")
+    chat_message_id: UUID
 
 
 class ReportAgentAnswerInsertResponse(_ReportModel):

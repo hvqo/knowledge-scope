@@ -7,7 +7,6 @@ import pytest
 from httpx import AsyncClient
 
 from knowledge_scope.evidence.lifecycle import evidence_artifact_path
-from knowledge_scope.parsing.models import CanonicalDocument
 from test_document_assets import (
     build_canonical,
     create_knowledge_base,
@@ -18,30 +17,69 @@ from test_document_assets import (
 )
 
 
-def _source_payload(
+def _citation(
     knowledge_base_id: str,
     document: dict[str, object],
-    evidence_id: str,
     *,
+    marker: str = "C1",
+    evidence_id: str | None = None,
+    chunk_id: str | None = None,
+    modality: str | None = None,
     page_start: int = 1,
     page_end: int = 1,
     source_block_ids: list[str] | None = None,
 ) -> dict[str, object]:
-    return {
-        "kind": "rag_evidence",
-        "title": "图 5-14 光合作用过程的示意图",
-        "knowledge_base_id": knowledge_base_id,
+    citation: dict[str, object] = {
+        "marker": marker,
         "document_id": document["id"],
-        "document_title": document["original_filename"],
-        "evidence_id": evidence_id,
-        "chunk_id": None,
+        "knowledge_base_id": knowledge_base_id,
         "page_start": page_start,
         "page_end": page_end,
-        "evidence_type": "image",
-        "snippet": "图 5-14 光合作用过程的示意图",
-        "section_path": ["第 5 章", "光合作用"],
         "source_block_ids": source_block_ids or ["p1-b2"],
+        "section_path": ["第 5 章", "光合作用"],
+        "section_title": "图 5-14 光合作用过程的示意图",
+        "snippet": "图 5-14 光合作用过程的示意图",
+        "snippet_kind": "representation",
     }
+    if evidence_id is not None:
+        citation.update(
+            {
+                "candidate_kind": "evidence",
+                "evidence_id": evidence_id,
+                "modality": modality or "image",
+                "representation_ids": ["representation_v1_" + "a" * 64],
+                "asset_refs": [],
+            }
+        )
+    else:
+        citation.update(
+            {
+                "candidate_kind": "chunk",
+                "chunk_id": chunk_id or "chunk-000012",
+                "snippet_kind": "source",
+            }
+        )
+    return citation
+
+
+async def _create_chat_answer(
+    client: AsyncClient,
+    knowledge_base_id: str,
+    content: str,
+    citations: list[dict[str, object]],
+) -> str:
+    conversation = await client.post(
+        "/api/v1/chat/conversations",
+        json={"knowledge_base_id": knowledge_base_id},
+    )
+    assert conversation.status_code == 201, conversation.text
+    conversation_id = conversation.json()["id"]
+    message = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages",
+        json={"role": "assistant", "content": content, "citations": citations},
+    )
+    assert message.status_code == 201, message.text
+    return str(message.json()["id"])
 
 
 async def _prepare_report(client: AsyncClient, test_data_dir: object) -> dict[str, object]:
@@ -64,66 +102,113 @@ async def _prepare_report(client: AsyncClient, test_data_dir: object) -> dict[st
     }
 
 
+async def _insert(
+    client: AsyncClient,
+    report: dict[str, object],
+    chat_message_id: str,
+    **extra: object,
+) -> object:
+    section_id = report["sections"][0]["id"]  # type: ignore[index]
+    return await client.post(
+        f"/api/v1/reports/{report['id']}/sections/{section_id}/agent-answers/insert",
+        json={"chat_message_id": chat_message_id, **extra},
+    )
+
+
 @pytest.mark.anyio
-async def test_insert_agent_answer_persists_content_and_validated_sources(
+async def test_insert_agent_answer_uses_server_side_message_body(
     client: AsyncClient,
     test_data_dir: object,
 ) -> None:
     state = await _prepare_report(client, test_data_dir)
-    report = state["report"]
-    report_id = report["id"]
-    section_id = report["sections"][0]["id"]
     evidence_id = evidence_id_for_modality(
         test_data_dir,  # type: ignore[arg-type]
         UUID(str(state["document"]["id"])),
         "image",
     )
-    response = await client.post(
-        f"/api/v1/reports/{report_id}/sections/{section_id}/agent-answers/insert",
-        json={
-            "content_append": "根据视觉分析，图片展示了光合作用的结构 [C1]。",
-            "sources": [
-                _source_payload(str(state["knowledge_base_id"]), state["document"], evidence_id)
-            ],
-        },
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "根据视觉分析，图片展示了光合作用的结构 [C1]。",
+        [_citation(str(state["knowledge_base_id"]), state["document"], evidence_id=evidence_id)],
     )
-    assert response.status_code == 201, response.text
-    body = response.json()
-    assert body["warnings"] == []
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 201, response.text  # type: ignore[attr-defined]
+    body = response.json()  # type: ignore[attr-defined]
+    assert "视觉分析草稿" in body["section"]["content"]
     assert body["section"]["content"].endswith("图片展示了光合作用的结构 [C1]。")
-    assert len(body["sources"]) == 1
+    assert body["warnings"] == ["已插入视觉分析草稿，正文已标记为待核对"]
     assert body["sources"][0]["evidence_id"] == evidence_id
-    assert body["sources"][0]["source_block_ids"] == ["p1-b2"]
-    detail = await client.get(f"/api/v1/reports/{report_id}")
-    assert detail.status_code == 200
-    sources = detail.json()["sections"][0]["sources"]
-    assert [source["evidence_id"] for source in sources] == [evidence_id]
 
 
 @pytest.mark.anyio
-async def test_insert_agent_answer_rejects_cross_knowledge_base_source(
+async def test_insert_agent_answer_blocks_unverified_visual_numbers(
+    client: AsyncClient,
+    test_data_dir: object,
+) -> None:
+    state = await _prepare_report(client, test_data_dir)
+    evidence_id = evidence_id_for_modality(
+        test_data_dir,  # type: ignore[arg-type]
+        UUID(str(state["document"]["id"])),
+        "image",
+    )
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "图 1 中最低季度为 Q1，销售额为 120 万元 [C1]。",
+        [_citation(str(state["knowledge_base_id"]), state["document"], evidence_id=evidence_id)],
+    )
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 409, response.text  # type: ignore[attr-defined]
+    assert "未经核验的视觉数值" in response.json()["detail"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_insert_agent_answer_allows_verified_table_answer(
+    client: AsyncClient,
+    test_data_dir: object,
+) -> None:
+    state = await _prepare_report(client, test_data_dir)
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "表 1 中越南 2024 年比 2023 年增长 10.6977%，绝对变化 460 亿美元 [C1]。",
+        [
+            _citation(
+                str(state["knowledge_base_id"]),
+                state["document"],
+                evidence_id=evidence_id_for_modality(
+                    test_data_dir,  # type: ignore[arg-type]
+                    UUID(str(state["document"]["id"])),
+                    "table",
+                ),
+                modality="table",
+                source_block_ids=["p1-b3"],
+            )
+        ],
+    )
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 201, response.text  # type: ignore[attr-defined]
+    assert response.json()["section"]["content"].endswith("绝对变化 460 亿美元 [C1]。")  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_insert_agent_answer_rejects_cross_knowledge_base_message(
     client: AsyncClient,
     test_data_dir: object,
 ) -> None:
     state = await _prepare_report(client, test_data_dir)
     other_kb = await create_knowledge_base(client, "另一个知识库")
     other_document = await upload_document(client, other_kb, filename="other.pdf")
-    evidence_id = evidence_id_for_modality(
-        test_data_dir,  # type: ignore[arg-type]
-        UUID(str(state["document"]["id"])),
-        "image",
+    message_id = await _create_chat_answer(
+        client,
+        other_kb,
+        "跨库回答 [C1]。",
+        [_citation(other_kb, other_document, chunk_id="chunk-other")],
     )
-    report = state["report"]
-    response = await client.post(
-        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}"
-        "/agent-answers/insert",
-        json={
-            "content_append": "跨库引用",
-            "sources": [_source_payload(other_kb, other_document, evidence_id)],
-        },
-    )
-    assert response.status_code == 409
-    assert response.json()["detail"] == "请先为报告选择与证据一致的知识库"
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 409, response.text  # type: ignore[attr-defined]
+    assert "一致的知识库" in response.json()["detail"]  # type: ignore[attr-defined]
 
 
 @pytest.mark.anyio
@@ -132,66 +217,64 @@ async def test_insert_agent_answer_rejects_mismatched_evidence_page(
     test_data_dir: object,
 ) -> None:
     state = await _prepare_report(client, test_data_dir)
-    report = state["report"]
     evidence_id = evidence_id_for_modality(
         test_data_dir,  # type: ignore[arg-type]
         UUID(str(state["document"]["id"])),
-        "image",
+        "table",
     )
-    response = await client.post(
-        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}"
-        "/agent-answers/insert",
-        json={
-            "content_append": "页码被篡改",
-            "sources": [
-                _source_payload(
-                    str(state["knowledge_base_id"]),
-                    state["document"],
-                    evidence_id,
-                    page_start=2,
-                    page_end=2,
-                )
-            ],
-        },
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "表格数据 [C1]。",
+        [
+            _citation(
+                str(state["knowledge_base_id"]),
+                state["document"],
+                evidence_id=evidence_id,
+                modality="table",
+                page_start=9,
+                page_end=9,
+                source_block_ids=["p1-b3"],
+            )
+        ],
     )
-    assert response.status_code == 409
-    assert response.json()["detail"] == "证据页码与服务器记录不一致"
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 409, response.text  # type: ignore[attr-defined]
+    assert response.json()["detail"] == "证据页码与服务器记录不一致"  # type: ignore[attr-defined]
 
 
 @pytest.mark.anyio
-async def test_insert_agent_answer_rejects_stale_evidence(
+async def test_insert_agent_answer_ignores_untrusted_client_body(
     client: AsyncClient,
     test_data_dir: object,
 ) -> None:
     state = await _prepare_report(client, test_data_dir)
-    report = state["report"]
-    document_id = UUID(str(state["document"]["id"]))
-    evidence_id = evidence_id_for_modality(test_data_dir, document_id, "image")  # type: ignore[arg-type]
-    canonical_path = (
-        test_data_dir  # type: ignore[operator]
-        / "parsing"
-        / str(document_id)
-        / "canonical.json"
+    other_kb = await create_knowledge_base(client, "伪造知识库")
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "真实回答 [C1]。",
+        [_citation(str(state["knowledge_base_id"]), state["document"], chunk_id="chunk-000012")],
     )
-    stale = CanonicalDocument.model_validate_json(canonical_path.read_bytes())
-    changed_text = stale.pages[0].blocks[0].model_copy(update={"text": "内容已被修改"})  # type: ignore[attr-defined]
-    changed_blocks = (changed_text, *stale.pages[0].blocks[1:])
-    changed = stale.model_copy(
-        update={"pages": [stale.pages[0].model_copy(update={"blocks": list(changed_blocks)})]}
+    response = await _insert(
+        client,
+        state["report"],
+        message_id,
+        content_append="伪造内容（包含伪造结论）",
+        sources=[{"kind": "rag_evidence", "knowledge_base_id": other_kb}],
+        verified=True,
     )
-    canonical_path.write_text(changed.model_dump_json(indent=2) + "\n")
+    assert response.status_code == 422, response.text  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_insert_agent_answer_rejects_unknown_message(client: AsyncClient) -> None:
     response = await client.post(
-        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}"
-        "/agent-answers/insert",
-        json={
-            "content_append": "过期证据",
-            "sources": [
-                _source_payload(str(state["knowledge_base_id"]), state["document"], evidence_id)
-            ],
-        },
+        "/api/v1/reports/00000000-0000-0000-0000-000000000000"
+        "/sections/00000000-0000-0000-0000-000000000000/agent-answers/insert",
+        json={"chat_message_id": "00000000-0000-0000-0000-000000000000"},
     )
-    assert response.status_code == 422
-    assert response.json()["detail"] == "证据来源无效或已过期，已拒绝插入"
+    assert response.status_code == 404
 
 
 @pytest.mark.anyio
@@ -200,75 +283,45 @@ async def test_insert_agent_answer_degrades_for_historical_missing_artifacts(
     test_data_dir: object,
 ) -> None:
     state = await _prepare_report(client, test_data_dir)
-    report = state["report"]
     evidence_id = evidence_id_for_modality(
         test_data_dir,  # type: ignore[arg-type]
         UUID(str(state["document"]["id"])),
-        "image",
+        "table",
     )
-    # Remove parsing/evidence artifacts to emulate a historical document whose
-    # source metadata is no longer verifiable.
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "历史表格引用 [C1]。",
+        [
+            _citation(
+                str(state["knowledge_base_id"]),
+                state["document"],
+                evidence_id=evidence_id,
+                modality="table",
+                source_block_ids=["p1-b3"],
+            )
+        ],
+    )
     evidence_artifact_path(test_data_dir, UUID(str(state["document"]["id"]))).unlink()  # type: ignore[arg-type]
     (test_data_dir / "parsing" / str(state["document"]["id"])).rename(  # type: ignore[operator]
         test_data_dir / "parsing" / "removed"  # type: ignore[operator]
     )
-    response = await client.post(
-        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}"
-        "/agent-answers/insert",
-        json={
-            "content_append": "历史引用",
-            "sources": [
-                _source_payload(str(state["knowledge_base_id"]), state["document"], evidence_id)
-            ],
-        },
-    )
-    assert response.status_code == 201, response.text
-    assert len(response.json()["warnings"]) == 1
-    assert "历史文档缺少解析产物" in response.json()["warnings"][0]
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 201, response.text  # type: ignore[attr-defined]
+    assert "历史文档缺少解析产物" in response.json()["warnings"][0]  # type: ignore[attr-defined]
 
 
 @pytest.mark.anyio
-async def test_insert_agent_answer_requires_at_least_one_source(client: AsyncClient) -> None:
-    response = await client.post(
-        "/api/v1/reports/not-a-uuid/sections/not-a-uuid/agent-answers/insert",
-        json={"content_append": "没有来源", "sources": []},
-    )
-    assert response.status_code == 422
-
-
-@pytest.mark.anyio
-async def test_insert_agent_answer_accepts_chunk_source_without_evidence_claim(
+async def test_insert_agent_answer_requires_citations(
     client: AsyncClient,
     test_data_dir: object,
 ) -> None:
-    """Chunk-only sources are allowed, but must not claim Evidence-level validation."""
     state = await _prepare_report(client, test_data_dir)
-    report = state["report"]
-    response = await client.post(
-        f"/api/v1/reports/{report['id']}/sections/{report['sections'][0]['id']}/agent-answers/insert",
-        json={
-            "content_append": "该结论来自文本片段 [C1]。",
-            "sources": [
-                {
-                    "kind": "rag_evidence",
-                    "title": "文本片段 #12",
-                    "knowledge_base_id": state["knowledge_base_id"],
-                    "document_id": state["document"]["id"],
-                    "document_title": state["document"]["original_filename"],
-                    "evidence_id": None,
-                    "chunk_id": "chunk-000012",
-                    "page_start": 1,
-                    "page_end": 1,
-                    "evidence_type": "text",
-                    "snippet": "来自文本片段的引用。",
-                    "section_path": ["第 5 章"],
-                    "source_block_ids": [],
-                }
-            ],
-        },
+    message_id = await _create_chat_answer(
+        client,
+        str(state["knowledge_base_id"]),
+        "没有引用的回答。",
+        [],
     )
-    assert response.status_code == 201, response.text
-    body = response.json()
-    assert body["warnings"] == []
-    assert body["sources"][0]["evidence_id"] is None
-    assert body["sources"][0]["chunk_id"] == "chunk-000012"
+    response = await _insert(client, state["report"], message_id)
+    assert response.status_code == 422, response.text  # type: ignore[attr-defined]
