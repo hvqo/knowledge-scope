@@ -370,7 +370,11 @@ class AgentChatService:
                 request.knowledge_base_id,
             )
         except Exception as error:
-            logger.warning("agent retrieval failed (%s)", type(error).__name__)
+            logger.warning(
+                "agent retrieval failed (%s): %s",
+                type(error).__name__,
+                error,
+            )
             trace.append(
                 RAGAgentToolTraceData(
                     tool="retrieval",

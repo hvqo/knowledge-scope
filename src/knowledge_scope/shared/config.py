@@ -92,6 +92,28 @@ class Settings(BaseSettings):
     vlm_timeout_seconds: float = Field(default=90.0, gt=0, le=300)
     vlm_max_image_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
     vlm_max_output_tokens: int = Field(default=2_048, ge=1, le=8_192)
+    # Native visual embedding retrieval: an independent, model-fingerprinted
+    # Qdrant collection over original image pixels.  Disabled by default so an
+    # existing deployment keeps its exact current retrieval behavior.
+    visual_embedding_enabled: bool = False
+    visual_model_id: str = Field(default="Qwen/Qwen3-VL-Embedding-2B", min_length=1)
+    visual_model_path: str = Field(default="", max_length=2_000)
+    visual_device: str = Field(default="cuda", min_length=1)
+    visual_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16"
+    visual_batch_size: int = Field(default=2, ge=1, le=16)
+    visual_collection_name: str = Field(
+        default="knowledgescope_visual_v1",
+        pattern=r"^[a-z0-9][a-z0-9_-]{2,62}$",
+    )
+    visual_query_prompt: str = Field(
+        default="Retrieve relevant images for the query.",
+        min_length=1,
+        max_length=500,
+    )
+    visual_candidate_limit: int = Field(default=8, ge=1, le=100)
+    visual_fusion_quota: int = Field(default=2, ge=0, le=5)
+    visual_max_image_pixels: int = Field(default=12_000_000, ge=250_000)
+    visual_encoder_cache_dir: str = Field(default="", max_length=2_000)
     graph_extraction_max_tokens: int = Field(default=1024, ge=1)
     graph_extraction_max_parse_retries: int = Field(default=1, ge=0, le=1)
     # The first budget is derived from graph_extraction_max_tokens when this
