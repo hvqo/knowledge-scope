@@ -320,6 +320,7 @@ Qdrant、Neo4j 或模型缓存。提交前请保持 README 描述与实际行为
 | 结构感知分块 | [CanonicalDocument → Chunk](docs/architecture/canonical-document-chunking.md) |
 | 多模态 Evidence | [Multimodal Evidence](docs/architecture/multimodal-evidence.md) |
 | 统一候选池 | [Unified Retrieval](docs/architecture/unified-retrieval.md) |
+| 视觉向量检索 | [Visual Retrieval](docs/architecture/visual-retrieval.md) |
 | RAG 与 citations | [RAG QA](docs/architecture/rag-qa.md) |
 | 多模态智能体 | [Agentic RAG](docs/architecture/agentic-rag.md) |
 | PDF 表格计算 | [Table Analysis](docs/architecture/table-analysis.md) |

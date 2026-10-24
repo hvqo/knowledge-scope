@@ -273,6 +273,19 @@ from knowledge_scope.retrieval.unified import (
     UnifiedRetrievalError,
     UnifiedRetrievalService,
 )
+from knowledge_scope.retrieval.visual_build import (
+    VisualBuildError,
+    VisualIndexBuilder,
+)
+from knowledge_scope.retrieval.visual_embedding import (
+    VisualEmbeddingEncoder,
+    VisualEmbeddingError,
+)
+from knowledge_scope.retrieval.visual_index import (
+    QdrantVisualStore,
+    VisualCollectionConfigurationError,
+    VisualIndexError,
+)
 from knowledge_scope.shared import build_health_report, get_settings
 from knowledge_scope.shared.config import Settings
 from knowledge_scope.shared.database import create_database_engine, create_session_factory
@@ -975,6 +988,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--modality",
         choices=("all", "text", "image", "table", "formula"),
     )
+
+    visual_index = subparsers.add_parser(
+        "visual-index",
+        help="build and query the independent native visual image vector index",
+    )
+    visual_actions = visual_index.add_subparsers(
+        dest="visual_index_action",
+        required=True,
+    )
+    visual_check = visual_actions.add_parser(
+        "check",
+        help="check the visual embedding model and collection readiness",
+    )
+    visual_check.add_argument("--load-model", action="store_true")
+    visual_build = visual_actions.add_parser(
+        "build",
+        help="encode original image assets and replace their visual vectors",
+    )
+    visual_build.add_argument("--knowledge-base-id", type=UUID, required=True)
+    visual_build.add_argument("--document-id", type=UUID, action="append")
+    visual_build.add_argument(
+        "--mode",
+        choices=("all", "selective"),
+        default="all",
+        help="all: index every image; selective: apply the explainable policy",
+    )
+    visual_search = visual_actions.add_parser(
+        "search",
+        help="run a text query over the native visual index",
+    )
+    visual_search.add_argument("query")
+    visual_search.add_argument("--knowledge-base-id", type=UUID, required=True)
+    visual_search.add_argument("--document-id", type=UUID)
+    visual_search.add_argument("--limit", type=_positive_int, default=10)
+    visual_audit = visual_actions.add_parser(
+        "audit",
+        help="report visual collection readiness and payload coverage",
+    )
+    visual_audit.add_argument("--knowledge-base-id", type=UUID)
 
     sparse_index = subparsers.add_parser(
         "sparse-index",
@@ -2841,6 +2893,85 @@ def _run_multimodal_index(args: argparse.Namespace) -> int:
     return 1
 
 
+def _run_visual_index(args: argparse.Namespace) -> int:
+    """Run the M7 native visual vector index workflow."""
+
+    encoder: VisualEmbeddingEncoder | None = None
+    store: QdrantVisualStore | None = None
+    try:
+        settings = get_settings()
+        encoder = VisualEmbeddingEncoder(settings)
+        if args.visual_index_action == "check":
+            output: dict[str, object] = {
+                "enabled": settings.visual_embedding_enabled,
+                "contract": encoder.contract.as_dict(),
+            }
+            if args.load_model:
+                _vectors, stats = encoder.encode_texts(["视觉向量就绪检查"])
+                output["encode_stats"] = {
+                    "latency_ms": round(stats.latency_ms, 2),
+                    "vram_peak_mb": None
+                    if stats.vram_peak_mb is None
+                    else round(stats.vram_peak_mb, 1),
+                    "load_latency_ms": None
+                    if encoder.load_latency_ms is None
+                    else round(encoder.load_latency_ms, 1),
+                }
+            store = QdrantVisualStore(settings, encoder)
+            output["store"] = store.readiness()
+            print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if not settings.visual_embedding_enabled:
+            print("visual_index_status: disabled", file=sys.stderr)
+            print(
+                "error: set KNOWLEDGE_SCOPE_VISUAL_EMBEDDING_ENABLED=true to use the visual index",
+                file=sys.stderr,
+            )
+            return 1
+        store = QdrantVisualStore(settings, encoder)
+        if args.visual_index_action == "build":
+            builder = VisualIndexBuilder(settings, store)
+            result = builder.build(
+                args.knowledge_base_id,
+                document_ids=args.document_id,
+                mode=args.mode,
+            )
+            print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, default=str))
+            return 0
+        if args.visual_index_action == "search":
+            result = store.search(
+                args.query,
+                knowledge_base_id=args.knowledge_base_id,
+                top_k=args.limit,
+                document_id=args.document_id,
+            )
+            print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+            return 0
+        if args.visual_index_action == "audit":
+            report: dict[str, object] = {"store": store.readiness()}
+            if args.knowledge_base_id is not None:
+                report["knowledge_base_id"] = str(args.knowledge_base_id)
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return 0
+    except (
+        VisualBuildError,
+        VisualCollectionConfigurationError,
+        VisualEmbeddingError,
+        VisualIndexError,
+        ValidationError,
+        ValueError,
+    ) as error:
+        print("visual_index_status: failed", file=sys.stderr)
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if store is not None:
+            store.close()
+        if encoder is not None:
+            encoder.close()
+    return 1
+
+
 def _run_sparse_index(args: argparse.Namespace) -> int:
     """Run the independent A4.3 local BM25 workflow."""
 
@@ -3389,6 +3520,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_qdrant(args)
     if args.command == "multimodal-index":
         return _run_multimodal_index(args)
+    if args.command == "visual-index":
+        return _run_visual_index(args)
     if args.command == "sparse-index":
         return _run_sparse_index(args)
     if args.command == "neo4j":

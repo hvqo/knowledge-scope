@@ -954,7 +954,13 @@ function parseCitationBranch(value: unknown): RAGCitation["branch_provenance"][n
     throw new Error("RAG citation branch is invalid");
   }
   const branch = requiredString(value.branch, "branch");
-  if (branch !== "dense" && branch !== "sparse" && branch !== "graph" && branch !== "multimodal") {
+  if (
+    branch !== "dense" &&
+    branch !== "sparse" &&
+    branch !== "graph" &&
+    branch !== "multimodal" &&
+    branch !== "visual"
+  ) {
     throw new Error("RAG citation branch is invalid");
   }
   const graphSeed = nullableString(value.graph_seed_entity_id, "graph_seed_entity_id");
