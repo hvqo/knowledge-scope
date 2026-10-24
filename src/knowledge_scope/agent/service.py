@@ -66,6 +66,7 @@ from knowledge_scope.table_analysis.service import TableAnalysisService
 from knowledge_scope.vision.safety import (
     assess_visual_risk,
     build_gated_visual_answer,
+    extract_numeric_claims,
 )
 from knowledge_scope.vision.service import VisionAnalysisService
 
@@ -97,6 +98,64 @@ _FALLBACK_NOTICE = (
     "未执行视觉分析或确定性计算；回答中若出现汇总、增长率等计算数值，"
     "均不是确定性工具结果，请以证据原文为准。）\n\n"
 )
+
+
+def _normalize_number_token(value: str) -> str:
+    return value.replace(",", "").replace("%", "").strip()
+
+
+def _format_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
+    """Render deterministic table-tool results as trusted application text."""
+
+    if outcome is None or outcome.status != "completed":
+        return []
+    payload = outcome.payload or {}
+    if payload.get("status") != "ok":
+        return []
+    parts: list[str] = ["表格工具确定性计算结果（已核验）："]
+    columns = [
+        str(item.get("name", "")) for item in payload.get("columns") or [] if isinstance(item, dict)
+    ]
+    if columns:
+        parts.append("列：" + " | ".join(name for name in columns if name))
+    for row in (payload.get("rows") or [])[:6]:
+        cells = row.get("cells") if isinstance(row, dict) else row
+        if not isinstance(cells, list):
+            continue
+        parts.append("行：" + " | ".join("" if cell is None else str(cell) for cell in cells))
+    if payload.get("formula"):
+        parts.append("公式：" + str(payload["formula"]))
+    units = [str(unit) for unit in payload.get("units") or [] if unit]
+    if units:
+        parts.append("单位：" + " | ".join(units))
+    return ["\n".join(parts)] if len(parts) > 1 else []
+
+
+def _verified_table_answer(outcome: AgentToolOutcome | None) -> str:
+    facts = _format_table_facts(outcome)
+    if not facts:
+        return (
+            "表格工具没有返回可用于回答的确定性结果，因此本轮不输出精确数值，请核对原始表格证据。"
+        )
+    return (
+        "本轮回答中的部分数值无法由表格工具结果核验，为避免把未核验数字当作事实，"
+        "下面只给出表格工具的确定性计算结果：\n\n" + "\n".join(facts)
+    )
+
+
+def _numbers_supported_by_table(answer: str, outcome: AgentToolOutcome | None) -> bool:
+    """True when every numeric claim in the generated text exists in tool output."""
+
+    if outcome is None:
+        return False
+    allowed_text = json.dumps(outcome.payload or {}, ensure_ascii=False)
+    allowed = {
+        _normalize_number_token(claim.value) for claim in extract_numeric_claims(allowed_text)
+    }
+    for claim in extract_numeric_claims(answer):
+        if _normalize_number_token(claim.value) not in allowed:
+            return False
+    return True
 
 
 class _RAGStreamService(Protocol):
@@ -219,6 +278,8 @@ class AgentChatService:
         used_candidates: set[int] = set()
         visual_candidate: AgentCandidate | None = None
         visual_outcome: AgentToolOutcome | None = None
+        table_outcome: AgentToolOutcome | None = None
+        table_candidates: set[int] = set()
         table_verified = False
         risk = assess_visual_risk(request.query)
 
@@ -249,7 +310,7 @@ class AgentChatService:
                 )
             )
             yield _tool_status("retrieval", "failed", "检索阶段失败，已降级为常规检索问答", step)
-            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+            if self._needs_visual_number_gate(risk, visual_outcome):
                 async for event in self._safety_gated_events(
                     request,
                     risk=risk,
@@ -258,6 +319,8 @@ class AgentChatService:
                     tool_calls=tool_calls,
                     visual_candidate=None,
                     visual_outcome=None,
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
                     retrieval_latency_ms=retrieval_latency_ms,
                     retrieval_degraded=retrieval_degraded,
                     branch_statuses=branch_statuses,
@@ -290,7 +353,7 @@ class AgentChatService:
                     summary="未检索到可引用来源，已降级为常规检索问答",
                 )
             )
-            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+            if self._needs_visual_number_gate(risk, visual_outcome):
                 async for event in self._safety_gated_events(
                     request,
                     risk=risk,
@@ -299,6 +362,8 @@ class AgentChatService:
                     tool_calls=tool_calls,
                     visual_candidate=None,
                     visual_outcome=None,
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
                     retrieval_latency_ms=retrieval_latency_ms,
                     retrieval_degraded=retrieval_degraded,
                     branch_statuses=branch_statuses,
@@ -398,6 +463,10 @@ class AgentChatService:
                     visual_outcome = outcome
                 elif outcome.tool == "analyze_table" and outcome.status == "completed":
                     table_verified = True
+                    table_outcome = outcome
+                    table_candidates.add(candidate.index)
+                    if second_candidate is not None:
+                        table_candidates.add(second_candidate.index)
                 trace.append(
                     RAGAgentToolTraceData(
                         tool=outcome.tool,
@@ -406,6 +475,7 @@ class AgentChatService:
                         evidence_id=candidate.evidence_id,
                         document_id=candidate.citation.document_id,
                         parameters=_trace_parameters(plan, candidate, second_candidate),
+                        fact_status=outcome.fact_status,
                         error_code=outcome.error_code,
                     )
                 )
@@ -418,7 +488,7 @@ class AgentChatService:
                 )
         except AgentPlanningError:
             logger.warning("agent planning failed after %s tool calls", tool_calls)
-            if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+            if self._needs_visual_number_gate(risk, visual_outcome):
                 async for event in self._safety_gated_events(
                     request,
                     risk=risk,
@@ -427,6 +497,8 @@ class AgentChatService:
                     tool_calls=tool_calls,
                     visual_candidate=visual_candidate,
                     visual_outcome=visual_outcome,
+                    table_outcome=table_outcome,
+                    table_candidates=table_candidates,
                     retrieval_latency_ms=retrieval_latency_ms,
                     retrieval_degraded=retrieval_degraded,
                     branch_statuses=branch_statuses,
@@ -446,7 +518,7 @@ class AgentChatService:
                 yield event
             return
 
-        if self._needs_visual_number_gate(risk, visual_outcome, table_verified):
+        if self._needs_visual_number_gate(risk, visual_outcome):
             async for event in self._safety_gated_events(
                 request,
                 risk=risk,
@@ -455,6 +527,8 @@ class AgentChatService:
                 tool_calls=tool_calls,
                 visual_candidate=visual_candidate,
                 visual_outcome=visual_outcome,
+                table_outcome=table_outcome,
+                table_candidates=table_candidates,
                 retrieval_latency_ms=retrieval_latency_ms,
                 retrieval_degraded=retrieval_degraded,
                 branch_statuses=branch_statuses,
@@ -473,6 +547,9 @@ class AgentChatService:
             visual_candidate=visual_candidate,
             visual_outcome=visual_outcome,
             table_verified=table_verified,
+            risk=risk,
+            table_outcome=table_outcome,
+            table_candidates=table_candidates,
             history_context=history_context,
             history_plan=history_plan,
             rewritten=rewritten,
@@ -488,17 +565,19 @@ class AgentChatService:
     def _needs_visual_number_gate(
         risk: object,
         visual_outcome: AgentToolOutcome | None,
-        table_verified: bool,
     ) -> bool:
-        """Decide whether the turn must be answered without untrusted visual numbers."""
+        """Decide whether the turn must not trust visual numbers.
 
-        if table_verified:
+        A successful table tool proves only its own deterministic calculation.
+        It never upgrades an unrelated visual-number claim, so the gate cannot
+        be skipped merely because a table tool succeeded.
+        """
+
+        if not bool(getattr(risk, "high_risk", False)):
             return False
-        high_risk = bool(getattr(risk, "high_risk", False))
-        visual_intent = bool(getattr(risk, "visual_intent", False))
-        if not high_risk:
-            return False
-        return visual_intent or visual_outcome is not None
+        if visual_outcome is not None:
+            return True
+        return bool(getattr(risk, "visual_intent", False))
 
     async def _safety_gated_events(
         self,
@@ -514,6 +593,8 @@ class AgentChatService:
         retrieval_degraded: bool,
         branch_statuses: dict[str, str] | None,
         started: float,
+        table_outcome: AgentToolOutcome | None = None,
+        table_candidates: set[int] | None = None,
     ) -> AsyncIterator[RAGStreamEvent]:
         """Return a deterministic, number-free answer instead of trusting the VLM.
 
@@ -528,11 +609,15 @@ class AgentChatService:
             answer = payload.get("answer")
             if isinstance(answer, str):
                 description = answer
+        verified_facts = _format_table_facts(table_outcome)
         answer, notice = build_gated_visual_answer(
             description=description,
             vision_completed=vision_completed,
+            verified_facts=verified_facts,
         )
-        used = {visual_candidate.index} if visual_candidate is not None else set()
+        used = set(table_candidates or ())
+        if visual_candidate is not None:
+            used.add(visual_candidate.index)
         citations = _select_citations(
             candidates,
             used_markers=set(),
@@ -547,12 +632,25 @@ class AgentChatService:
                 ).model_dump(mode="json"),
             )
         yield _delta_event(answer)
-        fact_status = (
-            visual_outcome.fact_status
-            if vision_completed and visual_outcome is not None
-            else "not_available"
-        )
-        gate = "visual_numeric_withheld" if vision_completed else "vision_unavailable"
+        has_table_facts = bool(verified_facts)
+        if vision_completed and has_table_facts:
+            fact_status = "unverified"
+            gate = "visual_numeric_withheld"
+            notice = "表格部分为确定性计算结果（已核验）；图片中的数值未经核验，已省略精确数字。"
+        elif vision_completed:
+            fact_status = (
+                visual_outcome.fact_status
+                if visual_outcome is not None and visual_outcome.fact_status
+                else "not_available"
+            )
+            gate = "visual_numeric_withheld"
+        elif has_table_facts:
+            fact_status = "source_verified"
+            gate = "vision_unavailable"
+            notice = "视觉分析未能完成，已阻止未核验的数值输出；表格计算结果已核验"
+        else:
+            fact_status = "not_available"
+            gate = "vision_unavailable"
         yield RAGStreamEvent(
             event="complete",
             data=RAGCompleteData(
@@ -646,6 +744,9 @@ class AgentChatService:
         visual_candidate: AgentCandidate | None,
         visual_outcome: AgentToolOutcome | None,
         table_verified: bool,
+        risk: object,
+        table_outcome: AgentToolOutcome | None,
+        table_candidates: set[int],
         history_context: str,
         history_plan: HistoryPlan | None,
         rewritten: str | None,
@@ -675,6 +776,12 @@ class AgentChatService:
         output_tokens: int | None = None
         finish_reason: str | None = None
         emitted = False
+        buffered: list[str] = []
+        must_validate_numbers = (
+            bool(getattr(risk, "high_risk", False))
+            and table_outcome is not None
+            and visual_outcome is None
+        )
         llm_started = time.perf_counter()
         try:
             streaming = self._gateway.stream(
@@ -698,7 +805,10 @@ class AgentChatService:
                     safe_delta = marker_filter.feed(event.delta)
                     if safe_delta:
                         emitted = True
-                        yield _delta_event(safe_delta)
+                        if must_validate_numbers:
+                            buffered.append(safe_delta)
+                        else:
+                            yield _delta_event(safe_delta)
         except LLMError:
             yield _error_event("llm", "回答生成失败，请稍后重试")
             yield _complete_error(
@@ -712,7 +822,10 @@ class AgentChatService:
         tail = marker_filter.flush()
         if tail:
             emitted = True
-            yield _delta_event(tail)
+            if must_validate_numbers:
+                buffered.append(tail)
+            else:
+                yield _delta_event(tail)
         llm_latency_ms = (time.perf_counter() - llm_started) * 1000.0
         if not emitted:
             yield _error_event("llm", "回答生成结果为空，请稍后重试")
@@ -729,11 +842,28 @@ class AgentChatService:
                 "agent stripped %s invalid citation markers",
                 marker_filter.stripped_markers,
             )
-        citations = _select_citations(
-            candidates,
-            used_markers=marker_filter.used_markers,
-            used_candidates=used_candidates,
-        )
+        numbers_withheld = False
+        if must_validate_numbers:
+            full_text = "".join(buffered)
+            if _numbers_supported_by_table(full_text, table_outcome):
+                for item in buffered:
+                    yield _delta_event(item)
+            else:
+                numbers_withheld = True
+                emitted = True
+                yield _delta_event(_verified_table_answer(table_outcome))
+        if numbers_withheld:
+            citations = _select_citations(
+                candidates,
+                used_markers=set(),
+                used_candidates=used_candidates | table_candidates,
+            )
+        else:
+            citations = _select_citations(
+                candidates,
+                used_markers=marker_filter.used_markers,
+                used_candidates=used_candidates,
+            )
         yield RAGStreamEvent(
             event="citations",
             data=RAGCitationsData(
@@ -742,7 +872,11 @@ class AgentChatService:
             ).model_dump(mode="json"),
         )
         history_fields = _history_fields(history_plan)
-        if table_verified:
+        if numbers_withheld:
+            fact_status = "source_verified"
+            safety_gate = "unverified_numbers_withheld"
+            safety_notice = "回答包含无法由表格工具核验的数值，已替换为确定性计算结果。"
+        elif table_verified:
             fact_status = "source_verified"
             safety_gate = "none"
             safety_notice = None

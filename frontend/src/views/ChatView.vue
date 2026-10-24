@@ -666,6 +666,7 @@ async function sendQuestion(question: string): Promise<void> {
         knowledge_base_id: knowledgeBaseId,
         retrieval_mode: chatStore.retrievalMode,
         answer_mode: chatStore.answerMode,
+        conversation_id: conversationId,
         history,
       },
       controller.signal,

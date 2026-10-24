@@ -578,6 +578,8 @@ export interface RAGQueryRequest {
   knowledge_base_id: string;
   retrieval_mode?: RAGRequestedRetrievalMode;
   answer_mode?: RAGAnswerMode;
+  // Bound the server-side trust record to this persisted conversation.
+  conversation_id?: string;
   history?: RAGHistoryTurn[];
 }
 
@@ -1205,6 +1207,13 @@ function parseRagStreamEvent(eventName: string, rawData: string): RAGStreamEvent
       safety_gate: nullableSafetyGate(parsed.safety_gate),
       safety_notice: nullableString(parsed.safety_notice, "safety_notice"),
       visual_sources: parseVisualSources(parsed.visual_sources),
+      answer_generated_by:
+        parsed.answer_generated_by === "agent" ||
+        parsed.answer_generated_by === "rag" ||
+        parsed.answer_generated_by === "safety_gate"
+          ? parsed.answer_generated_by
+          : null,
+      trust_id: nullableString(parsed.trust_id, "trust_id"),
     };
     return { event: "complete", data: complete };
   }

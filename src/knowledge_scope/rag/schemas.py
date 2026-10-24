@@ -53,6 +53,9 @@ class RAGQueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4_000)
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
+    # Bound server-generated trust records to the persisted conversation. Only
+    # the chat UI supplies this; direct API callers keep an unrecorded answer.
+    conversation_id: UUID | None = None
     retrieval_mode: RAGRequestedRetrievalMode = "dense"
     answer_mode: RAGAnswerMode = "standard"
     # Long-term memories injected by the API layer, scoped to one knowledge base.
@@ -273,6 +276,9 @@ RAGSafetyGate = Literal[
     "visual_numeric_withheld",
     "visual_unverified",
     "vision_unavailable",
+    # A high-risk answer contained numbers that could not be traced back to the
+    # executed table tool; the application replaced them before streaming.
+    "unverified_numbers_withheld",
 ]
 
 
@@ -309,6 +315,9 @@ class RAGAgentToolTraceData(BaseModel):
     # Only the bounded, validated tool contract parameters (never free-form
     # model text) are echoed for auditability.
     parameters: dict[str, Any] | None = None
+    # Application-assigned provenance of this specific tool result. A verified
+    # table calculation never upgrades an additional visual-numeric claim.
+    fact_status: RAGFactStatus | None = None
     error_code: str | None = None
 
 
@@ -358,6 +367,11 @@ class RAGCompleteData(BaseModel):
     safety_gate: RAGSafetyGate = "none"
     safety_notice: str | None = Field(default=None, max_length=400)
     visual_sources: list[RAGVisualSource] = Field(default_factory=list)
+    # Which pipeline produced the answer and the signed server-side trust
+    # record id. ``answer_generated_by`` is set by the application wrapper, never
+    # by the model, and report insertion refuses answers without a valid record.
+    answer_generated_by: Literal["agent", "rag", "safety_gate"] | None = None
+    trust_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     # The follow-up question as rewritten for retrieval, when one was needed.
     rewritten_query: str | None = None
     # Whether the assembled context was served from the retrieval cache.

@@ -1283,3 +1283,166 @@ async def test_agent_api_times_out_stalled_turn(
     assert "智能体执行超过" in response.text
     assert frames[-1] == "event: complete"
     assert '"answer_mode":"agent"' in response.text
+
+
+def _service_table_outcome() -> AgentToolOutcome:
+    return AgentToolOutcome(
+        tool="analyze_table",
+        status="completed",
+        summary="表格计算完成（growth）",
+        payload={
+            "status": "ok",
+            "operation": "growth",
+            "columns": [
+                {"name": "指标"},
+                {"name": "基期值"},
+                {"name": "报告期值"},
+                {"name": "绝对变化"},
+                {"name": "相对变化"},
+            ],
+            "rows": [{"cells": ["越南", "4300", "4760", "460", "10.6977"]}],
+            "formula": "((4760 - 4300) / 4300) × 100% = 10.6977%",
+            "units": ["亿美元", "%"],
+            "sources": [
+                {
+                    "document_id": str(DOC_ID),
+                    "evidence_id": "evidence_v1_" + "c" * 64,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "source_block_ids": ["p1-b3"],
+                }
+            ],
+        },
+        fact_status="source_verified",
+    )
+
+
+def _service_image_outcome() -> AgentToolOutcome:
+    return AgentToolOutcome(
+        tool="analyze_image",
+        status="completed",
+        summary="图表分析完成（fake-vlm）",
+        payload={
+            "status": "ok",
+            "answer": "Q1 最低约 120，Q4 最高约 210",
+            "fact_status": "visual_estimate",
+            "sources": [
+                {
+                    "knowledge_base_id": str(KB_ID),
+                    "document_id": str(DOC_ID),
+                    "evidence_id": "evidence_v1_" + "d" * 64,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "source_block_ids": ["p1-b2"],
+                }
+            ],
+        },
+        fact_status="visual_estimate",
+        numeric_claims=[{"value": "120", "fact_status": "visual_estimate"}],
+    )
+
+
+def test_mixed_table_and_visual_tools_gate_unverified_visual_numbers() -> None:
+    table_candidate = _candidate(
+        1,
+        marker="C1",
+        modality="table",
+        evidence_id="evidence_v1_" + "c" * 64,
+        table_columns=("年份", "GDP"),
+    )
+    image_candidate = _candidate(
+        2,
+        marker="C2",
+        modality="image",
+        evidence_id="evidence_v1_" + "d" * 64,
+    )
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_table",
+                "evidence_index": 1,
+                "operation": "growth",
+                "parameters": {
+                    "axis": "columns",
+                    "row": 0,
+                    "base_column": 1,
+                    "target_column": 2,
+                },
+            },
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 2,
+                "vision_task": "describe_image",
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["Q1 最低销售额为 120 万元。", "表格增长率为 10.6977%。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([table_candidate, image_candidate])),
+        executor=_StubExecutor([_service_table_outcome(), _service_image_outcome()]),
+    )
+    request = RAGQueryRequest(
+        query="计算表格中的增长率，并给出柱状图最低季度的具体金额。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    assert "120" not in answer
+    assert "10.6977" in answer
+    assert "未经核验" in answer
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["safety_gate"] == "visual_numeric_withheld"
+    assert complete.data["fact_status"] in {"visual_estimate", "unverified"}
+    assert len(complete.data["visual_sources"]) == 1
+
+
+def test_table_only_high_risk_answer_replaces_unverified_numbers() -> None:
+    table_candidate = _candidate(
+        1,
+        marker="C1",
+        modality="table",
+        evidence_id="evidence_v1_" + "c" * 64,
+        table_columns=("年份", "GDP"),
+    )
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_table",
+                "evidence_index": 1,
+                "operation": "growth",
+                "parameters": {
+                    "axis": "columns",
+                    "row": 0,
+                    "base_column": 1,
+                    "target_column": 2,
+                },
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["表格中的增长率是 99.9%。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([table_candidate])),
+        executor=_StubExecutor([_service_table_outcome()]),
+    )
+    request = RAGQueryRequest(
+        query="表格中的增长率是多少？请给出精确值。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    answer = "".join(event.data["text"] for event in events if event.event == "answer_delta")
+    assert "99.9" not in answer
+    assert "10.6977" in answer
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["fact_status"] == "source_verified"
+    assert complete.data["safety_gate"] == "unverified_numbers_withheld"

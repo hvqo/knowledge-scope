@@ -10,6 +10,7 @@ answers for high-risk visual numeric questions.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 # Questions that ask for a precise number, growth rate, ranking, or aggregate.
@@ -128,16 +129,33 @@ def build_gated_visual_answer(
     *,
     description: str | None,
     vision_completed: bool,
+    verified_facts: Sequence[str] | None = None,
 ) -> tuple[str, str]:
-    """Build a deterministic, number-free answer plus a safety notice.
+    """Build a deterministic, number-free visual answer plus a safety notice.
 
     Returns ``(answer, notice)``.  The answer never contains a precise number
-    from the vision model, so it is safe to stream once built.
+    from the vision model, so it is safe to stream once built.  ``verified_facts``
+    may carry deterministic table-tool results, which are trusted application
+    output (not model text) and therefore allowed to contain numbers.
     """
 
+    facts = [item for item in (verified_facts or []) if item]
+    fact_block = "\n".join(facts)
     if not vision_completed:
+        if facts:
+            answer = (
+                _GATED_ANSWER_HEADER
+                + "\n\n视觉分析未能完成，因此没有给出任何图片中的精确数值。\n\n"
+                + "以下为表格工具给出的确定性计算结果（已核验）：\n"
+                + fact_block
+                + "\n\n"
+                + _GATED_ANSWER_FOOTER
+            )
+            return answer, "视觉分析未完成，已阻止未核验的数值输出；表格计算结果已核验"
         return _GATED_ANSWER_UNAVAILABLE, "视觉分析未完成，已阻止未核验的数值输出"
     sections = [_GATED_ANSWER_HEADER]
+    if facts:
+        sections.append("以下为表格工具给出的确定性计算结果（已核验）：\n" + fact_block)
     if description:
         safe_description = strip_numeric_claims(description).strip()
         if safe_description:

@@ -508,6 +508,8 @@ export interface RAGCompleteData {
   safety_gate?: RAGSafetyGate;
   safety_notice?: string | null;
   visual_sources?: RAGVisualSource[];
+  answer_generated_by?: "agent" | "rag" | "safety_gate" | null;
+  trust_id?: string | null;
   rewritten_query: string | null;
   retrieval_cached: boolean | null;
   retrieval_escalated: boolean | null;
