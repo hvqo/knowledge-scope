@@ -573,3 +573,181 @@ async def test_unverified_visual_answer_with_chunk_source_is_rejected(
     )
     response = await _insert(client, fixtures, message_id)
     assert response.status_code == 409
+
+
+def test_trusted_record_survives_process_restart(test_data_dir: Path) -> None:
+    conversation_id = uuid4()
+    knowledge_base_id = uuid4()
+    citations = [
+        _chunk_citation(knowledge_base_id=str(knowledge_base_id), document_id=str(DOC_UUID))
+    ]
+    content = "2024 年越南 GDP 为 4760 亿美元。"
+    trust_id = _record(
+        test_data_dir,
+        conversation_id=str(conversation_id),
+        knowledge_base_id=str(knowledge_base_id),
+        content=content,
+        citations=citations,
+    )
+    restarted_settings = Settings(
+        _env_file=None,
+        environment="test",
+        data_dir=str(test_data_dir),
+    )
+    verified = verify_streamed_answer(
+        restarted_settings,
+        conversation_id=conversation_id,
+        knowledge_base_id=knowledge_base_id,
+        content=content,
+        citations=citations,
+    )
+    assert verified is not None
+    assert verified.trust_id == trust_id
+
+
+def test_concurrent_workers_share_the_same_trust_key(test_data_dir: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    conversation_id = uuid4()
+    knowledge_base_id = uuid4()
+    citations = [
+        _chunk_citation(knowledge_base_id=str(knowledge_base_id), document_id=str(DOC_UUID))
+    ]
+
+    def _writer(index: int) -> str:
+        settings = Settings(
+            _env_file=None,
+            environment="test",
+            data_dir=str(test_data_dir),
+        )
+        content = f"并发写入的回答 {index}"
+        trust_id = record_streamed_answer(
+            settings,
+            conversation_id=conversation_id,
+            knowledge_base_id=knowledge_base_id,
+            content=content,
+            citations=citations,
+            answer_mode="agent",
+            complete=_complete(),
+        )
+        assert trust_id is not None
+        return content
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        contents = list(pool.map(_writer, range(8)))
+
+    # The key is created exactly once and every record is verifiable afterwards.
+    secret_path = test_data_dir / "agent-trust" / ".trust-secret"
+    assert len(secret_path.read_text(encoding="ascii").strip()) == 64
+    for content in contents:
+        verified = verify_streamed_answer(
+            _settings(test_data_dir),
+            conversation_id=conversation_id,
+            knowledge_base_id=knowledge_base_id,
+            content=content,
+            citations=citations,
+        )
+        assert verified is not None
+
+
+def test_secret_file_reader_waits_for_a_complete_value(test_data_dir: Path) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from knowledge_scope.chat.trust import _read_secret_file
+
+    trust_root = test_data_dir / "agent-trust"
+    trust_root.mkdir(parents=True, exist_ok=True)
+    secret_path = trust_root / ".trust-secret"
+    secret_path.write_text("", encoding="ascii")
+    secret = bytes(range(32))
+    expected = secret.hex()
+
+    def _writer() -> None:
+        time.sleep(0.12)
+        secret_path.write_text(expected, encoding="ascii")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_writer)
+        read = _read_secret_file(secret_path)
+        future.result()
+    assert read == secret
+
+
+def test_missing_secret_fails_closed(test_data_dir: Path) -> None:
+    conversation_id = uuid4()
+    knowledge_base_id = uuid4()
+    citations = [
+        _chunk_citation(knowledge_base_id=str(knowledge_base_id), document_id=str(DOC_UUID))
+    ]
+    content = "2024 年越南 GDP 为 4760 亿美元。"
+    _record(
+        test_data_dir,
+        conversation_id=str(conversation_id),
+        knowledge_base_id=str(knowledge_base_id),
+        content=content,
+        citations=citations,
+    )
+    (test_data_dir / "agent-trust" / ".trust-secret").unlink()
+    verified = verify_streamed_answer(
+        _settings(test_data_dir),
+        conversation_id=conversation_id,
+        knowledge_base_id=knowledge_base_id,
+        content=content,
+        citations=citations,
+    )
+    assert verified is None
+
+
+def test_repeated_identical_answer_does_not_downgrade_safety_state(test_data_dir: Path) -> None:
+    conversation_id = uuid4()
+    knowledge_base_id = uuid4()
+    citations = [
+        _evidence_citation(
+            knowledge_base_id=str(knowledge_base_id),
+            document_id=str(DOC_UUID),
+            modality="image",
+        )
+    ]
+    content = "图表中 Q1 是销售额最低的季度。"
+    trace = [
+        RAGAgentToolTraceData(
+            tool="analyze_image",
+            status="completed",
+            summary="图片理解完成",
+            document_id=DOC_UUID,
+            evidence_id=EVIDENCE_ID,
+            fact_status="visual_estimate",
+        )
+    ]
+    trust_id = _record(
+        test_data_dir,
+        conversation_id=str(conversation_id),
+        knowledge_base_id=str(knowledge_base_id),
+        content=content,
+        citations=citations,
+        safety_gate="visual_numeric_withheld",
+        fact_status="visual_estimate",
+        trace=trace,
+    )
+    # A later generation with the same text/citations but a "verified" state must
+    # not replace the more conservative record.
+    _record(
+        test_data_dir,
+        conversation_id=str(conversation_id),
+        knowledge_base_id=str(knowledge_base_id),
+        content=content,
+        citations=citations,
+        safety_gate="none",
+        fact_status="source_verified",
+    )
+    verified = verify_streamed_answer(
+        _settings(test_data_dir),
+        conversation_id=conversation_id,
+        knowledge_base_id=knowledge_base_id,
+        content=content,
+        citations=citations,
+    )
+    assert verified is not None
+    assert verified.trust_id == trust_id
+    assert verified.safety_gate == "visual_numeric_withheld"

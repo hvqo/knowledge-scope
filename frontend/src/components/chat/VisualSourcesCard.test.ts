@@ -21,6 +21,8 @@ const source: RAGVisualSource = {
   asset_index: 0,
   label: "图 1 示例图片",
   fact_status: "visual_estimate",
+  execution_status: "completed",
+  vision_task: "describe_image",
 };
 
 describe("VisualSourcesCard", () => {
@@ -53,6 +55,20 @@ describe("VisualSourcesCard", () => {
 
     await wrapper.get(".visual-sources__thumb").trigger("click");
     expect(wrapper.emitted("open")?.[0]).toEqual([source]);
+  });
+
+  it("marks a failed visual execution without implying success", () => {
+    const wrapper = mount(VisualSourcesCard, {
+      props: {
+        sources: [{ ...source, execution_status: "failed", fact_status: "not_available" }],
+        notice: "视觉分析未能完成，已阻止未核验的数值输出",
+        gate: "vision_unavailable",
+        factStatus: "not_available",
+      },
+    });
+
+    expect(wrapper.text()).toContain("图片分析失败");
+    expect(wrapper.text()).not.toContain("视觉分析结果需核对");
   });
 
   it("shows a missing-asset notice instead of a broken image", async () => {

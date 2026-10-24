@@ -32,6 +32,14 @@ function imageFailed(source: RAGVisualSource): boolean {
   return failedAssets.value.has(assetKey(source));
 }
 
+function analysisFailed(source: RAGVisualSource): boolean {
+  return source.execution_status === "failed";
+}
+
+function sourceStatusLabel(source: RAGVisualSource): string {
+  return analysisFailed(source) ? "图片分析失败" : "视觉分析结果需核对";
+}
+
 function markFailed(source: RAGVisualSource, event: Event): void {
   event.stopPropagation();
   const next = new Set(failedAssets.value);
@@ -122,6 +130,12 @@ function sourceLabel(source: RAGVisualSource): string {
           <span>{{ sourceLabel(source) }}</span>
           <span class="visual-sources__page">第 {{ source.page_start }} 页</span>
         </div>
+        <span
+          v-if="analysisFailed(source)"
+          class="visual-sources__failed"
+        >
+          {{ sourceStatusLabel(source) }}
+        </span>
         <div class="visual-sources__actions">
           <button
             v-if="!imageFailed(source)"
@@ -261,5 +275,15 @@ function sourceLabel(source: RAGVisualSource): string {
 .visual-sources__action:focus-visible {
   outline: 2px solid var(--ks-accent);
   outline-offset: 2px;
+}
+
+.visual-sources__failed {
+  display: inline-block;
+  margin: 0 0 8px;
+  padding: 2px 8px;
+  color: var(--ks-danger);
+  font-size: 12px;
+  background: var(--ks-danger-soft, rgba(180, 60, 60, 0.08));
+  border-radius: 999px;
 }
 </style>

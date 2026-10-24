@@ -1103,6 +1103,8 @@ function parseVisualSources(value: unknown): RAGVisualSource[] {
         asset_index: isFiniteNumberValue(item.asset_index) ? item.asset_index : 0,
         label: nullableString(item.label, "label"),
         fact_status: nullableFactStatus(item.fact_status) ?? "visual_estimate",
+        execution_status: item.execution_status === "failed" ? "failed" : "completed",
+        vision_task: nullableString(item.vision_task, "vision_task"),
       });
     } catch {
       // Skip malformed visual source entries rather than failing the stream.

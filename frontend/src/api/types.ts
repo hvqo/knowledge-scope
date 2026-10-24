@@ -487,6 +487,8 @@ export interface RAGVisualSource {
   asset_index: number;
   label: string | null;
   fact_status: RAGFactStatus;
+  execution_status?: "completed" | "failed";
+  vision_task?: string | null;
 }
 
 export interface RAGToolStatusData {

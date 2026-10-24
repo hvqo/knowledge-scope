@@ -300,6 +300,11 @@ class RAGVisualSource(BaseModel):
     asset_index: int = Field(default=0, ge=0, le=255)
     label: str | None = Field(default=None, max_length=200)
     fact_status: RAGFactStatus = "visual_estimate"
+    # Application-recorded execution state for this exact asset. A failed
+    # attempt is listed (so users can see which image was attempted) but is
+    # never presented as a successful visual analysis.
+    execution_status: Literal["completed", "failed"] = "completed"
+    vision_task: str | None = Field(default=None, max_length=40)
 
 
 class RAGAgentToolTraceData(BaseModel):

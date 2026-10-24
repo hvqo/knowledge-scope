@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +79,28 @@ def _trust_root(settings: Settings) -> Path:
     return root
 
 
+def _read_secret_file(path: Path) -> bytes:
+    """Read a complete secret file, tolerating a concurrent first writer.
+
+    Multiple workers may discover a missing key at the same time. Exactly one
+    process creates the file; the others wait until the 64 hex characters are
+    fully written instead of reading a partial value.
+    """
+
+    for _ in range(200):
+        try:
+            raw = path.read_text(encoding="ascii").strip()
+        except OSError:
+            raw = ""
+        if len(raw) == _SECRET_BYTES * 2:
+            try:
+                return bytes.fromhex(raw)
+            except ValueError:
+                pass
+        time.sleep(0.01)
+    raise TrustStoreError("agent trust secret could not be read consistently")
+
+
 def _trust_secret(settings: Settings) -> bytes:
     configured = settings.agent_trust_secret
     if configured is not None:
@@ -89,13 +112,21 @@ def _trust_secret(settings: Settings) -> bytes:
     if path.exists():
         if path.is_symlink() or not path.is_file():
             raise TrustStoreError("agent trust secret is not a regular file")
-        raw = path.read_text(encoding="ascii").strip()
-        try:
-            return bytes.fromhex(raw)
-        except ValueError as error:
-            raise TrustStoreError("agent trust secret is malformed") from error
+        return _read_secret_file(path)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another worker won the creation race; wait for its secret.
+        return _read_secret_file(path)
     secret = secrets.token_bytes(_SECRET_BYTES)
-    _atomic_write(path, secret.hex().encode("ascii"))
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(secret.hex().encode("ascii"))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
     return secret
 
 
@@ -156,6 +187,53 @@ def _trust_id_for(
     return _sha256(_canonical_json(binding))
 
 
+_SAFETY_GATE_RANK: dict[str, int] = {
+    "none": 0,
+    "visual_unverified": 1,
+    "vision_unavailable": 2,
+    "unverified_numbers_withheld": 2,
+    "visual_numeric_withheld": 3,
+}
+
+
+def _safety_payload(complete: RAGCompleteData) -> dict[str, Any]:
+    """Application-assigned safety state committed together with the answer."""
+
+    return {
+        "fact_status": complete.fact_status,
+        "safety_gate": complete.safety_gate,
+        "safety_notice": complete.safety_notice,
+        "tool_trace": [item.model_dump(mode="json") for item in (complete.agent_tool_trace or [])],
+    }
+
+
+def _safety_restrictiveness(payload: dict[str, Any]) -> int:
+    return _SAFETY_GATE_RANK.get(str(payload.get("safety_gate") or "none"), 0)
+
+
+def _existing_payload(settings: Settings, path: Path) -> dict[str, Any] | None:
+    """Return the existing signed payload, or None when it is unusable."""
+
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        payload = record.get("payload")
+        signature = record.get("signature")
+        if not isinstance(payload, dict) or not isinstance(signature, str):
+            return None
+        expected = hmac.new(
+            _trust_secret(settings),
+            _canonical_json(payload),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+        return payload
+    except (OSError, ValueError, TrustStoreError):
+        return None
+
+
 def record_streamed_answer(
     settings: Settings,
     *,
@@ -183,6 +261,7 @@ def record_streamed_answer(
         generation_source = "agent"
     else:
         generation_source = "rag"
+    safety = _safety_payload(complete)
     trust_id = _trust_id_for(
         conversation_id=conversation_id,
         knowledge_base_id=knowledge_base_id,
@@ -198,10 +277,7 @@ def record_streamed_answer(
         "citations_sha256": citations_sha,
         "citations": [citation.model_dump(mode="json") for citation in citations],
         "generation_source": generation_source,
-        "fact_status": complete.fact_status,
-        "safety_gate": complete.safety_gate,
-        "safety_notice": complete.safety_notice,
-        "tool_trace": [item.model_dump(mode="json") for item in (complete.agent_tool_trace or [])],
+        **safety,
         "created_at": datetime.now(UTC).isoformat(),
     }
     signature = hmac.new(
@@ -215,6 +291,13 @@ def record_streamed_answer(
         "signature": signature,
     }
     path = _trust_root(settings) / f"{trust_id}.json"
+    existing = _existing_payload(settings, path)
+    if existing is not None and _safety_restrictiveness(existing) > _safety_restrictiveness(
+        payload
+    ):
+        # Identical text/citations produced again with a less restrictive safety
+        # state must not downgrade the record that users may have already seen.
+        return trust_id
     _atomic_write(path, json.dumps(record, ensure_ascii=False).encode("utf-8"))
     return trust_id
 
