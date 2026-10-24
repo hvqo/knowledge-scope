@@ -154,6 +154,9 @@ class AgentToolOutcome:
     payload: dict[str, Any] = field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None
+    # Application-assigned fact provenance of this tool result.
+    fact_status: str | None = None
+    numeric_claims: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:

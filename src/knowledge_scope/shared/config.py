@@ -144,6 +144,12 @@ class Settings(BaseSettings):
     # Wall-clock guard for one agentic turn; the standard fallback path keeps
     # its own RAG budget, so this only bounds the pre-answer planning/tool loop.
     agent_timeout_seconds: float = Field(default=180.0, ge=15, le=600)
+    # Server-side trust ledger for generated answers. The browser cannot create
+    # a trusted record, so report auto-insertion can distinguish answers produced
+    # by this server from client-authored chat rows. Records are HMAC-signed
+    # files under ``<data_dir>/agent-trust``; no database migration is needed.
+    agent_trust_enabled: bool = True
+    agent_trust_secret: SecretStr | None = None
     graph_retrieval_max_seed_entities: int = Field(default=5, ge=1, le=50)
     graph_retrieval_max_hops: int = Field(default=2, ge=1, le=2)
     graph_retrieval_max_neighbors: int = Field(default=20, ge=1, le=100)

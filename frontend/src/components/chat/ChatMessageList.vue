@@ -3,8 +3,9 @@ import brandIcon from "../../../imgs/icon.jpg";
 import { ElMessage } from "element-plus";
 import { computed, nextTick, ref, watch } from "vue";
 
-import type { ChatMessageView, RAGCitation } from "../../api/types";
+import type { ChatMessageView, RAGCitation, RAGVisualSource } from "../../api/types";
 import AssistantMessage from "./AssistantMessage.vue";
+import VisualSourcesCard from "./VisualSourcesCard.vue";
 import { referencedCitations } from "./citations";
 
 const props = defineProps<{
@@ -17,7 +18,8 @@ const emit = defineEmits<{
   selectCitation: [marker: string, citations: RAGCitation[]];
   selectPrompt: [text: string];
   openSources: [citations: RAGCitation[]];
-  insertReport: [message: { content: string; citations: RAGCitation[] }];
+  insertReport: [message: { id: string }];
+  openVisualSource: [source: RAGVisualSource];
 }>();
 
 const EXAMPLE_PROMPTS = [
@@ -162,19 +164,22 @@ defineExpose({ scrollToBottom });
                 来源 {{ (sourcesByMessage[message.id] ?? []).length }}
               </button>
               <button
-                v-if="(sourcesByMessage[message.id] ?? []).length > 0"
+                v-if="(sourcesByMessage[message.id] ?? []).length > 0 || (message.visualSources ?? []).length > 0"
                 type="button"
                 class="message-action"
-                @click="
-                  emit('insertReport', {
-                    content: message.content,
-                    citations: sourcesByMessage[message.id] ?? [],
-                  })
-                "
+                @click="emit('insertReport', { id: message.id })"
               >
                 插入报告
               </button>
             </div>
+            <VisualSourcesCard
+              v-if="(message.visualSources ?? []).length > 0 || message.safetyNotice"
+              :sources="message.visualSources ?? []"
+              :notice="message.safetyNotice ?? null"
+              :gate="message.safetyGate ?? 'none'"
+              :fact-status="message.factStatus ?? null"
+              @open="emit('openVisualSource', $event)"
+            />
           </div>
         </template>
       </article>

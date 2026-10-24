@@ -325,6 +325,7 @@ Qdrant、Neo4j 或模型缓存。提交前请保持 README 描述与实际行为
 | PDF 表格计算 | [Table Analysis](docs/architecture/table-analysis.md) |
 | VLM 视觉理解 | [Vision Analysis](docs/architecture/vision-analysis.md) |
 | 报告创作 | [Report Workspace](docs/architecture/report-workspace.md) |
+| 多模态安全边界 | [Multimodal Safety](docs/architecture/multimodal-safety.md) |
 | 知识图谱 | [Graph Retrieval](docs/architecture/graph-retrieval.md) |
 | ChatBI | [Schema Discovery](docs/architecture/chatbi-schema-discovery.md) · [SQL Execution](docs/architecture/chatbi-sql-execution.md) · [Agent](docs/architecture/chatbi-agent.md) |
 | 本地 MCP | [MCP 服务](docs/architecture/mcp-server.md) |

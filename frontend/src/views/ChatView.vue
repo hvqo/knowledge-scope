@@ -32,7 +32,7 @@ import type {
   RAGCitation,
   RAGStreamEvent,
   RAGToolStatusData,
-  ReportSourceCreateRequest,
+  RAGVisualSource,
 } from "../api/types";
 import MemoryDialog from "../components/chat/MemoryDialog.vue";
 import ChatComposer from "../components/chat/ChatComposer.vue";
@@ -56,6 +56,11 @@ const retrievalEscalated = ref(false);
 const isStreaming = ref(false);
 const agentSteps = ref<RAGToolStatusData[]>([]);
 const activeController = ref<AbortController | null>(null);
+type SafetyMetadata = Pick<
+  ChatMessageView,
+  "safetyNotice" | "safetyGate" | "factStatus" | "visualSources"
+>;
+const safetyMetadataByContent = ref<Record<string, SafetyMetadata>>({});
 let activeRun = 0;
 let isUnmounting = false;
 let hasRestoredConversation = false;
@@ -319,10 +324,19 @@ function buildHistory(messages: ChatMessageView[]): RAGHistoryTurn[] {
 }
 
 const persistedMessages = computed(() => conversationDetailQuery.data.value?.messages ?? []);
-const messages = computed<ChatMessageView[]>(() =>
-  pendingMessage.value === null
-    ? [...persistedMessages.value]
-    : [...persistedMessages.value, pendingMessage.value],
+const messages = computed<ChatMessageView[]>(() => {
+  const persisted = persistedMessages.value.map((message) => {
+    const metadata = safetyMetadataByContent.value[message.content.trim()];
+    return metadata === undefined ? message : { ...message, ...metadata };
+  });
+  return pendingMessage.value === null ? persisted : [...persisted, pendingMessage.value];
+});
+
+watch(
+  () => chatStore.activeConversationId,
+  () => {
+    safetyMetadataByContent.value = {};
+  },
 );
 const lastAssistantCitations = computed<RAGCitation[]>(() => {
   const assistantMessages = messages.value.filter((message) => message.role === "assistant");
@@ -545,6 +559,15 @@ function applyStreamEvent(event: RAGStreamEvent): void {
   if (event.event === "complete") {
     rewrittenQuery.value = event.data.rewritten_query;
     retrievalEscalated.value = event.data.retrieval_escalated === true;
+    if (event.data.status === "completed") {
+      pendingMessage.value = {
+        ...current,
+        safetyNotice: event.data.safety_notice ?? null,
+        safetyGate: event.data.safety_gate ?? "none",
+        factStatus: event.data.fact_status ?? null,
+        visualSources: event.data.visual_sources ?? [],
+      };
+    }
   }
   if (event.data.status === "error") {
     flushPacedText();
@@ -572,6 +595,23 @@ async function persistAssistantMessage(
     // Keep the answer visible even when it could not be stored.
     ElMessage.warning("回答未能保存到历史记录");
   } finally {
+    if (
+      message.content.trim() !== "" &&
+      (message.safetyNotice !== undefined ||
+        message.visualSources !== undefined ||
+        message.safetyGate !== undefined ||
+        message.factStatus !== undefined)
+    ) {
+      safetyMetadataByContent.value = {
+        ...safetyMetadataByContent.value,
+        [message.content.trim()]: {
+          safetyNotice: message.safetyNotice ?? null,
+          safetyGate: message.safetyGate,
+          factStatus: message.factStatus ?? null,
+          visualSources: message.visualSources ?? [],
+        },
+      };
+    }
     pendingMessage.value = null;
     await queryClient.invalidateQueries({ queryKey: ["chat-conversation", conversationId] });
     await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
@@ -626,6 +666,7 @@ async function sendQuestion(question: string): Promise<void> {
         knowledge_base_id: knowledgeBaseId,
         retrieval_mode: chatStore.retrievalMode,
         answer_mode: chatStore.answerMode,
+        conversation_id: conversationId,
         history,
       },
       controller.signal,
@@ -745,8 +786,7 @@ function openLastSources(): void {
 }
 
 interface InsertableAgentAnswer {
-  content: string;
-  citations: RAGCitation[];
+  id: string;
 }
 
 const isInsertOpen = ref(false);
@@ -777,51 +817,14 @@ watch(insertReportId, () => {
 });
 
 function openInsertReport(agentAnswer: InsertableAgentAnswer): void {
+  if (agentAnswer.id.startsWith("pending-")) {
+    ElMessage.warning("回答正在保存，请稍后再插入报告");
+    return;
+  }
   insertAnswer.value = agentAnswer;
   insertReportId.value = null;
   insertSectionId.value = null;
   isInsertOpen.value = true;
-}
-
-/** Mirror the citation lineage into the existing report source contract. */
-function buildInsertSources(citations: RAGCitation[]): ReportSourceCreateRequest[] {
-  const sources: ReportSourceCreateRequest[] = [];
-  const seen = new Set<string>();
-  for (const citation of citations) {
-    if (
-      citation.knowledge_base_id === null ||
-      (citation.evidence_id === null && citation.chunk_id === null)
-    ) {
-      continue;
-    }
-    const key = citation.evidence_id ?? citation.chunk_id ?? "";
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    const pageStart = citation.page_start ?? 1;
-    const snippet = (citation.snippet ?? "")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 500);
-    sources.push({
-      kind: "rag_evidence",
-      title: citation.section_title?.trim() || `来源 ${citation.marker}`,
-      knowledge_base_id: citation.knowledge_base_id,
-      document_id: citation.document_id,
-      evidence_id: citation.evidence_id,
-      chunk_id: citation.chunk_id,
-      document_title: documentTitles.value[citation.document_id] ?? citation.document_id,
-      page_start: pageStart,
-      page_end: citation.page_end ?? pageStart,
-      evidence_type: citation.modality ?? "text",
-      snippet: snippet || null,
-      section_path: citation.section_path,
-      source_block_ids: citation.source_block_ids,
-    });
-  }
-  return sources;
 }
 
 async function confirmInsertReport(): Promise<void> {
@@ -835,8 +838,7 @@ async function confirmInsertReport(): Promise<void> {
   isInserting.value = true;
   try {
     const response = await insertAgentAnswer(insertReportId.value, insertSectionId.value, {
-      content_append: insertAnswer.value.content,
-      sources: buildInsertSources(insertAnswer.value.citations),
+      chat_message_id: insertAnswer.value.id,
     });
     if (response.warnings.length > 0) {
       ElMessage.warning(response.warnings.join("；"));
@@ -849,6 +851,31 @@ async function confirmInsertReport(): Promise<void> {
   } finally {
     isInserting.value = false;
   }
+}
+
+function openVisualSource(source: RAGVisualSource): void {
+  previewCitation.value = {
+    marker: "V1",
+    document_id: source.document_id,
+    knowledge_base_id: source.knowledge_base_id,
+    candidate_kind: "evidence",
+    chunk_id: null,
+    evidence_id: source.evidence_id,
+    modality: "image",
+    representation_ids: [],
+    asset_refs: [],
+    page_start: source.page_start,
+    page_end: source.page_end,
+    source_block_ids: source.source_block_ids,
+    section_path: [],
+    section_title: source.label ?? "本次分析图片",
+    snippet: source.label ?? "本次分析图片",
+    snippet_kind: "representation",
+    final_rank: null,
+    final_reranker_score: null,
+    branch_provenance: [],
+  };
+  isPreviewOpen.value = true;
 }
 
 function retryConversations(): void {
@@ -955,6 +982,7 @@ onBeforeUnmount(() => {
           @select-prompt="applyPrompt"
           @open-sources="openSources"
           @insert-report="openInsertReport"
+          @open-visual-source="openVisualSource"
         />
 
         <div
@@ -1078,12 +1106,8 @@ onBeforeUnmount(() => {
               />
             </ElSelect>
           </label>
-          <p
-            v-if="insertAnswer !== null"
-            class="insert-report__preview"
-          >
-            将插入 {{ insertAnswer.content.length }} 字回答与
-            {{ buildInsertSources(insertAnswer.citations).length }} 条来源。
+          <p class="insert-report__preview">
+            正文与来源将由服务器从已保存的智能体回答中读取；包含未核验视觉数值的回答会被拒绝插入。
           </p>
         </div>
         <template #footer>

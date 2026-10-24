@@ -246,9 +246,7 @@ describe("chat messages", () => {
     expect(wrapper.emitted("openSources")?.[0]).toEqual([[citation]]);
 
     await wrapper.findAll(".message-action")[2].trigger("click");
-    expect(wrapper.emitted("insertReport")?.[0]).toEqual([
-      { content: "需要满足三点要求 [C1]", citations: [citation] },
-    ]);
+    expect(wrapper.emitted("insertReport")?.[0]).toEqual([{ id: "message-2" }]);
 
     await wrapper.get(".citation-marker").trigger("click");
     expect(wrapper.emitted("selectCitation")?.[0]).toEqual(["C1", [citation]]);

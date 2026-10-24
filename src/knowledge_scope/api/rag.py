@@ -9,16 +9,21 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from knowledge_scope.agent.service import AgentChatService
 from knowledge_scope.agent.tools import DocumentLoader
+from knowledge_scope.chat.models import ChatConversation
 from knowledge_scope.chat.service import load_recent_memories
+from knowledge_scope.chat.trust import record_streamed_answer
 from knowledge_scope.documents.models import Document
 from knowledge_scope.rag.schemas import (
+    RAGCitation,
     RAGCompleteData,
     RAGErrorData,
     RAGQueryRequest,
@@ -76,13 +81,13 @@ async def _load_memories(
     return tuple(kept)
 
 
-async def _event_stream(
+async def _events(
     service: RAGService,
     payload: RAGQueryRequest,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[RAGStreamEvent]:
     async with aclosing(service.stream(payload)) as event_stream:
         async for event in event_stream:
-            yield encode_sse(event)
+            yield event
 
 
 def _document_loader(request: Request) -> DocumentLoader:
@@ -108,11 +113,11 @@ def _agent_timeout(settings: Settings) -> float:
     return settings.agent_timeout_seconds
 
 
-async def _agent_event_stream(
+async def _agent_events(
     service: AgentChatService,
     payload: RAGQueryRequest,
     request: Request,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[RAGStreamEvent]:
     settings: Settings = request.app.state.settings
     timeout_seconds = _agent_timeout(settings)
     started = time.perf_counter()
@@ -122,35 +127,111 @@ async def _agent_event_stream(
                 service.stream(payload, document_loader=_document_loader(request))
             ) as event_stream:
                 async for event in event_stream:
-                    yield encode_sse(event)
+                    yield event
     except TimeoutError:
         logger.warning("agent turn timed out after %ss", timeout_seconds)
-        yield encode_sse(
-            RAGStreamEvent(
-                event="error",
-                data=RAGErrorData(
-                    category="agent",
-                    message=(
-                        f"智能体执行超过 {int(timeout_seconds)} 秒，已终止本轮问答。"
-                        "请重试或切换为标准问答。"
-                    ),
-                ).model_dump(mode="json"),
-            )
+        yield RAGStreamEvent(
+            event="error",
+            data=RAGErrorData(
+                category="agent",
+                message=(
+                    f"智能体执行超过 {int(timeout_seconds)} 秒，已终止本轮问答。"
+                    "请重试或切换为标准问答。"
+                ),
+            ).model_dump(mode="json"),
         )
-        yield encode_sse(
-            RAGStreamEvent(
-                event="complete",
-                data=RAGCompleteData(
-                    status="error",
-                    prompt_version="agent-rag-v1",
-                    retrieval_mode="unified",
-                    route="unified",
-                    answer_mode="agent",
-                    tool_calls=0,
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
-                ).model_dump(mode="json"),
-            )
+        yield RAGStreamEvent(
+            event="complete",
+            data=RAGCompleteData(
+                status="error",
+                prompt_version="agent-rag-v1",
+                retrieval_mode="unified",
+                route="unified",
+                answer_mode="agent",
+                tool_calls=0,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            ).model_dump(mode="json"),
         )
+
+
+async def _trusted_event_stream(
+    events: AsyncIterator[RAGStreamEvent],
+    *,
+    settings: Settings,
+    session_factory: object | None,
+    payload: RAGQueryRequest,
+    answer_mode: Literal["agent", "rag"],
+) -> AsyncIterator[str]:
+    """Encode events and attach a server-signed trust record to completed turns.
+
+    The record is written before the final ``complete`` event leaves the server,
+    so the client can rely on it for report insertion. A missing conversation or
+    database failure only disables that record; the answer stream itself is not
+    blocked.
+    """
+
+    answer_parts: list[str] = []
+    citations: list[RAGCitation] = []
+    complete_data: RAGCompleteData | None = None
+    async with aclosing(events) as event_stream:
+        async for event in event_stream:
+            if event.event == "answer_delta":
+                text = event.data.get("text")
+                if isinstance(text, str):
+                    answer_parts.append(text)
+                yield encode_sse(event)
+            elif event.event == "citations":
+                for item in event.data.get("items") or []:
+                    try:
+                        citations.append(RAGCitation.model_validate(item))
+                    except ValidationError:
+                        logger.warning("citations event contains an invalid citation")
+                yield encode_sse(event)
+            elif event.event == "complete":
+                try:
+                    complete_data = RAGCompleteData.model_validate(event.data)
+                except ValidationError:
+                    logger.warning("complete event failed validation; trust record skipped")
+                    yield encode_sse(event)
+                    complete_data = None
+            else:
+                yield encode_sse(event)
+    if complete_data is None:
+        return
+    data = complete_data.model_dump(mode="json")
+    trust_id: str | None = None
+    if (
+        complete_data.status == "completed"
+        and payload.conversation_id is not None
+        and payload.knowledge_base_id is not None
+        and session_factory is not None
+    ):
+        try:
+            async with session_factory() as session:
+                conversation = await session.get(ChatConversation, payload.conversation_id)
+                if (
+                    conversation is not None
+                    and conversation.knowledge_base_id == payload.knowledge_base_id
+                ):
+                    trust_id = await asyncio.to_thread(
+                        record_streamed_answer,
+                        settings,
+                        conversation_id=payload.conversation_id,
+                        knowledge_base_id=payload.knowledge_base_id,
+                        content="".join(answer_parts),
+                        citations=citations,
+                        answer_mode=answer_mode,
+                        complete=complete_data,
+                    )
+        except Exception as error:  # recording is best-effort for the stream
+            logger.warning("agent trust record skipped (%s)", type(error).__name__)
+    data["trust_id"] = trust_id
+    data["answer_generated_by"] = (
+        "safety_gate"
+        if complete_data.safety_gate != "none"
+        else ("agent" if answer_mode == "agent" else "rag")
+    )
+    yield encode_sse(RAGStreamEvent(event="complete", data=data))
 
 
 @router.post("/query", response_class=StreamingResponse)
@@ -172,7 +253,13 @@ async def query(payload: RAGQueryRequest, request: Request) -> StreamingResponse
                 detail="Agent service is not initialized",
             )
         return StreamingResponse(
-            _agent_event_stream(agent_service, payload, request),
+            _trusted_event_stream(
+                _agent_events(agent_service, payload, request),
+                settings=settings,
+                session_factory=getattr(request.app.state, "db_session_factory", None),
+                payload=payload,
+                answer_mode="agent",
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -183,7 +270,13 @@ async def query(payload: RAGQueryRequest, request: Request) -> StreamingResponse
             detail="RAG service is not initialized",
         )
     return StreamingResponse(
-        _event_stream(service, payload),
+        _trusted_event_stream(
+            _events(service, payload),
+            settings=settings,
+            session_factory=getattr(request.app.state, "db_session_factory", None),
+            payload=payload,
+            answer_mode="rag",
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

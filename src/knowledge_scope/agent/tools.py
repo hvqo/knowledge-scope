@@ -235,7 +235,9 @@ class AgentToolExecutor:
     ) -> AgentToolOutcome:
         evidence_id = candidate.evidence_id
         if evidence_id is None:
-            return _failure("analyze_image", "evidence_missing", "候选来源缺少 Evidence 标识")
+            return _vision_failure(
+                candidate, plan, "evidence_missing", "候选来源缺少 Evidence 标识"
+            )
         try:
             document = await self._load_document(candidate)
             result = await self._vision_service.analyze(
@@ -246,14 +248,21 @@ class AgentToolExecutor:
                 question=(plan.question or "").strip() or None,
             )
         except _ToolFailure as error:
-            return _failure("analyze_image", error.code, error.message)
+            return _vision_failure(candidate, plan, error.code, error.message)
         except VisionError as error:
-            return _failure("analyze_image", error.code, error.message)
+            return _vision_failure(candidate, plan, error.code, error.message)
         except AssetAccessError as error:
-            return _failure("analyze_image", error.code, error.message)
+            return _vision_failure(candidate, plan, error.code, error.message)
         except Exception:
-            return _failure("analyze_image", "vision_tool_failed", "视觉工具执行失败")
+            return _vision_failure(candidate, plan, "vision_tool_failed", "视觉工具执行失败")
         payload = result.model_dump(mode="json")
+        payload.update(
+            {
+                "asset_index": plan.asset_index,
+                "vision_task": result.task_type,
+                "execution_status": "completed",
+            }
+        )
         if result.status in {"ok", "needs_review"}:
             label = (
                 "图片理解"
@@ -268,7 +277,16 @@ class AgentToolExecutor:
                 status="completed",
                 summary=summary,
                 payload=payload,
+                fact_status=result.fact_status,
+                numeric_claims=[claim.model_dump(mode="json") for claim in result.numeric_claims],
             )
+        payload.update(
+            {
+                "asset_index": plan.asset_index,
+                "vision_task": result.task_type,
+                "execution_status": "failed",
+            }
+        )
         return AgentToolOutcome(
             tool="analyze_image",
             status="failed",
@@ -276,6 +294,8 @@ class AgentToolExecutor:
             payload=payload,
             error_code=result.error_code or "vision_tool_failed",
             error_message=result.message,
+            fact_status=result.fact_status,
+            numeric_claims=[claim.model_dump(mode="json") for claim in result.numeric_claims],
         )
 
     async def analyze_table(
@@ -339,6 +359,7 @@ class AgentToolExecutor:
                 status="completed",
                 summary=f"表格计算完成（{plan.operation}）",
                 payload=result_payload,
+                fact_status="source_verified",
             )
         return AgentToolOutcome(
             tool="analyze_table",
@@ -355,6 +376,54 @@ class _ToolFailure(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _vision_source_payload(candidate: AgentCandidate) -> list[dict[str, Any]]:
+    """Server-validated lineage for one attempted visual analysis."""
+
+    citation = candidate.citation
+    knowledge_base_id = citation.knowledge_base_id
+    evidence_id = candidate.evidence_id
+    if knowledge_base_id is None or evidence_id is None:
+        return []
+    return [
+        {
+            "knowledge_base_id": str(knowledge_base_id),
+            "document_id": str(citation.document_id),
+            "evidence_id": evidence_id,
+            "page_start": citation.page_start,
+            "page_end": citation.page_end,
+            "source_block_ids": list(citation.source_block_ids)[:64],
+        }
+    ]
+
+
+def _vision_failure(
+    candidate: AgentCandidate,
+    plan: AgentPlan,
+    code: str,
+    message: str,
+) -> AgentToolOutcome:
+    """Controlled failed visual attempt that still records the real asset."""
+
+    payload: dict[str, Any] = {
+        "status": "failed",
+        "error_code": code,
+        "message": message,
+        "asset_index": plan.asset_index,
+        "vision_task": plan.vision_task or "describe_image",
+        "execution_status": "failed",
+        "sources": _vision_source_payload(candidate),
+    }
+    return AgentToolOutcome(
+        tool="analyze_image",
+        status="failed",
+        summary=message,
+        payload=payload,
+        error_code=code,
+        error_message=message,
+        fact_status="not_available",
+    )
 
 
 def _failure(tool: str, code: str, message: str) -> AgentToolOutcome:
