@@ -20,7 +20,7 @@ RAGRequestedRetrievalMode = Literal["auto", "dense", "unified"]
 # ``agent`` enables the deterministic multimodal tool router; ``standard`` keeps
 # the classic single-pass RAG answer path.
 RAGAnswerMode = Literal["standard", "agent"]
-RAGCitationBranchName = Literal["dense", "sparse", "graph", "multimodal"]
+RAGCitationBranchName = Literal["dense", "sparse", "graph", "multimodal", "visual"]
 RAGCitationSnippetKind = Literal["source", "representation"]
 RAGToolName = Literal["retrieval", "analyze_image", "analyze_table"]
 RAGToolStatusValue = Literal["running", "completed", "failed", "skipped"]

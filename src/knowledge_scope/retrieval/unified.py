@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Unified multi-retriever candidates with one final local reranker.
 
 This module composes the existing dense, sparse, graph, and multimodal
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -32,17 +34,20 @@ from .representation_index import RepresentationRetrievalResult, RetrievedEviden
 from .reranking import RerankerProtocol
 from .service import RetrievalResult
 from .sparse import SparseSearchHit, SparseSearchResponse
+from .visual_index import VisualSearchHit, VisualSearchResult
 
 UNIFIED_RETRIEVAL_SCHEMA_VERSION = "1.0"
 UNIFIED_CANDIDATE_ID_SCHEMA_VERSION = "1.0"
-UNIFIED_BRANCH_ORDER = ("dense", "sparse", "graph", "multimodal")
+logger = logging.getLogger(__name__)
 
-UnifiedBranch = Literal["dense", "sparse", "graph", "multimodal"]
+UNIFIED_BRANCH_ORDER = ("dense", "sparse", "graph", "multimodal", "visual")
+
+UnifiedBranch = Literal["dense", "sparse", "graph", "multimodal", "visual"]
 UnifiedCandidateKind = Literal["chunk", "evidence"]
 UnifiedBranchStatus = Literal["success", "empty", "failed", "timed_out", "cancelled"]
 UnifiedFailureMode = Literal["strict", "degraded"]
 UnifiedModality = Literal["text", "image", "table", "formula"]
-UnifiedCandidateSource = Literal["dense", "sparse", "graph", "multimodal", "multiple"]
+UnifiedCandidateSource = Literal["dense", "sparse", "graph", "multimodal", "visual", "multiple"]
 UnifiedCandidateKey = tuple[UnifiedCandidateKind, UUID, UUID, str]
 
 
@@ -127,6 +132,9 @@ class UnifiedRetrievalConfig(BaseModel):
     sparse_candidate_limit: StrictInt = Field(default=20, ge=1, le=100)
     graph_candidate_limit: StrictInt = Field(default=20, ge=1, le=500)
     multimodal_candidate_limit: StrictInt = Field(default=20, ge=1, le=100)
+    visual_candidate_limit: StrictInt = Field(default=8, ge=1, le=100)
+    visual_fusion_quota: StrictInt = Field(default=2, ge=0, le=5)
+    visual_quota_ambiguous: StrictInt = Field(default=1, ge=0, le=5)
     candidate_pool_limit: StrictInt = Field(default=48, ge=1, le=500)
     result_limit: StrictInt = Field(default=8, ge=1, le=500)
     rerank_text_max_chars: StrictInt = Field(default=6_000, ge=1, le=20_000)
@@ -201,8 +209,8 @@ class UnifiedBranchContribution(BaseModel):
             or self.graph_paths
         ):
             raise ValueError("graph metadata belongs only to graph contributions")
-        if self.branch != "multimodal" and self.representation_ids:
-            raise ValueError("representation IDs belong only to multimodal contributions")
+        if self.branch not in {"multimodal", "visual"} and self.representation_ids:
+            raise ValueError("representation IDs belong only to multimodal or visual contributions")
         return self
 
 
@@ -370,6 +378,8 @@ class UnifiedRetrievalResult(BaseModel):
     rerank_latency_ms: float = Field(ge=0)
     total_latency_ms: float = Field(ge=0)
     degraded: bool = False
+    visual_intent: Literal["explicit", "ambiguous", "plain"] = "plain"
+    visual_quota_applied: StrictInt = Field(default=0, ge=0, le=5)
     items: list[UnifiedCandidate] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -389,7 +399,10 @@ class UnifiedRetrievalResult(BaseModel):
     @property
     def source_distribution(self) -> dict[str, int]:
         """Return stable final candidate counts by branch provenance."""
+        branches = {branch.branch for branch in self.branches}
         counts = {source: 0 for source in ("dense", "sparse", "graph", "multimodal", "multiple")}
+        if "visual" in branches or any(item.source == "visual" for item in self.items):
+            counts["visual"] = 0
         for item in self.items:
             counts[item.source] += 1
         return counts
@@ -780,6 +793,69 @@ def _add_evidence_candidate(
     _merge_contribution(builder, contribution)
 
 
+def _add_visual_candidate(
+    builders: dict[UnifiedCandidateKey, _CandidateBuilder],
+    branch_keys: dict[UnifiedBranch, list[UnifiedCandidateKey]],
+    hit: VisualSearchHit,
+    *,
+    knowledge_base_id: UUID,
+    max_chars: int,
+) -> None:
+    """Translate one native visual hit into the normal Evidence candidate path."""
+
+    payload = hit.payload
+    representations = payload.representations
+    if not representations:
+        raise UnifiedRetrievalError("visual candidate has no representation provenance")
+    from .representation_index import RepresentationEvidenceHit
+
+    merged_representations = []
+    for ref in representations:
+        merged_representations.append(
+            RepresentationEvidenceHit(
+                representation_id=ref.representation_id,
+                representation_type=ref.representation_type,
+                score=hit.score,
+                rank=hit.rank,
+                text=ref.content,
+                reference=ref.reference,
+            )
+        )
+    first = merged_representations[0]
+    rerank_text = (payload.caption or "") + "\n" + (payload.context or "")
+    evidence = RetrievedEvidence(
+        rank=hit.rank,
+        score=hit.score,
+        evidence_id=payload.evidence_id,
+        knowledge_base_id=payload.knowledge_base_id,
+        document_id=payload.document_id,
+        page_start=payload.page_number,
+        page_end=payload.page_number,
+        source_block_ids=list(payload.source_block_ids),
+        section_path=list(payload.section_path),
+        asset_refs=[payload.asset_ref],
+        modality="image",
+        representation_id=first.representation_id,
+        representation_type=first.representation_type,
+        text=payload.caption,
+        reference=payload.asset_ref,
+        representations=merged_representations,
+    )
+    _add_evidence_candidate(
+        builders,
+        branch_keys,
+        "visual",
+        evidence,
+        knowledge_base_id=knowledge_base_id,
+        max_chars=max_chars,
+    )
+    if not rerank_text.strip():
+        builder = builders[
+            ("evidence", knowledge_base_id, payload.document_id, payload.evidence_id)
+        ]
+        builder.rerank_text = "图片素材（无标题）"
+
+
 def _to_candidate(builder: _CandidateBuilder, max_chars: int) -> UnifiedCandidate:
     branch_values = [
         builder.contributions[name]
@@ -854,6 +930,20 @@ def _fair_pool(
     return selected
 
 
+class VisualRetrievalProtocol(Protocol):
+    """Native visual image-retrieval contract (independent vector space)."""
+
+    def search(
+        self,
+        query: str,
+        knowledge_base_id: UUID,
+        *,
+        top_k: int,
+        document_id: UUID | None = None,
+    ) -> VisualSearchResult:
+        """Return bounded native visual hits."""
+
+
 class UnifiedRetrievalService:
     """Run all existing retrievers concurrently and apply one final BGE reranker."""
 
@@ -867,11 +957,13 @@ class UnifiedRetrievalService:
         *,
         chunk_lookup: ChunkPayloadLookupProtocol,
         config: UnifiedRetrievalConfig | None = None,
+        visual_retrieval: VisualRetrievalProtocol | None = None,
     ) -> None:
         self.dense_retrieval = dense_retrieval
         self.sparse_retrieval = sparse_retrieval
         self.graph_retrieval = graph_retrieval
         self.multimodal_retrieval = multimodal_retrieval
+        self.visual_retrieval = visual_retrieval
         self.final_reranker = final_reranker
         self.chunk_lookup = chunk_lookup
         self.config = config or UnifiedRetrievalConfig()
@@ -889,6 +981,13 @@ class UnifiedRetrievalService:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            logger.warning(
+                "unified branch %s failed (%s): %s",
+                branch,
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
             status: UnifiedBranchStatus = (
                 "timed_out"
                 if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.casefold()
@@ -1006,7 +1105,7 @@ class UnifiedRetrievalService:
                     graph_retrieval_reason=item.retrieval_reason,
                     graph_paths=item.paths,
                 )
-            else:
+            elif execution.branch == "multimodal":
                 if not isinstance(item, RetrievedEvidence):
                     raise UnifiedRetrievalError("multimodal branch returned invalid Evidence")
                 if item.knowledge_base_id != knowledge_base_id:
@@ -1017,6 +1116,21 @@ class UnifiedRetrievalService:
                     builders,
                     branch_keys,
                     "multimodal",
+                    item,
+                    knowledge_base_id=knowledge_base_id,
+                    max_chars=self.config.rerank_text_max_chars,
+                )
+            else:
+                if not isinstance(item, VisualSearchHit):
+                    raise UnifiedRetrievalError("visual branch returned an invalid image hit")
+                payload = item.payload
+                if payload.knowledge_base_id != knowledge_base_id:
+                    raise UnifiedRetrievalError("visual branch returned another knowledge base")
+                if document_id is not None and payload.document_id != document_id:
+                    continue
+                _add_visual_candidate(
+                    builders,
+                    branch_keys,
                     item,
                     knowledge_base_id=knowledge_base_id,
                     max_chars=self.config.rerank_text_max_chars,
@@ -1086,6 +1200,21 @@ class UnifiedRetrievalService:
                 )
             ),
         ]
+        if self.visual_retrieval is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self._execute_branch(
+                        "visual",
+                        lambda: self.visual_retrieval.search(
+                            query,
+                            knowledge_base_id,
+                            top_k=self.config.visual_candidate_limit,
+                            document_id=document_id,
+                        ),
+                        lambda response: response.items,
+                    )
+                )
+            )
         try:
             executions = list(await asyncio.gather(*tasks))
         except asyncio.CancelledError:
@@ -1175,6 +1304,18 @@ class UnifiedRetrievalService:
             _to_candidate(builder, self.config.rerank_text_max_chars)
             for builder in selected_builders
         ]
+        visual_intent: Literal["explicit", "ambiguous", "plain"] = "plain"
+        visual_quota = 0
+        if self.visual_retrieval is not None:
+            from knowledge_scope.vision.safety import assess_visual_risk
+
+            risk = assess_visual_risk(query)
+            if risk.visual_intent:
+                visual_intent = "explicit"
+                visual_quota = self.config.visual_fusion_quota
+            elif risk.high_risk:
+                visual_intent = "ambiguous"
+                visual_quota = self.config.visual_quota_ambiguous
         rerank_started = perf_counter()
         if candidates:
             try:
@@ -1199,6 +1340,29 @@ class UnifiedRetrievalService:
                 zip(candidates, normalized_scores, strict=True),
                 key=lambda pair: (-float(pair[1]), pair[0].candidate_id),
             )
+            selected_pairs = list(ranked[: self.config.result_limit])
+            if self.visual_retrieval is not None and visual_quota > 0:
+                visual_pairs = [
+                    (candidate, score)
+                    for candidate, score in ranked
+                    if any(branch.branch == "visual" for branch in candidate.branches)
+                ]
+                selected_visual = sum(
+                    1
+                    for candidate, _score in selected_pairs
+                    if any(branch.branch == "visual" for branch in candidate.branches)
+                )
+                needed = min(visual_quota, len(visual_pairs)) - selected_visual
+                if needed > 0:
+                    selected_ids = {candidate.candidate_id for candidate, _score in selected_pairs}
+                    extras = [
+                        (candidate, score)
+                        for candidate, score in visual_pairs
+                        if candidate.candidate_id not in selected_ids
+                    ][:needed]
+                    if extras:
+                        kept = selected_pairs[: len(selected_pairs) - len(extras)]
+                        selected_pairs = kept + extras
             final_items = [
                 candidate.model_copy(
                     update={
@@ -1206,7 +1370,7 @@ class UnifiedRetrievalService:
                         "final_reranker_score": float(score),
                     }
                 )
-                for rank, (candidate, score) in enumerate(ranked[: self.config.result_limit], 1)
+                for rank, (candidate, score) in enumerate(selected_pairs, 1)
             ]
         else:
             final_items = []
@@ -1228,6 +1392,8 @@ class UnifiedRetrievalService:
                 for execution in normalized_executions
             ],
             candidate_pool_size=len(candidates),
+            visual_intent=visual_intent,
+            visual_quota_applied=visual_quota,
             normalization_latency_ms=normalization_latency_ms,
             rerank_latency_ms=rerank_latency_ms,
             total_latency_ms=(perf_counter() - started) * 1_000,
@@ -1253,6 +1419,7 @@ __all__ = [
     "UnifiedRetrievalError",
     "UnifiedRetrievalResult",
     "UnifiedRetrievalService",
+    "VisualRetrievalProtocol",
     "chunk_candidate_id",
     "evidence_candidate_id",
 ]

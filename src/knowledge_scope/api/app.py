@@ -134,6 +134,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             representation_store = application.state.representation_store
             if representation_store is None:  # pragma: no cover - initialized above.
                 raise RuntimeError("representation store is not initialized")
+            if application.state.visual_store is None and runtime_settings.visual_embedding_enabled:
+                from knowledge_scope.retrieval.visual_embedding import VisualEmbeddingEncoder
+                from knowledge_scope.retrieval.visual_index import QdrantVisualStore
+
+                visual_encoder = VisualEmbeddingEncoder(runtime_settings)
+                application.state.visual_encoder = visual_encoder
+                application.state.visual_store = QdrantVisualStore(
+                    runtime_settings,
+                    visual_encoder,
+                )
             unified_retrieval = UnifiedRetrievalService(
                 retrieval,
                 sparse_store,
@@ -144,11 +154,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 ),
                 reranker,
                 chunk_lookup=application.state.vector_store,
+                visual_retrieval=application.state.visual_store,
                 config=UnifiedRetrievalConfig(
                     dense_candidate_limit=settings.unified_dense_candidate_limit,
                     sparse_candidate_limit=settings.unified_sparse_candidate_limit,
                     graph_candidate_limit=settings.unified_graph_candidate_limit,
                     multimodal_candidate_limit=settings.unified_multimodal_candidate_limit,
+                    visual_candidate_limit=settings.visual_candidate_limit,
+                    visual_fusion_quota=settings.visual_fusion_quota,
+                    visual_quota_ambiguous=settings.visual_quota_ambiguous,
                     candidate_pool_limit=settings.unified_candidate_pool_limit,
                     result_limit=settings.unified_result_limit,
                     rerank_text_max_chars=settings.unified_rerank_text_max_chars,
@@ -228,6 +242,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             application.state.representation_store.close()
         if application.state.sparse_store is not None:
             application.state.sparse_store.close()
+        if application.state.visual_store is not None:
+            application.state.visual_store.close()
+        visual_encoder = getattr(application.state, "visual_encoder", None)
+        if visual_encoder is not None:
+            visual_encoder.close()
         application.state.graph_store.close()
 
 
@@ -245,6 +264,7 @@ def create_app(
     llm_gateway: LLMGateway | None = None,
     vlm_provider: VLMProvider | None = None,
     agent_service: AgentChatService | None = None,
+    visual_store: object | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -272,6 +292,8 @@ def create_app(
     application.state.llm_provider = None
     application.state.vlm_provider = vlm_provider
     application.state.agent_service = agent_service
+    application.state.visual_store = visual_store
+    application.state.visual_encoder = None
     application.state.unified_retrieval = None
     application.add_middleware(
         CORSMiddleware,
