@@ -1,0 +1,293 @@
+"""Focused tests for the M8 single-host PDF auto-ingestion pipeline."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from httpx import AsyncClient
+
+from knowledge_scope.ingestion.models import IngestionTask
+from knowledge_scope.ingestion.store import IngestionStoreError, IngestionTaskStore
+from knowledge_scope.ingestion.worker import IngestionWorker
+from knowledge_scope.shared.config import Settings
+from test_document_assets import create_knowledge_base, upload_document
+
+
+def _settings(tmp_path: Path, **overrides: object) -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="test",
+        data_dir=tmp_path,
+        visual_embedding_enabled=True,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+class FakeSteps:
+    """Deterministic in-memory replacement for the real pipeline steps."""
+
+    def __init__(self, *, fail_at: str | None = None, images: int = 2) -> None:
+        self.fail_at = fail_at
+        self.images = images
+        self.calls: list[str] = []
+
+    def _stage(self, name: str, details: dict[str, object]) -> dict[str, object]:
+        self.calls.append(name)
+        if self.fail_at == name:
+            raise RuntimeError(f"{name} exploded")
+        return {"elapsed_ms": 1.5, **details}
+
+    def parse(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("parse", {"canonical_ref": "parsing/x/canonical.json"})
+
+    def chunk(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("chunk", {"chunks": 3})
+
+    def text_index(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("text_index", {"vectors": 3})
+
+    def sparse_index(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("sparse_index", {})
+
+    def multimodal_index(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("multimodal_index", {"images": self.images})
+
+    def visual_index(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("visual_index", {"images": self.images})
+
+    def publish(self, task: IngestionTask) -> dict[str, object]:
+        published = ["text", "multimodal", "bm25", "visual"]
+        return self._stage(
+            "publish",
+            {
+                "published_indexes": published,
+                "text_points": 3,
+                "representation_points": 4,
+                "sparse_records": 3,
+                "visual_points": self.images,
+            },
+        )
+
+    def verify(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage(
+            "verify",
+            {
+                "text_points": 3,
+                "representation_points": 4,
+                "sparse_ok": True,
+                "visual_points": self.images,
+            },
+        )
+
+    def graph(self, task: IngestionTask) -> dict[str, object]:
+        return self._stage("graph", {"skipped": True, "ready": False})
+
+
+def _worker(tmp_path: Path, steps: FakeSteps) -> tuple[IngestionWorker, IngestionTaskStore]:
+    store = IngestionTaskStore(_settings(tmp_path))
+    worker = IngestionWorker(_settings(tmp_path), store, steps=steps)
+    return worker, store
+
+
+def test_task_store_roundtrip_and_corruption(tmp_path: Path) -> None:
+    store = IngestionTaskStore(_settings(tmp_path))
+    task = IngestionTask(document_id=uuid4(), knowledge_base_id=uuid4())
+    store.write(task)
+    loaded = store.read(task.document_id)
+    assert loaded is not None
+    assert loaded.status == "queued"
+    assert store.list_tasks() == [loaded]
+    store.write_bundle(task.document_id, {"dense_points": []})
+    assert store.read_bundle(task.document_id) == {"dense_points": []}
+    store.remove_bundle(task.document_id)
+    assert store.read_bundle(task.document_id) is None
+    store.task_path(task.document_id).write_text("{not json")
+    with pytest.raises(IngestionStoreError):
+        store.read(task.document_id)
+    store.delete(task.document_id)
+    assert store.read(task.document_id) is None
+
+
+def test_worker_full_pipeline_completes(tmp_path: Path) -> None:
+    steps = FakeSteps()
+    worker, store = _worker(tmp_path, steps)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.attempts == 1
+    assert finished.chunk_count == 3
+    assert finished.image_count == 2
+    assert finished.indexes["text"] is True
+    assert finished.indexes["bm25"] is True
+    assert finished.indexes["multimodal"] is True
+    assert finished.indexes["visual"] is True
+    assert finished.indexes["graph"] is False
+    assert finished.error_stage is None
+    assert steps.calls == [
+        "parse",
+        "chunk",
+        "text_index",
+        "sparse_index",
+        "multimodal_index",
+        "visual_index",
+        "publish",
+        "verify",
+        "graph",
+    ]
+
+
+def test_worker_failure_then_retry_recovers(tmp_path: Path) -> None:
+    failing = FakeSteps(fail_at="chunk")
+    worker, store = _worker(tmp_path, failing)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    failed = store.read(task.document_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_stage == "chunk"
+    assert failed.error_code == "stage_failed"
+    assert "exploded" in (failed.error_message or "")
+    retried = worker.retry(task.document_id)
+    assert retried.status == "queued"
+    assert retried.attempts == 0
+    worker._steps = FakeSteps()  # type: ignore[assignment]
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+
+
+def test_worker_no_image_document_still_completes(tmp_path: Path) -> None:
+    steps = FakeSteps(images=0)
+    worker, store = _worker(tmp_path, steps)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.image_count == 0
+    assert finished.indexes["visual"] is True
+
+
+def test_worker_recovery_requeues_interrupted_then_exhausts(tmp_path: Path) -> None:
+    store = IngestionTaskStore(_settings(tmp_path))
+    document_id = uuid4()
+    task = IngestionTask(document_id=document_id, knowledge_base_id=uuid4())
+    task.ensure_stages()
+    task.status = "running"
+    task.attempts = 1
+    task.current_stage = "chunk"
+    task.stages["chunk"] = task.stages["chunk"].model_copy(update={"status": "running"})
+    store.write(task)
+    worker = IngestionWorker(_settings(tmp_path), store, steps=FakeSteps())
+    recovered = worker._recover_interrupted()
+    assert recovered == [document_id]
+    resumed = store.read(document_id)
+    assert resumed is not None
+    assert resumed.status == "queued"
+    assert resumed.interruptions == 1
+    assert resumed.stages["chunk"].status == "interrupted"
+
+    exhausted = store.read(document_id)
+    assert exhausted is not None
+    exhausted.status = "running"
+    exhausted.attempts = 3
+    store.write(exhausted)
+    assert worker._recover_interrupted() == []
+    final = store.read(document_id)
+    assert final is not None
+    assert final.status == "failed"
+    assert final.error_code == "ingestion_interrupted"
+
+
+def test_worker_enqueue_is_idempotent(tmp_path: Path) -> None:
+    worker, _store = _worker(tmp_path, FakeSteps())
+    document_id = uuid4()
+    kb = uuid4()
+    first = worker.enqueue(document_id, kb)
+    second = worker.enqueue(document_id, kb)
+    assert first.document_id == second.document_id
+    worker._run_document(document_id)
+    completed = worker.enqueue(document_id, kb)
+    assert completed.status == "completed"
+    forced = worker.enqueue(document_id, kb, force=True)
+    assert forced.status == "queued"
+
+
+class FakeApiWorker:
+    """Minimal worker facade used by API tests."""
+
+    def __init__(self, store: IngestionTaskStore) -> None:
+        self.store = store
+        self.enqueued: list[UUID] = []
+
+    def enqueue(self, document_id: UUID, knowledge_base_id: UUID, **_: object) -> IngestionTask:
+        self.enqueued.append(document_id)
+        task = IngestionTask(document_id=document_id, knowledge_base_id=knowledge_base_id)
+        self.store.write(task)
+        return task
+
+    def status(self, document_id: UUID) -> IngestionTask | None:
+        return self.store.read(document_id)
+
+    def retry(self, document_id: UUID) -> IngestionTask:
+        task = self.store.read(document_id)
+        assert task is not None
+        task.status = "queued"
+        task.attempts = 0
+        self.store.write(task)
+        return task
+
+    def list_tasks(self, knowledge_base_id: UUID | None = None) -> list[IngestionTask]:
+        tasks = self.store.list_tasks()
+        if knowledge_base_id is not None:
+            tasks = [task for task in tasks if task.knowledge_base_id == knowledge_base_id]
+        return tasks
+
+
+@pytest.mark.anyio
+async def test_ingestion_api_status_retry_and_list(
+    ingestion_client_factory: object,
+    test_data_dir: Path,
+) -> None:
+    store = IngestionTaskStore(_settings(test_data_dir))
+    fake = FakeApiWorker(store)
+    factory = ingestion_client_factory
+    async with factory(fake) as client:  # type: ignore[operator]
+        kb_id = await create_knowledge_base(client, "自动入库测试")
+        document = await upload_document(client, kb_id)
+        document_id = UUID(str(document["id"]))
+        assert fake.enqueued == [document_id]
+
+        status_response = await client.get(
+            f"/api/v1/knowledge-bases/{kb_id}/documents/{document_id}/ingestion"
+        )
+        assert status_response.status_code == 200
+        body = status_response.json()
+        assert body["task"]["document_id"] == str(document_id)
+        assert body["task"]["status"] == "queued"
+
+        retry_response = await client.post(
+            f"/api/v1/knowledge-bases/{kb_id}/documents/{document_id}/ingestion/retry"
+        )
+        assert retry_response.status_code == 202
+        assert retry_response.json()["task"]["status"] == "queued"
+
+        list_response = await client.get(f"/api/v1/knowledge-bases/{kb_id}/ingestion")
+        assert list_response.status_code == 200
+        assert len(list_response.json()["tasks"]) == 1
+
+
+@pytest.mark.anyio
+async def test_ingestion_api_disabled_without_worker(client: AsyncClient) -> None:
+    kb_id = await create_knowledge_base(client, "无 worker 测试")
+    document = await upload_document(client, kb_id)
+    response = await client.get(
+        f"/api/v1/knowledge-bases/{kb_id}/documents/{document['id']}/ingestion"
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "自动入库任务未启用"

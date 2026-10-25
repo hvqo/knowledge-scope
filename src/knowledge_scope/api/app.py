@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Final
@@ -29,6 +30,8 @@ from knowledge_scope.graph.api import router as graph_router
 from knowledge_scope.graph.neo4j import Neo4jGraphStore
 from knowledge_scope.graph.retrieval import GraphRetrievalConfig
 from knowledge_scope.graph.retrieval_service import GraphRetrievalService
+from knowledge_scope.ingestion.store import IngestionTaskStore
+from knowledge_scope.ingestion.worker import IngestionWorker
 from knowledge_scope.llm.gateway import LLMGateway
 from knowledge_scope.llm.providers import create_llm_provider
 from knowledge_scope.llm.usage import DatabaseUsageRecorder
@@ -56,6 +59,7 @@ from knowledge_scope.vision.provider import VLMProvider, create_vlm_provider
 from knowledge_scope.vision.service import VisionAnalysisService
 
 from .documents import router as documents_router
+from .ingestion import router as ingestion_router
 from .knowledge_bases import router as knowledge_bases_router
 from .rag import router as rag_router
 from .retrieval import router as retrieval_router
@@ -73,6 +77,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Initialize the default RAG graph and dispose owned clients on shutdown."""
     provider = None
     owned_vlm_provider: VLMProvider | None = None
+    owned_ingestion_worker: IngestionWorker | None = None
     unified_retrieval: UnifiedRetrievalService | None = None
     runtime_settings: Settings = application.state.settings
     if application.state.vlm_provider is None and runtime_settings.vlm_enabled:
@@ -230,8 +235,18 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 limits=ChatBIAgentLimits.from_settings(settings),
                 eligibility_service=eligibility,
             )
+        if application.state.ingestion_worker is None and runtime_settings.ingestion_enabled:
+            ingestion_store = IngestionTaskStore(runtime_settings)
+            owned_ingestion_worker = IngestionWorker(
+                runtime_settings,
+                ingestion_store,
+            )
+            owned_ingestion_worker.start()
+            application.state.ingestion_worker = owned_ingestion_worker
         yield
     finally:
+        if owned_ingestion_worker is not None:
+            await asyncio.to_thread(owned_ingestion_worker.stop)
         if provider is not None:
             await provider.aclose()
         if owned_vlm_provider is not None:
@@ -265,6 +280,7 @@ def create_app(
     vlm_provider: VLMProvider | None = None,
     agent_service: AgentChatService | None = None,
     visual_store: object | None = None,
+    ingestion_worker: IngestionWorker | None = None,
 ) -> FastAPI:
     """Create the API application with validated runtime settings."""
     runtime_settings = settings if settings is not None else get_settings()
@@ -294,6 +310,7 @@ def create_app(
     application.state.agent_service = agent_service
     application.state.visual_store = visual_store
     application.state.visual_encoder = None
+    application.state.ingestion_worker = ingestion_worker
     application.state.unified_retrieval = None
     application.add_middleware(
         CORSMiddleware,
@@ -363,6 +380,7 @@ def create_app(
     application.include_router(router)
     application.include_router(knowledge_bases_router, prefix=API_PREFIX)
     application.include_router(documents_router, prefix=API_PREFIX)
+    application.include_router(ingestion_router, prefix=API_PREFIX)
     application.include_router(graph_router, prefix=API_PREFIX)
     application.include_router(retrieval_router, prefix=API_PREFIX)
     application.include_router(chat_router, prefix=API_PREFIX)

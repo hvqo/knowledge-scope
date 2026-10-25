@@ -54,6 +54,77 @@ export interface Document {
   updated_at: string;
 }
 
+export type IngestionStatus = "queued" | "running" | "completed" | "failed";
+export type IngestionStageStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "interrupted";
+
+export interface IngestionStageState {
+  name: string;
+  status: IngestionStageStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  message: string | null;
+  error_code: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface IngestionTask {
+  schema_version: "1.0";
+  pipeline_version: string;
+  document_id: string;
+  knowledge_base_id: string;
+  status: IngestionStatus;
+  current_stage: string | null;
+  attempts: number;
+  interruptions: number;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  stages: Record<string, IngestionStageState>;
+  indexes: {
+    text: boolean;
+    bm25: boolean;
+    multimodal: boolean;
+    visual: boolean;
+    graph: boolean;
+  };
+  source_sha256: string | null;
+  chunk_count: number;
+  image_count: number;
+  timings_ms: Record<string, number>;
+  vram_peak_mb: number | null;
+  error_stage: string | null;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+export interface IngestionStatusEntry {
+  document_id: string;
+  knowledge_base_id: string;
+  status: IngestionStatus;
+  current_stage: string | null;
+  stage_label: string | null;
+  stage_status: IngestionStageStatus | null;
+  stage_message: string | null;
+  error_stage: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  chunk_count: number;
+  image_count: number;
+  attempts: number;
+  updated_at: string;
+}
+
+export interface IngestionStatusResponse {
+  task: IngestionTask | null;
+  summary: IngestionStatusEntry | null;
+}
+
 export interface DocumentListResponse {
   items: Document[];
   total: number;

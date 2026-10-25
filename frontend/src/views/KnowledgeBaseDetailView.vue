@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   ElButton,
@@ -15,12 +15,14 @@ import {
 
 import {
   deleteDocument,
+  fetchDocumentIngestion,
   fetchDocuments,
   fetchKnowledgeBase,
   getUserFacingError,
+  retryDocumentIngestion,
   uploadDocument,
 } from "../api/client";
-import type { Document } from "../api/types";
+import type { Document, IngestionStatusEntry, IngestionStatusResponse } from "../api/types";
 import DocumentPreviewDialog from "../components/documents/DocumentPreviewDialog.vue";
 
 const DOCUMENT_PAGE_SIZE = 10;
@@ -77,6 +79,123 @@ const documentsError = computed(() => documentsQuery.isError.value);
 const documentsErrorMessage = computed(() =>
   getUserFacingError(documentsQuery.error.value, "文档暂时无法加载，请稍后重试。"),
 );
+const ingestionQuery = useQuery({
+  queryKey: computed(() => [
+    "ingestion",
+    knowledgeBaseId.value,
+    documents.value.map((document) => document.id).join(","),
+  ]),
+  queryFn: async () => {
+    const responses = await Promise.all(
+      documents.value.map(async (document) => {
+        try {
+          const response = await fetchDocumentIngestion(knowledgeBaseId.value, document.id);
+          return [document.id, response] as const;
+        } catch {
+          return [document.id, { task: null, summary: null }] as const;
+        }
+      }),
+    );
+    return new Map<string, IngestionStatusResponse>(responses);
+  },
+  enabled: computed(() => Boolean(knowledgeBase.value) && documents.value.length > 0),
+  refetchInterval: (query) => {
+    const data = query.state.data;
+    if (!data) {
+      return 2500;
+    }
+    const active = [...data.values()].some(
+      (response) =>
+        response.summary?.status === "queued" || response.summary?.status === "running",
+    );
+    return active ? 1500 : false;
+  },
+});
+const ingestionByDocument = computed<Map<string, IngestionStatusResponse>>(
+  () => ingestionQuery.data.value ?? new Map(),
+);
+const lastIngestionStatus = ref<Record<string, string>>({});
+
+watch(ingestionQuery.data, (data) => {
+  if (!data) {
+    return;
+  }
+  let shouldRefresh = false;
+  const next: Record<string, string> = {};
+  for (const [documentId, response] of data) {
+    const status = response.summary?.status ?? "none";
+    next[documentId] = status;
+    const previous = lastIngestionStatus.value[documentId];
+    if (previous && previous !== status && (status === "completed" || status === "failed")) {
+      shouldRefresh = true;
+    }
+  }
+  lastIngestionStatus.value = next;
+  if (shouldRefresh) {
+    void queryClient.invalidateQueries({ queryKey: ["documents", knowledgeBaseId.value] });
+  }
+});
+
+function ingestionEntry(document: Document): IngestionStatusEntry | null {
+  return ingestionByDocument.value.get(document.id)?.summary ?? null;
+}
+
+function ingestionLabel(document: Document): string {
+  const entry = ingestionEntry(document);
+  if (!entry) {
+    return statusLabel(document.status);
+  }
+  if (entry.status === "queued") {
+    return "排队中";
+  }
+  if (entry.status === "running") {
+    return entry.stage_label ?? "处理中";
+  }
+  if (entry.status === "failed") {
+    return "处理失败";
+  }
+  return "已就绪";
+}
+
+function ingestionTagType(document: Document): "success" | "warning" | "danger" | "info" {
+  const status = ingestionEntry(document)?.status;
+  if (status === "failed") {
+    return "danger";
+  }
+  if (status === "running") {
+    return "warning";
+  }
+  if (status === "completed") {
+    return "success";
+  }
+  return "info";
+}
+
+function ingestionDetail(document: Document): string | null {
+  const entry = ingestionEntry(document);
+  if (!entry) {
+    return null;
+  }
+  if (entry.status === "failed") {
+    return entry.error_message ?? "处理失败，可重试。";
+  }
+  if (entry.status === "completed") {
+    const chunks = entry.chunk_count > 0 ? `${entry.chunk_count} 个文本块` : "无文本块";
+    return `${chunks} · ${entry.image_count} 张图片`;
+  }
+  return null;
+}
+
+async function retryIngestion(document: Document): Promise<void> {
+  try {
+    await retryDocumentIngestion(knowledgeBaseId.value, document.id);
+    ElMessage.success("已重新提交处理");
+    await ingestionQuery.refetch();
+  } catch (error) {
+    ElMessage.error(getUserFacingError(error, "重试失败，请稍后再试。"));
+  }
+}
+
 const isUploading = computed(() => uploadMutation.isPending.value);
 const isDeletingDocument = computed(() => deleteMutation.isPending.value);
 const isDocumentActionPending = computed(() => isUploading.value || isDeletingDocument.value);
@@ -128,7 +247,9 @@ async function onFileSelected(event: Event): Promise<void> {
 }
 
 function handleDocumentAction(command: string | number | object, document: Document): void {
-  if (command === "preview") {
+  if (command === "retry") {
+    void retryIngestion(document);
+  } else if (command === "preview") {
     openDocumentPreview(document);
   } else if (command === "delete") {
     void confirmDeleteDocument(document);
@@ -421,11 +542,15 @@ function statusLabel(documentStatus: Document["status"]): string {
               <div class="document-details">
                 <span>{{ formatSize(document.size_bytes) }}</span>
                 <el-tag
-                  type="success"
+                  :type="ingestionTagType(document)"
                   effect="plain"
                 >
-                  {{ statusLabel(document.status) }}
+                  {{ ingestionLabel(document) }}
                 </el-tag>
+                <span
+                  v-if="ingestionDetail(document)"
+                  class="document-ingestion-detail"
+                >{{ ingestionDetail(document) }}</span>
                 <time :datetime="document.created_at">{{ formatDate(document.created_at) }}</time>
               </div>
               <el-dropdown
@@ -457,6 +582,13 @@ function statusLabel(documentStatus: Document["status"]): string {
                       :disabled="isDocumentActionPending"
                     >
                       预览 PDF
+                    </el-dropdown-item>
+                    <el-dropdown-item
+                      v-if="ingestionEntry(document)?.status === 'failed'"
+                      command="retry"
+                      :disabled="isDocumentActionPending"
+                    >
+                      重试处理
                     </el-dropdown-item>
                     <el-dropdown-item
                       command="delete"
@@ -771,6 +903,15 @@ h1 {
   --el-tag-border-color: #c5dbd3;
   --el-tag-text-color: var(--ks-success);
   font-size: 11px;
+}
+
+.document-ingestion-detail {
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--ks-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .more-button {
