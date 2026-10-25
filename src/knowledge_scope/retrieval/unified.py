@@ -832,7 +832,7 @@ def _add_visual_candidate(
         page_start=payload.page_number,
         page_end=payload.page_number,
         source_block_ids=list(payload.source_block_ids),
-        section_path=[],
+        section_path=list(payload.section_path),
         asset_refs=[payload.asset_ref],
         modality="image",
         representation_id=first.representation_id,

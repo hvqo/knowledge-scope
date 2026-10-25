@@ -162,3 +162,113 @@ uv run --group embedding-benchmark python scripts/m7_retrieval_experiment.py --o
 uv run knowledgescope visual-index search "柱状图 四个季度 销售额 增长趋势 峰值" \
   --knowledge-base-id 00000000-0000-4000-8000-000000000007 --limit 5
 ```
+
+
+## 10. M7.1 索引替换的数据安全（代际指针）
+
+`replace_document()` 不再采用「删除旧点 → 编码 → 写入」的顺序，而是引入文档级 generation 与 activity pointer：
+
+1. `recover_document()`：读取文档级 pointer（`kind="generation_pointer"` 的独立 point），把状态归一到唯一有效代；没有 pointer 时选择 active 代或最新代，并清理其它代。
+2. 新向量先在内存中编码；编码失败时直接抛 `视觉索引编码失败，旧索引保持不变`，不写入任何点。
+3. 新点以 `active=false` 写入独立 generation（`point_id` 含 generation，不覆盖旧点）。
+4. 写入 pointer（`active_generation`），再将新代标为 active。
+5. 最后删除旧代点。
+
+失败与恢复边界：
+
+- 编码失败：旧代与 pointer 均未变化。
+- 新点部分写入失败：清理 pending 点，旧代保持 active。
+- pointer 更新后切换失败：恢复旧 pointer 与 active 标记，清理新代。
+- 切换过程中进程退出：检索过滤 `active=true` 且只接受 pointer 指向的 generation，因此不会返回新旧双份结果；重新构建时 `recover_document()` 会归一到明确的有效代。
+
+Qdrant 的多次 payload 更新不是数据库级原子事务；上述机制保证的是「检索视角下的单一有效版本 + 失败后可恢复」，而不是跨集合事务。
+
+## 11. 视觉候选配额与查询意图
+
+`visual_fusion_quota` 不再无条件保留视觉候选，`UnifiedRetrievalService` 在 rerank 后按查询意图决定配额：
+
+| 查询意图 | 判定 | 视觉配额 |
+| --- | --- | --- |
+| `explicit` | 查询包含图表/图片等视觉意图 | `visual_fusion_quota`（默认 2） |
+| `ambiguous` | 含数值/分析意图但未明确视觉指向 | `visual_quota_ambiguous`（默认 1） |
+| `plain` | 普通文本问题 | 0 |
+
+配额只做「尾部替换」：先保留 reranker 排序靠前的文本候选，仅在配额不足时用排名靠前的视觉候选替换尾部；不跨模型比较原始相似度分数。实验与单测验证：普通文本问题不注入视觉候选、显式视觉问题保留 2 条且不挤掉最相关文本证据、模糊问题最多 1 条。
+
+## 12. 候选链诊断：视觉 Recall 不等于 Agent 视觉召回
+
+独立视觉检索的 Recall@5/@10 只说明「视觉索引能否找到图片」，不能代表 Agent 实际拿到并使用了图片。诊断脚本沿真实链路记录：
+
+`visual Top-8 → Unified 最终 Top-8（含配额融合）→ AgentRetrievalTool Top-6 → Agent 实际调用 analyze_image / 最终 visual_sources`
+
+10 条人工视觉查询（4 份真实研究报告、80 张已索引图片）上的结果：
+
+| 环节 | 命中 |
+| --- | --- |
+| 视觉 Top-8 | 9/10 |
+| Unified Top-8 | 8/10 |
+| Agent Top-6 | 8/10 |
+| Agent 实际分析正确图片 | 见业务验收 |
+
+失败案例：
+
+- q02（橙色算法流程图）：视觉排名第 3，但 Unified 配额被其它视觉候选占满，未进入 Top-8。
+- q04（图像处理流程图）：独立视觉检索 Top-8 未命中（视觉模型对该图区分度不足）。
+
+## 13. CPU/GPU 性能与 RTX 3060 12GB 运行方案
+
+实测（RTX 3060 12GB、Qwen3-VL-Embedding-2B、2048 维、查询编码）：
+
+| 项目 | P50 | P95 | 备注 |
+| --- | --- | --- | --- |
+| GPU 视觉查询编码（热态） | 20.69 ms | 21.26 ms | 模型加载 1.78 s，GPU 峰值 4068.7 MB |
+| CPU 视觉查询编码（bf16） | 982.8 ms | 1125.65 ms | 无 GPU 占用 |
+| Qdrant 视觉查询 | 4.45 ms | 5.64 ms | server 端 |
+| BGE reranker（CPU fp32） | 18.63 ms | 19.28 ms | 6 候选 |
+
+12GB GPU 的资源冲突：Ollama 的 `qwen3-vl:8b` 视觉分析常驻约 7.2GB，若 API 内文本嵌入、reranker、视觉编码也全部驻留 GPU，则加载即 OOM。当前可运行方案（验收采用）：
+
+- VLM（Qwen3-VL-8B）保留在 GPU（Ollama）；
+- 文本嵌入、BGE reranker、视觉查询编码放 CPU（`KNOWLEDGE_SCOPE_EMBEDDING_DEVICE=cpu`、`RERANKER_DEVICE=cpu`、`VISUAL_DEVICE=cpu`）；
+- 视觉集合指纹与 GPU/CPU 无关（模型/精度/维度不变），向量空间契约保持；
+- GPU 采样峰值约 8.9GB，未发生 OOM；代价是视觉查询编码从 ~21ms 上升到 ~1s。
+
+CPU 视觉编码的 `meta tensor` 加载错误已在编码器中以 `low_cpu_mem_usage=device != "cpu"` 修复。
+
+## 14. M7.1 真实研究报告业务验收
+
+本机没有国别经济/统计报告 PDF；按要求使用 4 份真实研究报告作为同等级替代（报告中如实说明，不冒充国别统计资料）：
+
+| 文档 | 内容 |
+| --- | --- |
+| yolo-report.pdf | 道路检测系统技术报告（含系统架构、算法流程图） |
+| air-quality-thesis.pdf | 空气质量等级分类研究论文（含 CNN 结构、池化对比图） |
+| voiceprint-thesis.pdf | 声纹识别系统论文（含 ResNet21 架构、注意力池化流程图） |
+| e-waste-architecture.pdf | 后台管理系统架构设计文档 |
+
+隔离知识库（`/tmp/m7-accept-data`）重新解析/分块/文本索引/多模态索引/视觉索引（80 张图片，视觉构建 30.4 s，VRAM 峰值 4858 MB）；12 个业务问题（10 个视觉检索问题 + 2 个文本问题，均人工核对 gold Evidence）。
+
+| 指标 | 结果 |
+| --- | --- |
+| 视觉问题命中正确 Evidence | 8/10 |
+| 实际调用 analyze_image | 9/10 |
+| 文本问题完成 | 2/2 |
+| safety_gate=visual_unverified | 8 |
+| safety_gate=vision_unavailable | 1 |
+| safety_gate=none | 1 |
+| 端到端延迟 | mean 48.2 s / median 46.3 s / p95 79.0 s |
+| 失败案例 | q02（视觉 rank3 被配额占满未进 Agent 候选）、q09（planner 未调用视觉工具） |
+
+单次链路耗时分解（混合运行方案，CPU 文本/视觉编码 + GPU VLM，样本 1 条）：
+
+| 环节 | 实测 |
+| --- | --- |
+| 检索（dense + multimodal + visual + rerank） | 19.8 s |
+| Planner 决策 | 约 0.9 s |
+| Qwen3-VL 分析 | 12.7 s |
+| 回答生成（DeepSeek Flash） | 1.5 s |
+| 端到端 | 37.1 s |
+
+GPU 峰值显存约 8.9 GB（VLM 7.2 GB + API 进程），未发生 OOM。视觉数值仍经过 PR #65 安全门禁：视觉回答全部标记为 `visual_unverified`，未作为精确统计数据输出。
+
+结论：视觉索引在本机业务链路上可召回多数“只可视觉描述”的图片，但独立视觉 Recall 会因 Unified 配额竞争与 planner 工具选择而损失；该差距已在诊断与业务验收中记录，未用独立 Recall 冒充 Agent 最终视觉召回。

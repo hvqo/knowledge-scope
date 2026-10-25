@@ -191,12 +191,13 @@ class VisualEmbeddingEncoder:
                     image_processor=image_processor,
                     tokenizer=tokenizer,
                 )
+                device = self._settings.visual_device
                 causal = Qwen3VLForConditionalGeneration.from_pretrained(
                     source,
                     dtype=dtype,
-                    low_cpu_mem_usage=True,
+                    low_cpu_mem_usage=device != "cpu",
                 )
-                model = causal.model.to(self._settings.visual_device).eval()
+                model = causal.model.to(device).eval()
                 if len(model.language_model.layers) == 0:  # pragma: no cover - defensive
                     raise VisualEmbeddingError("visual embedding model has no language layers")
             except VisualEmbeddingError:

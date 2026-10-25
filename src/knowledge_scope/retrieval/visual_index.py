@@ -61,6 +61,7 @@ class VisualVectorPayload(BaseModel):
     document_id: UUID
     evidence_id: str = Field(pattern=r"^evidence_v1_[0-9a-f]{64}$")
     page_number: int = Field(ge=1)
+    section_path: list[str] = Field(default_factory=list)
     source_block_ids: list[str] = Field(min_length=1)
     asset_index: int = Field(ge=0)
     asset_ref: str = Field(min_length=1)

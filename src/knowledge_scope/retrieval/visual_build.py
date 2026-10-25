@@ -281,6 +281,7 @@ class VisualIndexBuilder:
                         document_id=artifact.document_id,
                         evidence_id=evidence.evidence_id,
                         page_number=max(1, page_number),
+                        section_path=list(evidence.lineage.section_path),
                         source_block_ids=list(evidence.lineage.source_block_ids),
                         asset_index=asset_index,
                         asset_ref=asset_ref,
