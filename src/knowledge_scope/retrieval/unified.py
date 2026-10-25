@@ -134,6 +134,7 @@ class UnifiedRetrievalConfig(BaseModel):
     multimodal_candidate_limit: StrictInt = Field(default=20, ge=1, le=100)
     visual_candidate_limit: StrictInt = Field(default=8, ge=1, le=100)
     visual_fusion_quota: StrictInt = Field(default=2, ge=0, le=5)
+    visual_quota_ambiguous: StrictInt = Field(default=1, ge=0, le=5)
     candidate_pool_limit: StrictInt = Field(default=48, ge=1, le=500)
     result_limit: StrictInt = Field(default=8, ge=1, le=500)
     rerank_text_max_chars: StrictInt = Field(default=6_000, ge=1, le=20_000)
@@ -377,6 +378,8 @@ class UnifiedRetrievalResult(BaseModel):
     rerank_latency_ms: float = Field(ge=0)
     total_latency_ms: float = Field(ge=0)
     degraded: bool = False
+    visual_intent: Literal["explicit", "ambiguous", "plain"] = "plain"
+    visual_quota_applied: StrictInt = Field(default=0, ge=0, le=5)
     items: list[UnifiedCandidate] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -1301,6 +1304,18 @@ class UnifiedRetrievalService:
             _to_candidate(builder, self.config.rerank_text_max_chars)
             for builder in selected_builders
         ]
+        visual_intent: Literal["explicit", "ambiguous", "plain"] = "plain"
+        visual_quota = 0
+        if self.visual_retrieval is not None:
+            from knowledge_scope.vision.safety import assess_visual_risk
+
+            risk = assess_visual_risk(query)
+            if risk.visual_intent:
+                visual_intent = "explicit"
+                visual_quota = self.config.visual_fusion_quota
+            elif risk.high_risk:
+                visual_intent = "ambiguous"
+                visual_quota = self.config.visual_quota_ambiguous
         rerank_started = perf_counter()
         if candidates:
             try:
@@ -1326,7 +1341,7 @@ class UnifiedRetrievalService:
                 key=lambda pair: (-float(pair[1]), pair[0].candidate_id),
             )
             selected_pairs = list(ranked[: self.config.result_limit])
-            if self.visual_retrieval is not None and self.config.visual_fusion_quota > 0:
+            if self.visual_retrieval is not None and visual_quota > 0:
                 visual_pairs = [
                     (candidate, score)
                     for candidate, score in ranked
@@ -1337,7 +1352,7 @@ class UnifiedRetrievalService:
                     for candidate, _score in selected_pairs
                     if any(branch.branch == "visual" for branch in candidate.branches)
                 )
-                needed = min(self.config.visual_fusion_quota, len(visual_pairs)) - selected_visual
+                needed = min(visual_quota, len(visual_pairs)) - selected_visual
                 if needed > 0:
                     selected_ids = {candidate.candidate_id for candidate, _score in selected_pairs}
                     extras = [
@@ -1377,6 +1392,8 @@ class UnifiedRetrievalService:
                 for execution in normalized_executions
             ],
             candidate_pool_size=len(candidates),
+            visual_intent=visual_intent,
+            visual_quota_applied=visual_quota,
             normalization_latency_ms=normalization_latency_ms,
             rerank_latency_ms=rerank_latency_ms,
             total_latency_ms=(perf_counter() - started) * 1_000,

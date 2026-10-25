@@ -162,6 +162,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                     multimodal_candidate_limit=settings.unified_multimodal_candidate_limit,
                     visual_candidate_limit=settings.visual_candidate_limit,
                     visual_fusion_quota=settings.visual_fusion_quota,
+                    visual_quota_ambiguous=settings.visual_quota_ambiguous,
                     candidate_pool_limit=settings.unified_candidate_pool_limit,
                     result_limit=settings.unified_result_limit,
                     rerank_text_max_chars=settings.unified_rerank_text_max_chars,

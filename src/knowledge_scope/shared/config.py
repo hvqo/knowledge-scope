@@ -112,6 +112,7 @@ class Settings(BaseSettings):
     )
     visual_candidate_limit: int = Field(default=8, ge=1, le=100)
     visual_fusion_quota: int = Field(default=2, ge=0, le=5)
+    visual_quota_ambiguous: int = Field(default=1, ge=0, le=5)
     visual_max_image_pixels: int = Field(default=12_000_000, ge=250_000)
     visual_encoder_cache_dir: str = Field(default="", max_length=2_000)
     graph_extraction_max_tokens: int = Field(default=1024, ge=1)

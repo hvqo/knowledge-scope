@@ -521,6 +521,8 @@ def test_unified_visual_branch_and_fusion_quota() -> None:
     assert [branch.branch for branch in result.branches].count("visual") == 1
     assert result.source_distribution["visual"] == 1
     assert result.items[0].evidence_id == evidence_id
+    assert result.visual_intent == "ambiguous"
+    assert result.visual_quota_applied == 1
 
 
 def test_visual_search_without_index_returns_empty_without_creating_collection(
@@ -534,3 +536,331 @@ def test_visual_search_without_index_returns_empty_without_creating_collection(
     result = store.search("quarterly chart", UUID(int=31), top_k=5)
     assert result.items == []
     assert client.get_collections().collections == []
+
+
+def _store(tmp_path: Path) -> QdrantVisualStore:
+    from qdrant_client import QdrantClient
+
+    store = QdrantVisualStore(
+        _settings(tmp_path), _FakeEncoder(), client=QdrantClient(location=":memory:")
+    )
+    store.ensure_collection()
+    return store
+
+
+def _fit(store: QdrantVisualStore, entry: VisualVectorPayload) -> VisualVectorPayload:
+    return entry.model_copy(
+        update={
+            "collection_fingerprint": store.collection_fingerprint,
+            "model_fingerprint": store.collection_fingerprint,
+        }
+    )
+
+
+def _two_generations(
+    store: QdrantVisualStore,
+) -> tuple[UUID, UUID, VisualVectorPayload, bytes, VisualVectorPayload, bytes]:
+    kb, doc = UUID(int=41), UUID(int=42)
+    old, old_bytes = _payload(
+        knowledge_base_id=kb,
+        document_id=doc,
+        evidence_id="evidence_v1_" + "4" * 64,
+        asset_bytes=b"\x01",
+    )
+    new, new_bytes = _payload(
+        knowledge_base_id=kb,
+        document_id=doc,
+        evidence_id="evidence_v1_" + "5" * 64,
+        asset_bytes=b"\x02",
+    )
+    return kb, doc, _fit(store, old), old_bytes, _fit(store, new), new_bytes
+
+
+def test_replace_document_encode_failure_keeps_previous_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+
+    from knowledge_scope.retrieval.visual_index import VisualIndexError
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    def fail_encode(_images):
+        raise RuntimeError("encoder crashed")
+
+    monkeypatch.setattr(store.encoder, "encode_images", fail_encode)
+    with pytest.raises(VisualIndexError, match="旧索引保持不变"):
+        store.replace_document(doc, [(new, new_bytes)])
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert len(result.items) == 1
+    assert result.items[0].payload.evidence_id == old.evidence_id
+
+
+def test_replace_document_upsert_failure_keeps_previous_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+
+    from knowledge_scope.retrieval.visual_index import VisualIndexError
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    client = store._get_client()
+    original_upsert = client.upsert
+
+    def fail_data_upsert(*args, **kwargs):
+        for point in kwargs.get("points", ()):
+            if (getattr(point, "payload", None) or {}).get("kind") != "generation_pointer":
+                raise RuntimeError("qdrant write failed")
+        return original_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(client, "upsert", fail_data_upsert)
+    with pytest.raises(VisualIndexError, match="旧索引保持不变"):
+        store.replace_document(doc, [(new, new_bytes)])
+    monkeypatch.undo()
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert len(result.items) == 1
+    assert result.items[0].payload.evidence_id == old.evidence_id
+
+
+def test_partial_switch_crash_hides_pending_generation_until_recovery(tmp_path: Path) -> None:
+    from qdrant_client import models
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    pending = new.model_copy(update={"generation": "a" * 32, "active": False})
+    vector, _stats = store.encoder.encode_images([new_bytes])
+    store._get_client().upsert(
+        collection_name=store.collection_name,
+        points=[
+            models.PointStruct(
+                id=str(visual_point_id(pending)),
+                vector=vector[0],
+                payload=pending.model_dump(mode="json"),
+            )
+        ],
+        wait=True,
+    )
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert len(result.items) == 1
+    assert result.items[0].payload.evidence_id == old.evidence_id
+
+    assert store.recover_document(doc) is not None
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert len(result.items) == 1
+    assert result.items[0].payload.evidence_id == old.evidence_id
+    remaining = [
+        record
+        for record in store._scroll_records(document_id=doc)
+        if isinstance(record.payload, dict) and record.payload.get("kind") != "generation_pointer"
+    ]
+    assert len(remaining) == 1
+
+
+def test_switch_failure_rolls_back_to_previous_generation(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from knowledge_scope.retrieval.visual_index import VisualIndexError
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    def fail_cleanup(document_id, *, keep):
+        raise RuntimeError("switch failed")
+
+    monkeypatch.setattr(store, "_delete_other_generations", fail_cleanup)
+    with pytest.raises(VisualIndexError, match="已回滚到旧索引"):
+        store.replace_document(doc, [(new, new_bytes)])
+    monkeypatch.undo()
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert len(result.items) == 1
+    assert result.items[0].payload.evidence_id == old.evidence_id
+
+
+def test_backend_unavailable_is_not_reported_as_missing_collection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+
+    from knowledge_scope.retrieval.visual_index import VisualIndexError
+
+    store = _store(tmp_path)
+
+    def fail_collection_info():
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr(store, "_collection_info", fail_collection_info)
+    with pytest.raises(VisualIndexError, match="视觉检索后端不可用"):
+        store.search("quarterly chart", UUID(int=41), top_k=5)
+
+
+def test_unified_visual_quota_respects_query_intent() -> None:
+    from knowledge_scope.graph.retrieval import GraphRetrievalResult
+    from knowledge_scope.retrieval.service import (
+        RetrievalResult,
+        RetrievedChunk,
+    )
+    from knowledge_scope.retrieval.sparse import SparseSearchResponse
+    from knowledge_scope.retrieval.unified import UnifiedRetrievalConfig, UnifiedRetrievalService
+
+    kb = UUID(int=51)
+    doc = UUID(int=52)
+
+    def _chunk(index: int) -> RetrievedChunk:
+        from knowledge_scope.retrieval.qdrant import (
+            QDRANT_COLLECTION_SCHEMA_VERSION,
+            ChunkVectorPayload,
+        )
+
+        payload = ChunkVectorPayload(
+            collection_schema_version=QDRANT_COLLECTION_SCHEMA_VERSION,
+            chunk_id=f"chunk-{index}",
+            document_id=doc,
+            knowledge_base_id=kb,
+            page_start=1,
+            page_end=1,
+            source_block_ids=[f"p1-b{index + 1}"],
+            section_path=["第一章"],
+            content_types=["text"],
+            asset_refs=[],
+            text=f"chunk-{index} 表格之外的正文说明",
+            chunking_config_fingerprint="a" * 64,
+            embedding_model="Qwen/Qwen3-Embedding-0.6B",
+            embedding_model_revision="revision",
+            embedding_config_fingerprint="b" * 64,
+        )
+        return RetrievedChunk(point_id=UUID(int=100 + index), score=0.5, payload=payload)
+
+    def _visual_hit(index: int):
+        payload, _bytes = _payload(
+            knowledge_base_id=kb,
+            document_id=doc,
+            evidence_id="evidence_v1_" + ("f" if index == 0 else "e") * 64,
+            asset_ref=f"doc/auto/images/figure-{index}.png",
+        )
+        from knowledge_scope.retrieval.visual_index import (
+            VisualRepresentationRef,
+            VisualSearchHit,
+        )
+
+        payload = payload.model_copy(
+            update={
+                "representations": [
+                    VisualRepresentationRef(
+                        representation_id=payload.representation_ids[0],
+                        representation_type="caption",
+                        content=payload.caption or "",
+                        reference=None,
+                    )
+                ]
+            }
+        )
+        return VisualSearchHit(rank=index + 1, score=0.9, point_id=f"v{index}", payload=payload)
+
+    class _Dense:
+        def search(self, query, *, limit, knowledge_base_id, document_id=None):
+            return RetrievalResult(
+                query, limit, "dense", "chunks", [_chunk(0), _chunk(1), _chunk(2)]
+            )
+
+    class _Sparse:
+        def search(self, query, *, knowledge_base_id, top_k, document_id=None):
+            return SparseSearchResponse(
+                query=query,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                top_k=top_k,
+                index_fingerprint="b" * 64,
+                items=[],
+            )
+
+    class _Graph:
+        def search(self, query, knowledge_base_id, *, document_id=None):
+            return GraphRetrievalResult(query=query, knowledge_base_id=knowledge_base_id, items=[])
+
+    class _Multimodal:
+        def search(self, query, *, knowledge_base_id, top_k, document_id=None):
+            from knowledge_scope.retrieval.representation_index import (
+                RepresentationRetrievalResult,
+            )
+
+            return RepresentationRetrievalResult(
+                query=query, knowledge_base_id=knowledge_base_id, items=[], raw_hits=[]
+            )
+
+    class _Reranker:
+        model_id = "BAAI/bge-reranker-v2-m3"
+
+        def score_pairs(self, _query, passages):
+            result = []
+            for passage in passages:
+                score = 0.01
+                for key, value in {"chunk-0": 0.9, "chunk-1": 0.5, "chunk-2": 0.4}.items():
+                    if key in passage:
+                        score = value
+                        break
+                result.append(score)
+            return result
+
+    class _Lookup:
+        def get_chunk_payload(self, *, knowledge_base_id, document_id, chunk_id):
+            return None
+
+    class _Visual:
+        def search(self, query, knowledge_base_id, *, top_k, document_id=None):
+            from knowledge_scope.retrieval.visual_index import VisualSearchResult
+
+            return VisualSearchResult(
+                query=query,
+                knowledge_base_id=knowledge_base_id,
+                collection_name="visual",
+                collection_fingerprint="0" * 64,
+                model_id="fake/visual-embedding",
+                embedding_dim=4,
+                items=[_visual_hit(0), _visual_hit(1)],
+                latency_ms=1.0,
+            )
+
+    def _run(query: str):
+        service = UnifiedRetrievalService(
+            _Dense(),
+            _Sparse(),
+            _Graph(),
+            _Multimodal(),
+            _Reranker(),
+            chunk_lookup=_Lookup(),
+            visual_retrieval=_Visual(),
+            config=UnifiedRetrievalConfig(
+                result_limit=3,
+                visual_fusion_quota=2,
+                visual_quota_ambiguous=1,
+            ),
+        )
+        return asyncio.run(service.search(query, kb))
+
+    plain = _run("光合作用的过程是什么")
+    assert plain.visual_intent == "plain"
+    assert plain.visual_quota_applied == 0
+    assert plain.source_distribution["visual"] == 0
+
+    explicit = _run("分析图中的柱状图，指出最低季度的具体销售额趋势")
+    assert explicit.visual_intent == "explicit"
+    assert explicit.visual_quota_applied == 2
+    assert explicit.source_distribution["visual"] == 2
+    assert explicit.items[0].chunk_id == "chunk-0"
+
+    ambiguous = _run("2024 年越南 GDP 的具体数值是多少")
+    assert ambiguous.visual_intent == "ambiguous"
+    assert ambiguous.visual_quota_applied == 1
+    assert ambiguous.source_distribution["visual"] == 1
