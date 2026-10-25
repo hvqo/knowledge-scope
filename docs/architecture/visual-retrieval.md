@@ -168,18 +168,18 @@ uv run knowledgescope visual-index search "柱状图 四个季度 销售额 增�
 
 `replace_document()` 不再采用「删除旧点 → 编码 → 写入」的顺序，而是引入文档级 generation 与 activity pointer：
 
-1. `recover_document()`：读取文档级 pointer（`kind="generation_pointer"` 的独立 point），把状态归一到唯一有效代；没有 pointer 时选择 active 代或最新代，并清理其它代。
+1. `recover_document()`：读取文档级 pointer（`kind="generation_pointer"` 的独立 point），把状态归一到唯一有效代；没有有效 pointer 时只保留 `active=true` 的已提交代，没有任何已提交代则清理全部 pending 点与 pointer，绝不把未完整写入的 pending 代激活。
 2. 新向量先在内存中编码；编码失败时直接抛 `视觉索引编码失败，旧索引保持不变`，不写入任何点。
 3. 新点以 `active=false` 写入独立 generation（`point_id` 含 generation，不覆盖旧点）。
-4. 写入 pointer（`active_generation`），再将新代标为 active。
-5. 最后删除旧代点。
+4. 写入 pointer（`active_generation`）——从这一刻起新代对检索可见，pointer 是唯一可见性权威。
+5. 将新代标为 `active=true`（仅作为恢复元数据），最后删除旧代点。
 
 失败与恢复边界：
 
 - 编码失败：旧代与 pointer 均未变化。
 - 新点部分写入失败：清理 pending 点，旧代保持 active。
 - pointer 更新后切换失败：恢复旧 pointer 与 active 标记，清理新代。
-- 切换过程中进程退出：检索过滤 `active=true` 且只接受 pointer 指向的 generation，因此不会返回新旧双份结果；重新构建时 `recover_document()` 会归一到明确的有效代。
+- 切换过程中进程退出：检索只接受 pointer 指向的 generation，因此 pointer 写入前只返回旧代、写入后只返回新代，不会返回新旧双份结果，也不会出现 pointer 与 active 之间的可见性空窗；下次构建或显式恢复时 `recover_document()` 会归一到明确有效代。
 
 Qdrant 的多次 payload 更新不是数据库级原子事务；上述机制保证的是「检索视角下的单一有效版本 + 失败后可恢复」，而不是跨集合事务。
 
@@ -272,3 +272,32 @@ CPU 视觉编码的 `meta tensor` 加载错误已在编码器中以 `low_cpu_mem
 GPU 峰值显存约 8.9 GB（VLM 7.2 GB + API 进程），未发生 OOM。视觉数值仍经过 PR #65 安全门禁：视觉回答全部标记为 `visual_unverified`，未作为精确统计数据输出。
 
 结论：视觉索引在本机业务链路上可召回多数“只可视觉描述”的图片，但独立视觉 Recall 会因 Unified 配额竞争与 planner 工具选择而损失；该差距已在诊断与业务验收中记录，未用独立 Recall 冒充 Agent 最终视觉召回。
+
+### 10.1 M7.2 一致性边界与真实验收
+
+可见性顺序（保持不变，但语义由 pointer 决定）：
+
+1. `replace_document()` 先 `recover_document()`，再在内存编码新代；编码失败不写入任何点。
+2. 新代点以 `active=false` + 独立 generation 写入（`point_id` 含 generation）。
+3. 写入文档级 pointer；检索从这一刻起只返回新代。
+4. 更新新代 `active=true` 作为恢复元数据，最后删除旧代。
+
+`search()` 不再要求 `active=true`，而是以 pointer 的 `active_generation` 为唯一可见性权威：
+
+- pointer 存在时，只接受 `payload.generation == pointer.active_generation` 的候选。
+- pointer 缺失时只接受 legacy（`generation` 为空）点；pending 代一律不可见。
+- 查询窗口按 `min(max(top_k*4, top_k+8), 256)` 起步，若过滤后不足会翻倍重查，避免休眠代/ pending 点占位导致有效候选被挤出。
+
+一致性边界：Qdrant 不提供跨操作事务；本机制提供的是「检索视角下的单一有效版本 + 崩溃后自动恢复」。pointer 写入是唯一的可见性切换点，`active` 标志只用于恢复与审计。`recover_document()` 不会把未提交的 pending 代提升为有效版本。
+
+真实 Qdrant 验收（`/tmp/m7-2-accept.py`，真实模型与真实 Qdrant 服务，单文档 47 张图）：
+
+| 场景 | 结果 |
+|---|---|
+| 初始构建 + 查询 | 47 图索引；真实查询返回 5 条同代结果 |
+| 新代部分写入、pointer 未更新（pointer 前退出） | 旧代仍可见；`recover_document()` 保留旧代并清理 pending 点（残留 0） |
+| pointer 已更新、active 尚未置位（pointer 后退出） | 立即查询返回 5 条新代结果（无空窗）；恢复后旧代点 0 |
+| 切换中并发查询（真实 rebuild 期间） | 44 次查询，0 空结果、0 异常、0 次新旧混代；p50 155.24ms |
+| 首次构建 pending 残留 | 查询 0 条；恢复返回 None 并清理全部残留点 |
+| 正常重建 + 删除文档 | 重建后 5 条命中；删除清理 48 个点（47 数据 + 1 pointer），删除后命中 0 |
+| 历史数据 | `knowledgescope_chunks_v1` 7567 / `knowledgescope_representations_v1` 79338 未变 |

@@ -554,7 +554,7 @@ class QdrantVisualStore:
         if isinstance(pointer_generation, str) and pointer_generation in generations:
             keep = pointer_generation
         else:
-            active = [
+            committed = [
                 generation
                 for generation in generations
                 if any(
@@ -564,8 +564,14 @@ class QdrantVisualStore:
                     for record in data_records
                 )
             ]
-            candidates = active or list(generations)
-            keep = max(candidates, key=lambda item: generations[item]["indexed_at"])
+            if not committed:
+                # A pending generation that was never committed is not a valid
+                # index.  Drop every residue (including the stale pointer) so a
+                # rebuild starts from a clean slate instead of advertising a
+                # partially written generation.
+                self._delete_ids([record.id for record in records])
+                return None
+            keep = max(committed, key=lambda item: generations[item]["indexed_at"])
         knowledge_base_id = next(
             (
                 record.payload["knowledge_base_id"]
@@ -781,7 +787,7 @@ class QdrantVisualStore:
 
         from qdrant_client import models
 
-        must: list[Any] = [
+        base_must: list[Any] = [
             models.FieldCondition(
                 key="knowledge_base_id",
                 match=models.MatchValue(value=str(knowledge_base_id)),
@@ -790,58 +796,62 @@ class QdrantVisualStore:
                 key="collection_fingerprint",
                 match=models.MatchValue(value=self._fingerprint),
             ),
-            models.FieldCondition(
-                key="active",
-                match=models.MatchValue(value=True),
-            ),
         ]
         if document_id is not None:
-            must.append(
+            base_must.append(
                 models.FieldCondition(
                     key="document_id",
                     match=models.MatchValue(value=str(document_id)),
                 )
             )
-        try:
-            points = (
-                self._get_client()
-                .query_points(
-                    collection_name=self._collection,
-                    query=vector,
-                    query_filter=models.Filter(must=must),
-                    limit=max(1, min(top_k * 4, 64)),
-                    with_payload=True,
-                )
-                .points
-            )
-        except Exception as error:
-            if self._is_collection_missing(error):
-                return self._empty_result(
-                    query,
-                    knowledge_base_id,
-                    collection_missing=True,
-                    started=started,
-                )
-            raise VisualIndexError("视觉检索后端不可用，请稍后重试") from error
-
         pointer_cache: dict[UUID, str | None] = {}
-        items: list[VisualSearchHit] = []
-        seen: set[tuple[str, str, int]] = set()
         expected_kb = UUID(str(knowledge_base_id))
-        for point in points:
-            if len(items) >= top_k:
-                break
-            if not isinstance(point.payload, dict):
-                continue
+        seen: set[tuple[str, str, int]] = set()
+        items: list[VisualSearchHit] = []
+        raw_limit = max(1, min(max(top_k * 4, top_k + 8), 256))
+        # The activity pointer, not the per-point ``active`` flag, decides which
+        # generation is visible.  ``active`` is recovery metadata only, so a
+        # query that races with the pointer switch never observes an empty or
+        # mixed window.  Pending points from unfinished builds are filtered
+        # out; sampling is widened when a document has several generations so
+        # stale points cannot crowd the valid ones out of the result window.
+        while True:
             try:
-                payload = VisualVectorPayload.model_validate(point.payload)
-            except Exception:
-                continue
-            if payload.knowledge_base_id != expected_kb:
-                continue
-            if not _payload_matches_contract(payload, self._fingerprint):
-                continue
-            if payload.generation:
+                points = (
+                    self._get_client()
+                    .query_points(
+                        collection_name=self._collection,
+                        query=vector,
+                        query_filter=models.Filter(must=base_must),
+                        limit=raw_limit,
+                        with_payload=True,
+                    )
+                    .points
+                )
+            except Exception as error:
+                if self._is_collection_missing(error):
+                    return self._empty_result(
+                        query,
+                        knowledge_base_id,
+                        collection_missing=True,
+                        started=started,
+                    )
+                raise VisualIndexError("视觉检索后端不可用，请稍后重试") from error
+            items = []
+            seen = set()
+            for point in points:
+                if len(items) >= top_k:
+                    break
+                if not isinstance(point.payload, dict):
+                    continue
+                try:
+                    payload = VisualVectorPayload.model_validate(point.payload)
+                except Exception:
+                    continue
+                if payload.knowledge_base_id != expected_kb:
+                    continue
+                if not _payload_matches_contract(payload, self._fingerprint):
+                    continue
                 if payload.document_id not in pointer_cache:
                     try:
                         pointer = self._read_pointer(payload.document_id)
@@ -851,24 +861,33 @@ class QdrantVisualStore:
                     pointer_cache[payload.document_id] = (
                         active_generation if isinstance(active_generation, str) else None
                     )
-                if pointer_cache[payload.document_id] != payload.generation:
+                pointer_generation = pointer_cache[payload.document_id]
+                if pointer_generation is not None:
+                    if pointer_generation != payload.generation:
+                        continue
+                elif payload.generation:
+                    # No pointer yet: only legacy points (empty generation) are
+                    # visible; pending generations require a committed pointer.
                     continue
-            key = (
-                str(payload.document_id),
-                payload.evidence_id,
-                payload.asset_index,
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(
-                VisualSearchHit(
-                    rank=len(items) + 1,
-                    score=float(point.score),
-                    point_id=str(point.id),
-                    payload=payload,
+                key = (
+                    str(payload.document_id),
+                    payload.evidence_id,
+                    payload.asset_index,
                 )
-            )
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(
+                    VisualSearchHit(
+                        rank=len(items) + 1,
+                        score=float(point.score),
+                        point_id=str(point.id),
+                        payload=payload,
+                    )
+                )
+            if len(items) >= top_k or len(points) < raw_limit or raw_limit >= 256:
+                break
+            raw_limit = min(raw_limit * 2, 256)
         return VisualSearchResult(
             query=query,
             knowledge_base_id=UUID(str(knowledge_base_id)),

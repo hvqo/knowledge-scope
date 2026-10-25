@@ -535,6 +535,7 @@ def test_visual_search_without_index_returns_empty_without_creating_collection(
     store = QdrantVisualStore(settings, _FakeEncoder(), client=client)
     result = store.search("quarterly chart", UUID(int=31), top_k=5)
     assert result.items == []
+    assert result.collection_missing is True
     assert client.get_collections().collections == []
 
 
@@ -864,3 +865,197 @@ def test_unified_visual_quota_respects_query_intent() -> None:
     assert ambiguous.visual_intent == "ambiguous"
     assert ambiguous.visual_quota_applied == 1
     assert ambiguous.source_distribution["visual"] == 1
+
+
+def test_crash_before_pointer_switch_keeps_old_generation_visible(tmp_path: Path) -> None:
+    """A staged-but-uncommitted generation must not become visible without a pointer."""
+    from qdrant_client import models
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+    pointer_before = store._read_pointer(doc)
+    assert pointer_before is not None
+
+    pending_generation = "b" * 32
+    pending = new.model_copy(update={"generation": pending_generation, "active": False})
+    vector, _stats = store.encoder.encode_images([new_bytes])
+    store._get_client().upsert(
+        collection_name=store.collection_name,
+        points=[
+            models.PointStruct(
+                id=str(visual_point_id(pending)),
+                vector=vector[0],
+                payload=pending.model_dump(mode="json"),
+            )
+        ],
+        wait=True,
+    )
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert [item.payload.evidence_id for item in result.items] == [old.evidence_id]
+    assert store._read_pointer(doc)["active_generation"] == (pointer_before["active_generation"])
+
+    recovered = store.recover_document(doc)
+    assert recovered == pointer_before["active_generation"]
+    remaining = [
+        record
+        for record in store._scroll_records(document_id=doc)
+        if isinstance(record.payload, dict) and record.payload.get("kind") != "generation_pointer"
+    ]
+    assert len(remaining) == 1
+    assert remaining[0].payload["evidence_id"] == old.evidence_id
+
+
+def test_crash_after_pointer_switch_exposes_new_generation_before_active_flag(
+    tmp_path: Path,
+) -> None:
+    """The pointer is authoritative: new generation is visible even if active flags lag."""
+    from qdrant_client import models
+
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    generation = "c" * 32
+    pending = new.model_copy(update={"generation": generation, "active": False})
+    vector, _stats = store.encoder.encode_images([new_bytes])
+    store._get_client().upsert(
+        collection_name=store.collection_name,
+        points=[
+            models.PointStruct(
+                id=str(visual_point_id(pending)),
+                vector=vector[0],
+                payload=pending.model_dump(mode="json"),
+            )
+        ],
+        wait=True,
+    )
+    store._write_pointer(doc, kb, generation, point_count=1)
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert [item.payload.evidence_id for item in result.items] == [new.evidence_id]
+
+    recovered = store.recover_document(doc)
+    assert recovered == generation
+    flags = [
+        record.payload.get("active")
+        for record in store._scroll_records(document_id=doc)
+        if isinstance(record.payload, dict) and record.payload.get("kind") != "generation_pointer"
+    ]
+    assert flags == [True]
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert [item.payload.evidence_id for item in result.items] == [new.evidence_id]
+
+
+def test_first_build_pending_residue_is_invisible_and_recovered(tmp_path: Path) -> None:
+    """Crash during the very first build: pending points must never be served."""
+    from qdrant_client import models
+
+    store = _store(tmp_path)
+    kb, doc, _old, _old_bytes, new, new_bytes = _two_generations(store)
+    pending = new.model_copy(update={"generation": "d" * 32, "active": False})
+    vector, _stats = store.encoder.encode_images([new_bytes])
+    store._get_client().upsert(
+        collection_name=store.collection_name,
+        points=[
+            models.PointStruct(
+                id=str(visual_point_id(pending)),
+                vector=vector[0],
+                payload=pending.model_dump(mode="json"),
+            )
+        ],
+        wait=True,
+    )
+
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert result.items == []
+    assert store.recover_document(doc) is None
+    remaining = store._scroll_records(document_id=doc)
+    assert remaining == []
+
+
+def test_concurrent_query_during_switch_sees_old_then_new_never_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Queries racing with the switch always see one complete generation."""
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    store.replace_document(doc, [(old, old_bytes)])
+
+    observed: list[tuple[str, str]] = []
+    original_encode = store.encoder.encode_images
+    original_set_active = store._set_generation_active
+
+    def encode_with_probe(images):
+        vectors = original_encode(images)
+        result = store.search("quarterly chart", kb, top_k=5)
+        observed.append(("before_pointer", result.items[0].payload.evidence_id))
+        return vectors
+
+    def set_active_with_probe(*args, **kwargs):
+        # The pointer already points at the new generation here, but its
+        # ``active`` flag has not been flipped yet: this is the historical
+        # visibility-gap window.
+        result = store.search("quarterly chart", kb, top_k=5)
+        observed.append(("pointer_switched_active_pending", result.items[0].payload.evidence_id))
+        original_set_active(*args, **kwargs)
+
+    monkeypatch.setattr(store.encoder, "encode_images", encode_with_probe)
+    monkeypatch.setattr(store, "_set_generation_active", set_active_with_probe)
+    store.replace_document(doc, [(new, new_bytes)])
+    monkeypatch.undo()
+
+    # recover_document() re-normalizes the still-valid old generation first;
+    # every observation during the whole switch must be a complete generation.
+    assert [label for label, _evidence in observed] == [
+        "pointer_switched_active_pending",
+        "before_pointer",
+        "pointer_switched_active_pending",
+    ]
+    assert observed[0][1] == old.evidence_id
+    assert observed[1][1] == old.evidence_id
+    assert observed[2][1] == new.evidence_id
+    result = store.search("quarterly chart", kb, top_k=5)
+    assert [item.payload.evidence_id for item in result.items] == [new.evidence_id]
+
+
+def test_search_ignores_dormant_generations_when_window_is_oversampled(
+    tmp_path: Path,
+) -> None:
+    """Dormant older generations must not crowd a valid new generation out of the window."""
+    store = _store(tmp_path)
+    kb, doc, old, old_bytes, new, new_bytes = _two_generations(store)
+    dormant_entries = []
+    for index in range(8):
+        entry, asset = _payload(
+            knowledge_base_id=kb,
+            document_id=doc,
+            evidence_id="evidence_v1_" + f"{index + 6:064x}",
+            asset_bytes=bytes([index + 1]),
+        )
+        dormant_entries.append((_fit(store, entry), asset))
+    store.replace_document(doc, [*dormant_entries, (old, old_bytes)])
+
+    # Simulate a switch where the new generation has a single point but the
+    # dormant generation has many points with equally high scores.
+    generation = "e" * 32
+    pending = new.model_copy(update={"generation": generation, "active": False})
+    vector, _stats = store.encoder.encode_images([new_bytes])
+    from qdrant_client import models
+
+    store._get_client().upsert(
+        collection_name=store.collection_name,
+        points=[
+            models.PointStruct(
+                id=str(visual_point_id(pending)),
+                vector=vector[0],
+                payload=pending.model_dump(mode="json"),
+            )
+        ],
+        wait=True,
+    )
+    store._write_pointer(doc, kb, generation, point_count=1)
+
+    result = store.search("quarterly chart", kb, top_k=2)
+    assert [item.payload.evidence_id for item in result.items] == [new.evidence_id]
