@@ -9,12 +9,26 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
+from knowledge_scope.evidence.lifecycle import write_evidence_artifact
+from knowledge_scope.evidence.service import build_evidence_document
 from knowledge_scope.ingestion.models import IngestionTask
-from knowledge_scope.ingestion.steps import IngestionStepError
+from knowledge_scope.ingestion.steps import (
+    BUNDLE_SCHEMA_VERSION,
+    INGESTION_PIPELINE_VERSION,
+    IngestionStepError,
+    IngestionSteps,
+)
 from knowledge_scope.ingestion.store import IngestionStoreError, IngestionTaskStore
 from knowledge_scope.ingestion.worker import IngestionError, IngestionWorker
+from knowledge_scope.parsing.models import CanonicalDocument, ImageBlock, Page, TextBlock
 from knowledge_scope.shared.config import Settings
-from test_document_assets import create_knowledge_base, upload_document
+from test_document_assets import (
+    JPEG_BYTES,
+    PNG_BYTES,
+    create_knowledge_base,
+    upload_document,
+    write_parsing_artifact,
+)
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -27,6 +41,30 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         environment="test",
         data_dir=tmp_path,
         **values,  # type: ignore[arg-type]
+    )
+
+
+IMAGE_ASSET_A = "two-images/auto/images/a.png"
+IMAGE_ASSET_B = "two-images/auto/images/b.jpg"
+
+
+def _canonical_with_images(document_id: UUID, image_count: int) -> CanonicalDocument:
+    blocks: list[TextBlock | ImageBlock] = [
+        TextBlock(block_id="p1-b1", reading_order=0, text="页面正文内容")
+    ]
+    assets = [IMAGE_ASSET_A, IMAGE_ASSET_B]
+    for index in range(image_count):
+        blocks.append(
+            ImageBlock(
+                block_id=f"p1-b{index + 2}",
+                reading_order=index + 1,
+                asset_ref=assets[index],
+                caption=f"示意图 {index + 1}",
+            )
+        )
+    return CanonicalDocument(
+        document_id=document_id,
+        pages=[Page(page_number=1, blocks=blocks)],
     )
 
 
@@ -349,6 +387,47 @@ def test_worker_recovery_requeues_interrupted_then_exhausts(tmp_path: Path) -> N
     assert final is not None
     assert final.status == "failed"
     assert final.error_code == "ingestion_interrupted"
+
+
+def test_real_visual_step_keeps_evidence_image_count_when_disabled(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, visual_embedding_enabled=False)
+    store = IngestionTaskStore(settings)
+    steps = IngestionSteps(settings, store)
+    document_id = uuid4()
+    knowledge_base_id = uuid4()
+    canonical = _canonical_with_images(document_id, 2)
+    write_parsing_artifact(
+        tmp_path,
+        document_id,
+        canonical=canonical,
+        assets={IMAGE_ASSET_A: PNG_BYTES, IMAGE_ASSET_B: JPEG_BYTES},
+    )
+    artifact = build_evidence_document(canonical, knowledge_base_id)
+    write_evidence_artifact(tmp_path, artifact)
+    store.write_bundle(
+        document_id,
+        {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "pipeline_version": INGESTION_PIPELINE_VERSION,
+            "evidence": artifact.model_dump(mode="json"),
+            "image_count": 2,
+        },
+    )
+    task = IngestionTask(document_id=document_id, knowledge_base_id=knowledge_base_id)
+    details = steps.visual_index(task)
+    assert details["skipped"] is True
+    assert details["reason"] == "visual_embedding_disabled"
+    assert details["evidence_image_count"] == 2
+    bundle = store.read_bundle(document_id)
+    assert bundle is not None
+    assert bundle["visual_evidence_count"] == 2
+
+    worker = IngestionWorker(settings, store, steps=steps)
+    worker._apply_details(task, "multimodal_index", {"evidence_image_count": 2})
+    worker._apply_details(task, "visual_index", details)
+    assert task.image_count == 2
+    assert task.visual_status == "not_enabled"
+    assert task.indexes["visual"] is False
 
 
 def test_worker_enqueue_is_idempotent(tmp_path: Path) -> None:

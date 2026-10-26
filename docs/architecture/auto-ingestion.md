@@ -129,7 +129,9 @@
 
 各阶段只写各自明确的计数键；worker 不再从通用 `images` 键推导 `image_count`。前端仍展示“N 张图片”（原始图片数），并补充视觉索引覆盖情况，例如“视觉索引就绪（2/2 张）”“视觉索引缺失（已索引 1/2 张）”“策略跳过 1 张”。
 
-### 10.2 视觉就绪判定
+#- 视觉 Embedding 禁用时，`visual_index` 仍返回 Evidence 原始图片数（`evidence_image_count`，来自 bundle 的 `image_count`），不会用 0 覆盖该数量；有图 PDF 显示 `image_count>0`、`visual_status=not_enabled`、`indexes.visual=false`，无图 PDF 显示 `skipped_no_images`。
+
+## 10.2 视觉就绪判定
 
 `visual_index` 阶段对 `ingestion_visual_mode` 做一致性校验：
 

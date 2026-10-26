@@ -312,6 +312,19 @@ class IngestionSteps:
             "evidence_image_count": image_count,
         }
 
+    def _evidence_image_count(self, bundle: dict[str, Any]) -> int:
+        raw_count = bundle.get("image_count")
+        if isinstance(raw_count, int) and raw_count >= 0:
+            return raw_count
+        raw_evidence = bundle.get("evidence")
+        if not isinstance(raw_evidence, dict):
+            return 0
+        try:
+            artifact = MultimodalEvidenceDocument.model_validate(raw_evidence)
+        except ValidationError:
+            return 0
+        return sum(1 for item in artifact.evidence if item.modality == "image")
+
     def _read_bundle_or_empty(self, task: IngestionTask) -> dict[str, Any]:
         bundle = self.task_store.read_bundle(task.document_id)
         if bundle is None:
@@ -323,13 +336,15 @@ class IngestionSteps:
     def visual_index(self, task: IngestionTask) -> dict[str, object]:
         if not self.settings.visual_embedding_enabled:
             bundle = self._read_bundle_or_empty(task)
+            evidence_image_count = self._evidence_image_count(bundle)
             bundle["visual_entries"] = []
             bundle["visual_skipped_reason"] = "visual_embedding_disabled"
+            bundle["visual_evidence_count"] = evidence_image_count
             _write_bundle(self.task_store, task.document_id, bundle)
             return {
                 "skipped": True,
                 "reason": "visual_embedding_disabled",
-                "evidence_image_count": 0,
+                "evidence_image_count": evidence_image_count,
             }
         started = perf_counter()
         bundle = _read_bundle(self.task_store, task.document_id)
@@ -341,6 +356,7 @@ class IngestionSteps:
         if image_count == 0:
             bundle["visual_entries"] = []
             bundle["visual_skipped_reason"] = "no_images"
+            bundle["visual_evidence_count"] = 0
             _write_bundle(self.task_store, task.document_id, bundle)
             return {"skipped": True, "reason": "no_images", "evidence_image_count": 0}
         encoder: VisualEmbeddingEncoder | None = None
