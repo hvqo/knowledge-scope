@@ -212,6 +212,7 @@ def main() -> None:
     parser.add_argument("--gold", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--only", default="", help="Comma separated question ids")
     args = parser.parse_args()
 
     fixtures = json.loads(Path(args.fixtures).read_text())
@@ -222,7 +223,10 @@ def main() -> None:
     history: list[dict[str, str]] = []
     previous_group: str | None = None
     results: list[dict[str, Any]] = []
+    selected = {item.strip() for item in args.only.split(",") if item.strip()}
     for question in gold["questions"]:
+        if selected and question["id"] not in selected:
+            continue
         group = question.get("followup_group")
         request_history = history if group and group == previous_group else None
         result = _stream_events(

@@ -100,11 +100,18 @@ class EvidenceRequirement:
     needs_table: bool = False
     comparison: bool = False
     range_years: tuple[int, int] | None = None
+    relation_terms: tuple[str, ...] = ()
+    scanned_table: bool = False
 
     @property
     def empty(self) -> bool:
         return not (
-            self.objects or self.years or self.metrics or self.needs_image or self.needs_table
+            self.objects
+            or self.years
+            or self.metrics
+            or self.needs_image
+            or self.needs_table
+            or self.relation_terms
         )
 
 
@@ -115,6 +122,7 @@ class EvidenceAssessment:
     satisfied: bool
     missing: tuple[str, ...] = ()
     object_coverage: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    relation_coverage: dict[str, tuple[int, ...]] = field(default_factory=dict)
     year_coverage: tuple[int, ...] = ()
     metric_coverage: tuple[str, ...] = ()
     image_indices: tuple[int, ...] = ()
@@ -129,6 +137,7 @@ class EvidenceAssessment:
             "images": len(self.image_indices),
             "tables": len(self.table_indices),
             "missing": len(self.missing),
+            "relations": len(self.relation_coverage),
         }
 
 
@@ -177,8 +186,15 @@ def extract_requirement(query: str) -> EvidenceRequirement:
             metrics.append(normalized)
     needs_image = bool(_IMAGE_SOFT.search(text))
     needs_image_feature = needs_image and bool(_IMAGE_FEATURE.search(text))
+    scanned_table = bool(
+        re.search(r"图片\s*表格|图像\s*表格|扫描\s*(?:表|件|图片)|扫描表|图片中", text)
+    )
+    if scanned_table:
+        needs_image = True
+        needs_image_feature = True
     needs_table = bool(_TABLE_INTENT.search(text)) or bool(metrics and len(objects) >= 2)
     comparison = len(objects) >= 2 or (bool(_COMPARISON.search(text)) and len(objects) >= 2)
+    relation_terms = _relation_terms(text) if "关系" in text else ()
     return EvidenceRequirement(
         query=query,
         objects=objects,
@@ -189,7 +205,47 @@ def extract_requirement(query: str) -> EvidenceRequirement:
         needs_table=needs_table,
         comparison=comparison,
         range_years=range_years,
+        relation_terms=relation_terms,
+        scanned_table=scanned_table,
     )
+
+
+_RELATION_STOPWORDS = (
+    "请解释",
+    "解释",
+    "请说明",
+    "说明",
+    "统计关系",
+    "关系",
+    "之间",
+    "的",
+    "请分析",
+    "分析",
+    "请说明",
+)
+
+_RELATION_SPLIT = re.compile(r"与|和|、|,|，|对比|比较|相比|差异|关系")
+
+
+def _relation_terms(text: str) -> tuple[str, ...]:
+    """Extract the concepts whose relationship the question asks about."""
+    raw = text.strip()
+    for word in _RELATION_STOPWORDS:
+        raw = raw.replace(word, " ")
+    lowered = raw.lower()
+    for token in _METRICS:
+        lowered = lowered.replace(token, " ")
+    terms: list[str] = []
+    for part in _RELATION_SPLIT.split(lowered):
+        cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", part)
+        cleaned = cleaned.strip("的了和与及统计指标数据")
+        if len(cleaned) < 2 or cleaned in {"gdp"}:
+            continue
+        if any(country in cleaned for country in _COUNTRIES):
+            continue
+        if cleaned not in terms:
+            terms.append(cleaned)
+    return tuple(terms[:2])
 
 
 def _object_covered(candidate: AgentCandidate, object_name: str) -> bool:
@@ -198,17 +254,32 @@ def _object_covered(candidate: AgentCandidate, object_name: str) -> bool:
     return object_name in _candidate_text(candidate)
 
 
+def _candidate_bound(candidate: AgentCandidate, requirement: EvidenceRequirement) -> bool:
+    """Return True when one candidate binds the object to the year and metric."""
+    text = _candidate_text(candidate)
+    object_hits = [obj for obj in requirement.objects if _object_covered(candidate, obj)]
+    year_hits = [year for year in requirement.years if str(year) in text]
+    metric_hits = [metric for metric in requirement.metrics if _metric_in_text(metric, text)]
+    if requirement.relation_terms and not any(term in text for term in requirement.relation_terms):
+        return False
+    if object_hits:
+        if requirement.years and not year_hits:
+            return False
+        return not (requirement.metrics and not metric_hits)
+    if requirement.years and requirement.metrics:
+        return bool(year_hits and metric_hits)
+    return False
+
+
 def assess_evidence(
     requirement: EvidenceRequirement,
     candidates: Sequence[AgentCandidate],
 ) -> EvidenceAssessment:
-    """Check whether candidates plausibly cover every required evidence item."""
+    """Check whether candidates bind every required item inside one evidence item."""
     if requirement.empty:
         return EvidenceAssessment(satisfied=True)
     if not candidates:
         return EvidenceAssessment(satisfied=False, missing=("没有任何候选证据",))
-    object_coverage: dict[str, tuple[int, ...]] = {}
-    missing: list[str] = []
     image_indices = tuple(
         candidate.index
         for candidate in candidates
@@ -219,43 +290,110 @@ def assess_evidence(
         for candidate in candidates
         if candidate.modality == "table" and candidate.tool_capable
     )
+    object_coverage: dict[str, tuple[int, ...]] = {}
+    missing: list[str] = []
     for object_name in requirement.objects:
         indices = tuple(
-            candidate.index for candidate in candidates if _object_covered(candidate, object_name)
+            candidate.index
+            for candidate in candidates
+            if _object_covered(candidate, object_name) and _candidate_bound(candidate, requirement)
         )
         object_coverage[object_name] = indices
         if not indices:
-            missing.append(f"{object_name} 缺少对应证据")
-    candidate_text = " ".join(_candidate_text(candidate) for candidate in candidates)
-    year_coverage = tuple(year for year in requirement.years if str(year) in candidate_text)
-    if requirement.range_years is not None and requirement.comparison:
-        required_years = (requirement.range_years[0], requirement.range_years[1])
-        if any(str(year) not in candidate_text for year in required_years):
-            missing.append("年份范围覆盖不足：需要 " + "、".join(str(y) for y in required_years))
-    elif requirement.years and not year_coverage:
-        missing.append("时间信息缺失：" + "、".join(str(y) for y in requirement.years))
+            bound_hint = ""
+            if requirement.years or requirement.metrics:
+                parts = []
+                if requirement.years:
+                    parts.append("年份 " + "/".join(str(year) for year in requirement.years))
+                if requirement.metrics:
+                    parts.append("指标 " + "/".join(requirement.metrics))
+                bound_hint = "，且未能绑定" + "、".join(parts)
+            missing.append(f"{object_name} 缺少对应证据{bound_hint}")
+    relation_coverage: dict[str, tuple[int, ...]] = {}
+    for term in requirement.relation_terms:
+        indices = tuple(
+            candidate.index
+            for candidate in candidates
+            if _normalize(term) in _candidate_text(candidate)
+        )
+        relation_coverage[term] = indices
+        if not indices:
+            missing.append(f"关系对象「{term}」缺少直接证据")
+    bound_candidates = [
+        candidate for candidate in candidates if _candidate_bound(candidate, requirement)
+    ]
+    year_coverage = tuple(
+        year
+        for year in requirement.years
+        if any(str(year) in _candidate_text(candidate) for candidate in bound_candidates)
+    )
+    if requirement.years and any(
+        str(year) not in " ".join(_candidate_text(candidate) for candidate in candidates)
+        for year in requirement.years
+    ):
+        missing.append("时间信息缺失：" + "、".join(str(year) for year in requirement.years))
     metric_coverage = tuple(
-        metric for metric in requirement.metrics if _metric_in_text(metric, candidate_text)
+        metric
+        for metric in requirement.metrics
+        if any(
+            _metric_in_text(metric, _candidate_text(candidate)) for candidate in bound_candidates
+        )
     )
     for metric in requirement.metrics:
         if metric not in metric_coverage:
             missing.append(f"指标 {metric} 缺少对应证据")
     if requirement.needs_image_feature and not image_indices:
         missing.append("缺少可分析的图片证据")
+    image_driven = bool(
+        requirement.needs_image_feature
+        and image_indices
+        and not requirement.objects
+        and not requirement.needs_table
+    )
+    if image_driven or (requirement.scanned_table and image_indices):
+        # A question that asks to read a visual feature (or a scanned table)
+        # can be answered by the image itself; metric/year words do not need
+        # to appear in the text around the image.
+        missing = [
+            item
+            for item in missing
+            if "指标" not in item and "年份" not in item and "图片" not in item
+        ]
+    if requirement.needs_image_feature and image_indices and not requirement.scanned_table:
+        if requirement.relation_terms:
+            if not any(
+                any(
+                    _normalize(term) in _candidate_text(candidate)
+                    for term in requirement.relation_terms
+                )
+                for candidate in candidates
+                if candidate.modality == "image"
+            ):
+                missing.append("缺少与关系对象直接相关的图片证据")
+        elif requirement.objects and not any(
+            _object_covered(candidate, object_name)
+            for candidate in candidates
+            if candidate.modality == "image"
+            for object_name in requirement.objects
+        ):
+            missing.append("缺少与对象绑定的图片证据")
     if requirement.needs_table and not table_indices and requirement.comparison:
         missing.append("跨对象比较缺少结构化表格证据")
     if (
         requirement.comparison
         and len(requirement.objects) >= 2
-        and not any(len(indices) >= 2 for indices in object_coverage.values())
         and sum(1 for indices in object_coverage.values() if indices) < 2
+        and not any(len(indices) >= 2 for indices in object_coverage.values())
     ):
         missing.append("比较对象未在同一或互补证据中同时覆盖")
     conflicts = _unit_conflicts(candidates) if requirement.comparison else ()
+    if conflicts:
+        missing.extend(conflicts)
     return EvidenceAssessment(
         satisfied=not missing,
         missing=tuple(dict.fromkeys(missing)),
         object_coverage=object_coverage,
+        relation_coverage=relation_coverage,
         year_coverage=year_coverage,
         metric_coverage=metric_coverage,
         image_indices=image_indices,
@@ -314,6 +452,9 @@ def build_supplementary_query(
     for metric in requirement.metrics:
         if metric not in assessment.metric_coverage:
             parts.append(metric)
+    for term in requirement.relation_terms:
+        if not assessment.relation_coverage.get(term):
+            parts.append(term)
     if requirement.needs_image_feature:
         parts.append("图表 趋势")
     if requirement.needs_table and not assessment.table_indices:

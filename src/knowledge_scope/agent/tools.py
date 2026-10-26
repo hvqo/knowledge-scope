@@ -197,6 +197,7 @@ class AgentRetrievalTool:
             columns: tuple[str, ...] = ()
             row_labels: tuple[str, ...] = ()
             issue: str | None = None
+            asset_index: int | None = None
             if item.candidate_kind == "evidence" and item.modality == "table":
                 document = documents.get(item.document_id)
                 evidence_id = item.evidence_id
@@ -214,6 +215,19 @@ class AgentRetrievalTool:
                         issue = error.code
                     except Exception:
                         issue = "table_unavailable"
+            if item.candidate_kind == "evidence" and item.modality == "image":
+                document = documents.get(item.document_id)
+                evidence_id = item.evidence_id
+                if document is not None and evidence_id is not None:
+                    try:
+                        snapshot = get_evidence(self._settings, document, evidence_id)
+                        asset_refs = list(snapshot.evidence.lineage.asset_refs)
+                        for ref in citation.asset_refs:
+                            if ref in asset_refs:
+                                asset_index = asset_refs.index(ref)
+                                break
+                    except AssetAccessError:
+                        asset_index = None
             candidates.append(
                 AgentCandidate(
                     index=index,
@@ -223,6 +237,7 @@ class AgentRetrievalTool:
                     table_columns=columns,
                     table_rows=row_labels,
                     table_issue=issue,
+                    asset_index=asset_index,
                 )
             )
             if remaining <= 0:

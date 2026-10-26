@@ -583,20 +583,49 @@ class AgentChatService:
                     round_number=tool_calls + 1,
                     history_context=history_context or None,
                 )
-                if plan.action == "final" and not auto_visual and tool_calls == 0:
-                    forced = _auto_visual_plan(request.query, candidates, risk)
-                    if forced is not None:
-                        plan = forced
-                        auto_visual = True
+                if not auto_visual and tool_calls < self._settings.agent_max_tool_calls:
+                    wants_visual = requirement is not None and requirement.needs_image_feature
+                    if plan.action == "final" and (tool_calls == 0 or wants_visual):
+                        forced = _auto_visual_plan(
+                            request.query,
+                            candidates,
+                            risk,
+                            requirement=requirement,
+                            tool_calls=tool_calls,
+                        )
+                        if forced is not None:
+                            plan = forced
+                            auto_visual = True
                 if plan.action == "final":
                     break
                 tool = plan.tool
                 if tool is None:  # validator guarantees a tool; defensive only
                     break
+                if (
+                    tool == "analyze_table"
+                    and not auto_visual
+                    and requirement is not None
+                    and requirement.needs_image_feature
+                    and (requirement.comparison or _image_table_intent(request.query))
+                    and tool_calls > 0
+                ):
+                    forced = _auto_visual_plan(
+                        request.query,
+                        candidates,
+                        risk,
+                        requirement=requirement,
+                        tool_calls=tool_calls,
+                    )
+                    if forced is not None:
+                        plan = forced
+                        tool = plan.tool
+                        auto_visual = True
                 key = (
                     tool,
                     plan.evidence_index,
-                    plan.asset_index if tool == "analyze_image" else 0,
+                    _effective_asset_index(candidates[plan.evidence_index - 1], plan)
+                    if tool == "analyze_image"
+                    else 0,
                     plan.vision_task if tool == "analyze_image" else None,
                     plan.question if tool == "analyze_image" else None,
                     plan.operation,
@@ -649,7 +678,7 @@ class AgentChatService:
                         _VisualExecution(
                             candidate=candidate,
                             outcome=outcome,
-                            asset_index=plan.asset_index,
+                            asset_index=_effective_asset_index(candidate, plan),
                             vision_task=plan.vision_task or "describe_image",
                         )
                     )
@@ -1285,9 +1314,11 @@ def _trace_parameters(
     if plan.operation is not None:
         parameters["operation"] = plan.operation
     if plan.tool == "analyze_image":
-        # Record the exact asset the planner asked for, including index 0.
+        # Record the exact asset the executor will read, including index 0.
         parameters["vision_task"] = plan.vision_task or "describe_image"
-        parameters["asset_index"] = plan.asset_index
+        parameters["asset_index"] = (
+            _effective_asset_index(candidate, plan) if candidate is not None else plan.asset_index
+        )
     elif plan.vision_task is not None:
         parameters["vision_task"] = plan.vision_task
     if plan.question is not None:
@@ -1571,10 +1602,15 @@ _CHART_FEATURE = re.compile(
 )
 
 
-def _candidate_identity(candidate: AgentCandidate) -> tuple[str, str, str]:
+def _candidate_identity(candidate: AgentCandidate) -> tuple[str, str, str, int]:
     citation = candidate.citation
     identity = str(citation.chunk_id or candidate.evidence_id or candidate.marker)
-    return (str(citation.document_id), identity, str(citation.page_start))
+    return (
+        str(citation.document_id),
+        identity,
+        str(citation.page_start),
+        candidate.asset_index if candidate.asset_index is not None else -1,
+    )
 
 
 def _renumber_candidates(
@@ -1593,6 +1629,7 @@ def _renumber_candidates(
                 table_columns=candidate.table_columns,
                 table_rows=candidate.table_rows,
                 table_issue=candidate.table_issue,
+                asset_index=candidate.asset_index,
             )
         )
     return tuple(renumbered)
@@ -1665,19 +1702,45 @@ def _evidence_answer_notes(
     return tuple(notes)
 
 
+def _effective_asset_index(candidate: AgentCandidate, plan: AgentPlan) -> int:
+    if candidate.asset_index is not None:
+        return candidate.asset_index
+    return plan.asset_index
+
+
+def _image_table_intent(query: str) -> bool:
+    return bool(re.search(r"图片\s*表格|图像\s*表格|扫描\s*(?:表|件|图片)|扫描表", query))
+
+
 def _auto_visual_plan(
     query: str,
     candidates: tuple[AgentCandidate, ...],
     risk: object,
+    *,
+    requirement: EvidenceRequirement | None = None,
+    tool_calls: int = 0,
 ) -> AgentPlan | None:
-    """Call the image tool when a visual-feature question needs native pixels.
+    """Call the image tool when a question needs native pixels.
 
     The planner still owns table and text decisions. This guard only prevents a
     "final" plan from skipping the image analysis that the question requires.
     """
-    if not visual_feature_requested(query):
+    image_table = _image_table_intent(query)
+    comparison_after_tools = bool(
+        requirement is not None
+        and requirement.needs_image_feature
+        and requirement.comparison
+        and len(requirement.objects) >= 2
+    )
+    planned_after_tools = bool((image_table or comparison_after_tools) and tool_calls > 0)
+    wants_feature = visual_feature_requested(query) or image_table or planned_after_tools
+    if not wants_feature:
         return None
-    if not bool(getattr(risk, "visual_intent", False)):
+    if (
+        not image_table
+        and not planned_after_tools
+        and (tool_calls > 0 or not bool(getattr(risk, "visual_intent", False)))
+    ):
         return None
     image_candidates = [
         candidate
@@ -1687,13 +1750,25 @@ def _auto_visual_plan(
     if not image_candidates:
         return None
     target = image_candidates[0]
-    vision_task = "analyze_chart" if _CHART_FEATURE.search(query) else "describe_image"
+    extracted_table = bool(
+        requirement is not None
+        and (
+            requirement.needs_table
+            or re.search(r"图片\s*表格|图像\s*表格|扫描\s*(?:表|件|图片)", query)
+        )
+    )
+    if extracted_table:
+        vision_task = "extract_table"
+    elif _CHART_FEATURE.search(query):
+        vision_task = "analyze_chart"
+    else:
+        vision_task = "describe_image"
     return AgentPlan(
         action="call_tool",
         reason="问题要求原生视觉特征分析，应用层自动调用图片分析",
         tool="analyze_image",
         evidence_index=target.index,
-        asset_index=0,
+        asset_index=target.asset_index if target.asset_index is not None else 0,
         vision_task=vision_task,
         question=query[:500],
     )

@@ -172,3 +172,110 @@ def test_empty_requirement_is_always_satisfied() -> None:
     assessment = assess_evidence(requirement, ())
     assert assessment.satisfied is True
     assert assessment.missing == ()
+
+
+def _binding_candidate(
+    index: int,
+    *,
+    modality: str = "table",
+    snippet: str,
+    columns: tuple[str, ...] = (),
+    rows: tuple[str, ...] = (),
+    asset_index: int | None = None,
+) -> AgentCandidate:
+    from knowledge_scope.rag.schemas import RAGCitation
+
+    evidence_id = "evidence_v1_" + "a" * 64
+    citation = RAGCitation(
+        marker=f"C{index}",
+        document_id=UUID(int=index),
+        knowledge_base_id=UUID(int=99),
+        candidate_kind="evidence",
+        evidence_id=evidence_id,
+        modality=modality,  # type: ignore[arg-type]
+        representation_ids=["representation_v1_" + "b" * 64],
+        asset_refs=["auto/images/sample.jpg"] if modality == "image" else [],
+        page_start=1,
+        page_end=1,
+        source_block_ids=[f"p1-b{index}"],
+        section_path=["章节"],
+        snippet=snippet,
+        snippet_kind="representation",
+        final_rank=index,
+        final_reranker_score=0.5,
+    )
+    return AgentCandidate(
+        index=index,
+        marker=f"C{index}",
+        citation=citation,
+        table_columns=columns,
+        table_rows=rows,
+        asset_index=asset_index,
+    )
+
+
+def test_assess_requires_object_year_metric_binding() -> None:
+    requirement = extract_requirement("请给出 2025 年越南 GDP 的数值。")
+    candidates = (
+        _binding_candidate(
+            1, snippet="越南 2023 年 GDP 为 4300 亿美元", columns=("国家", "2023年GDP")
+        ),
+        _binding_candidate(2, snippet="2024 年 GDP 数据表", columns=("2024年GDP",)),
+    )
+    assessment = assess_evidence(requirement, candidates)
+    assert assessment.satisfied is False
+    assert any("越南" in item for item in assessment.missing)
+
+
+def test_assess_rejects_unrelated_relation_terms() -> None:
+    requirement = extract_requirement("请解释量子纠缠与 GDP 的统计关系。")
+    candidates = (
+        _binding_candidate(1, snippet="越南 GDP 2024 年预测值", columns=("国家", "GDP", "2024年")),
+    )
+    assessment = assess_evidence(requirement, candidates)
+    assert assessment.satisfied is False
+    assert any("量子纠缠" in item for item in assessment.missing)
+
+
+def test_assess_unit_conflict_is_not_satisfied() -> None:
+    requirement = extract_requirement("请比较越南和泰国 2024 年 GDP。")
+    candidates = (
+        _binding_candidate(
+            1,
+            snippet="表 1 各国 GDP 单位：亿美元",
+            columns=("国家", "2024年GDP"),
+            rows=("越南", "泰国"),
+        ),
+        _binding_candidate(
+            2,
+            snippet="表 2 各国 GDP 单位：万元",
+            columns=("国家", "2024年GDP"),
+            rows=("越南", "泰国"),
+        ),
+    )
+    assessment = assess_evidence(requirement, candidates)
+    assert assessment.satisfied is False
+    assert assessment.conflicts
+
+
+def test_assess_binds_image_candidate_to_compared_objects() -> None:
+    requirement = extract_requirement(
+        "请比较越南和泰国 2024 年 GDP，并分析展示两国 GDP 对比的柱状图。"
+    )
+    candidates = (
+        _binding_candidate(
+            1,
+            snippet="表 1 各国 GDP",
+            columns=("国家", "2024年GDP"),
+            rows=("越南", "泰国"),
+        ),
+        _binding_candidate(
+            2,
+            modality="image",
+            snippet="图 1 季度销售额柱状图",
+            asset_index=0,
+        ),
+    )
+    assessment = assess_evidence(requirement, candidates)
+    assert assessment.satisfied is False
+    assert any("图片" in item for item in assessment.missing)

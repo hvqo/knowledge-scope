@@ -168,42 +168,54 @@ M9 在原有「检索 → 规划 → 工具 → 回答」链路上增加一层**
    证据不足时回答必须明确缺少什么，不拼凑；精确数值仍需确定性表格工具，视觉结论仍走 M6 安全门禁与
    可信台账/报告插入边界。
 
-### M9 真实验收（10–15 题）
+### M9.1 正确性修复与真实验收（10–15 题）
 
-数据集：`docs/benchmarks/m9-acceptance-gold.json`（15 题，覆盖视觉趋势/峰值、q09 类图片问题、表格增长、
-跨文档对比、合计、多值查询、缺失视觉证据、缺失年份、架构图/流程图、follow-up、负面问题、扫描表对比）。
-环境：真实 DeepSeek Flash（规划/回答）+ 本地 Ollama `qwen3-vl:8b`；隔离 KB 与 `/tmp/m9-data`；
-CPU 文本嵌入/reranker/视觉编码 + GPU VLM。Baseline 关闭 M9 机制
-（`AGENT_EVIDENCE_SUFFICIENCY_ENABLED=false`、`AGENT_VISUAL_TOOL_AUTO=false`、
-`VISUAL_QUOTA_EXPLICIT=2`、`AGENT_MAX_ROUNDS=2`）。
+初次 M9 交付暴露了三类正确性问题：充分性判断按全局词面覆盖，可能把分别提到对象/年份/指标的无关候选拼成"充分"；
+同一 Evidence 下的不同图片缺少 `asset_index`，合并/去重时会混淆；扫描表问题只调用结构化表格工具，未读取图片。
+M9.1 在原分支做了最小修复：
 
-| 指标 | Baseline | M9 |
+1. **逐条 Evidence 绑定**：`assess_evidence()` 要求同一候选同时绑定对象 + 年份 + 指标（无对象时要求年份 + 指标共存）；
+   "X 与 Y 的关系"会抽取 `relation_terms` 并要求直接证据；单位/统计口径冲突强制 `satisfied=false`；
+   图片型问题需要图片证据绑定对象/关系，扫描表（`scanned_table`）允许图片自身满足视觉需求，但仍要求结构化表格绑定对象。
+2. **多图 asset_index**：`AgentCandidate.asset_index` 通过 `get_evidence().lineage.asset_refs` 解析真实素材下标；
+   `_candidate_identity` / `_merge_candidates` / `_renumber_candidates` / `_VisualExecution` / `_trace_parameters`
+   全部保留 `asset_index`，`_effective_asset_index()` 用于工具调用与 trace。
+3. **Planner 视觉兜底**：Planner 返回 `final` 但问题明确要求原生视觉特征时，应用层自动调用 `analyze_image`；
+   比较/扫描表场景允许在表格工具之后补一次视觉调用；重复表格计划分支强制转视觉；仍受 `agent_max_tool_calls`
+   与 auto_visual 一次约束，不改变 Planner 对文本/表格的自主判断。
+
+真实验收（同一 15 题原始 gold；真实 DeepSeek Flash + Ollama `qwen3-vl:8b`；隔离 KB；
+CPU 文本嵌入/reranker/视觉编码 + GPU VLM；Baseline 关闭 M9 机制）：
+
+| 指标 | Baseline（关闭 M9） | M9.1（修复后） |
 | --- | --- | --- |
-| Tool Selection | 14/15 (93.3%) | 14/15 (93.3%) |
+| Tool Selection | 14/15 (93.3%) | 15/15 (100%) |
+| Evidence Sufficiency | 8/9 (88.9%) | 9/9 (100%) |
+| Supplementary Trigger | 6/9 (66.7%) | 9/9 (100%) |
 | Key Evidence Coverage | 15/15 (100%) | 15/15 (100%) |
-| Answer Accuracy | 15/15 (100%) | 15/15 (100%) |
-| Visual Tool Call | 14/15 (93.3%) | 14/15 (93.3%) |
-| E2E Success | 11/15 (73.3%) | 11/15 (73.3%) |
-| Evidence Sufficiency | 8/9 (88.9%) | 6/9 (66.7%) |
-| Supplementary Trigger | 6/9 (66.7%) | 14/15 (93.3%) |
-| 延迟 mean/median/p95 | 34.4s / 25.3s / 71.3s | 40.1s / 29.8s / 93.3s |
+| Visual Tool Call | 14/15 (93.3%) | 15/15 (100%) |
+| Answer Accuracy | 15/15 (100%) | 14/15 (93.3%) |
+| E2E Success | 11/15 (73.3%) | 14/15 (93.3%) |
+| 延迟 mean / median / p95 | 34.4s / 25.3s / 71.3s | 42.4s / 37.3s / 81.1s |
 
-- 补检索按设计触发：3 个「明确不足」问题（缺视觉证据、缺 2025 年数据、无关负面问题）在 M9 全部触发，
-  Baseline 全部未触发；但补检索后的词面评估把无关候选误判为“充分”，导致 Evidence Sufficiency
-  M9 反而低于 Baseline（6/9 vs 8/9）。这是本阶段最重要的已知局限：评估器只做词面覆盖，无法判断
-  语义支持，补检索也不保证高级证据质量。
-- E2E 同为 11/15：失败为 q08/q09/q13（评估充分性误判，回答本身正确地说明不足/无法回答）与 q14
-  （应调用 `analyze_image` 提取扫描表，但只调用了表格工具；跨语言表头 `国家` vs `Country` 导致
-  表格对比工具报「未找到列」，回答最终靠证据原文比对给出正确结论）。
-- 成功 trace 示例：q01 视觉趋势/峰值（analyze_image → Q4 峰值）、q02 视觉细节、q10 YOLO 架构图
-  （analyze_image，回答模块与数据流）；失败 trace 示例：q09 缺失年份（补检索后误判充分）、
-  q14 扫描表跨语言表头（工具失败但回答人工比对正确）。
-- 运行脚本：`scripts/m9_acceptance.py --fixtures <fixtures.json> --gold docs/benchmarks/m9-acceptance-gold.json --output result.json`；
-  需要本地 API（见上）与 fixtures（临时 KB 的 doc id 映射）。
+- 补检索：实际触发 3 次（q08/q09/q13，全部为 gold 期望不足的问题）；应补触发率 3/3，不应补避免率 12/12；
+  初次充分性判断 15/15 与 gold 期望一致，补检索后最终充分性 9/9（q08/q09/q13 保持"证据不足"并明确说明缺什么）。
+- 多图/扫描表：q14 同时调用 `analyze_image` + `analyze_table`，`visual_sources` 1 条、`asset_index` 与 Evidence 对齐；
+  q08 先补检索再自动视觉 + 表格，最终引用两份文档。
+- q03 失败为安全门禁：问题包含"峰值/精确数值"触发视觉数字门禁，回答被替换为确定性安全文本（英文趋势 + 数值打码），
+  gold 中文短语不匹配；人工核对回答语义正确，属于安全策略与评测口径差异，不是新回归。
+- 工具层仍有真实失败：q14 表格对比因中英文表头（国家 vs Country）报"未找到列"；q08/q14 的
+  `analyze_image(extract_table)` 未提取出表格列；最终回答基于原始证据文本对照，已明确说明未使用工具计算。
+- 默认开关决策：M9.1 在 E2E、充分性、补检索触发、视觉调用上均有明确收益且未发现重要回归（延迟增加约 8 秒，
+  主要来自补检索与自动视觉），因此保持 `agent_evidence_sufficiency_enabled=true`、`agent_visual_tool_auto=true`；
+  仍保留配置开关用于回退。
+- 运行脚本：`scripts/m9_acceptance.py --fixtures <fixtures.json> --gold docs/benchmarks/m9-acceptance-gold.json --output result.json`
+  （支持 `--only q01,q02` 单题复验）。
 
 ### 已知局限
 
-- 证据充分性判断为词面规则：对「提到但语义不相关」「补检索带回弱相关候选」「跨语言表头」等情况会误判；
-  下阶段可引入更强的证据校验（但不应只靠 LLM 自评）。
+- 证据充分性为逐条词面绑定，仍不能证明语义支撑：对「提到但语义不相关」「跨语言表头」「VLM 提取失败」等情况会误判；
+  M9.1 通过保守缺失提示缓解，但未引入语义模型自评（避免以模型自评代替事实校验）。
+- 自动视觉/补检索增加延迟（mean 34.4s → 42.4s）；扫描表跨语言表头仍是结构化表格工具的真实限制，回答只能降级为原文对照。
 - 本数据集没有真实国别统计报告，使用真实技术/研究报告与已知表格 PDF 做技术验证，不构成国别业务结论。
 - 视觉配额 / 自动视觉调用只覆盖“是否有图片与意图”的启发式判断，不保证视觉证据与问题语义匹配。
