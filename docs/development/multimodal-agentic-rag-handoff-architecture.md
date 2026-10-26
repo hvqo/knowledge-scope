@@ -186,6 +186,7 @@ sequenceDiagram
 - 每个工具结果携带 `fact_status`：`source_verified`（确定性表格计算）/`visual_estimate`/`unverified`/`not_available`；`agent_tool_trace[].fact_status` 可审计。
 - 高风险视觉数值问题由 `vision/safety.py` 的风险分类器识别；命中时**不启动 LLM 流式生成**，直接输出确定性安全回答，避免先泄漏再警告。
 - 混合工具场景：表格结果不会把视觉数字“洗白”为已验证；回答会明确说明视觉估计需人工核对。
+- 确定性表格结果的展示由应用层按 `TableAnalysisResult.columns[].unit` 逐列渲染：绝对变化沿用输入单位，相对变化固定 `%`，百分数指标的绝对变化使用“百分点”；模型不参与单位与数值改写（M10 后补丁 PR #70）。
 - 回答完成后写入 `<data_dir>/agent-trust/<trust_id>.json`（HMAC-SHA256 签名，绑定 conversation/KB/content/citations）。报告插入只接受验证通过的服务端记录；客户端伪造 assistant 消息插入返回 409。
 
 ## 9. 报告创作与可信来源插入
