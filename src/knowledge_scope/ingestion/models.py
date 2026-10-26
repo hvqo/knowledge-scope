@@ -14,6 +14,14 @@ INGESTION_PIPELINE_VERSION = "m8-auto-ingest-v1"
 
 IngestionStatus = Literal["queued", "running", "completed", "failed"]
 StageStatus = Literal["pending", "running", "completed", "failed", "skipped", "interrupted"]
+VisualIndexStatus = Literal[
+    "pending",
+    "not_enabled",
+    "skipped_no_images",
+    "assets_missing",
+    "ready",
+    "failed",
+]
 
 STAGE_ORDER: tuple[str, ...] = (
     "parse",
@@ -84,6 +92,7 @@ class IngestionTask(BaseModel):
             "graph": False,
         }
     )
+    visual_status: VisualIndexStatus = "pending"
     source_sha256: str | None = None
     chunk_count: int = 0
     image_count: int = 0
@@ -121,6 +130,7 @@ class IngestionStatusEntry(BaseModel):
     image_count: int
     attempts: int
     updated_at: str
+    visual_status: VisualIndexStatus
 
 
 def status_entry(task: IngestionTask) -> IngestionStatusEntry:
@@ -140,6 +150,7 @@ def status_entry(task: IngestionTask) -> IngestionStatusEntry:
         image_count=task.image_count,
         attempts=task.attempts,
         updated_at=task.updated_at,
+        visual_status=task.visual_status,
     )
 
 
@@ -153,5 +164,6 @@ __all__ = [
     "IngestionStatusEntry",
     "IngestionTask",
     "StageStatus",
+    "VisualIndexStatus",
     "status_entry",
 ]

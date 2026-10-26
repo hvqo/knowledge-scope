@@ -11,7 +11,6 @@ that document remain untouched.
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -347,6 +346,14 @@ class IngestionSteps:
                 artifact,
                 mode=mode,
             )
+            # Encode inside the visual stage so stage timings reflect the real
+            # work and the publish phase is a pure write phase.
+            if entries:
+                vectors, encode_stats = encoder.encode_images(
+                    [image_bytes for _payload, image_bytes in entries]
+                )
+            else:
+                vectors, encode_stats = [], None
         except Exception as error:
             raise IngestionStepError(
                 "visual_embedding_failed", f"图片视觉向量生成失败：{error}"
@@ -360,9 +367,9 @@ class IngestionSteps:
         bundle["visual_entries"] = [
             {
                 "payload": payload.model_dump(mode="json"),
-                "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+                "vector": [float(value) for value in vector],
             }
-            for payload, image_bytes in entries
+            for (payload, _image_bytes), vector in zip(entries, vectors, strict=True)
         ]
         bundle["visual_skipped_reason"] = None
         _write_bundle(self.task_store, task.document_id, bundle)
@@ -373,8 +380,12 @@ class IngestionSteps:
             "images_missing": stats.images_missing,
             "images_invalid": stats.images_invalid,
             "skipped_by_policy": stats.images_skipped_by_policy,
-            "embedding_latency_ms": stats.embedding_latency_ms,
-            "vram_peak_mb": stats.vram_peak_mb,
+            "embedded_images": len(vectors),
+            "embedding_latency_ms": (encode_stats.latency_ms if encode_stats is not None else 0.0),
+            "vram_peak_mb": max(
+                float(stats.vram_peak_mb or 0.0),
+                float(encode_stats.vram_peak_mb or 0.0) if encode_stats is not None else 0.0,
+            ),
         }
 
     # -- publish --------------------------------------------------------
@@ -389,10 +400,10 @@ class IngestionSteps:
                 bundle.get("representation_points") or []
             )
             sparse_records = _sparse_records_from_json(bundle.get("sparse_records") or [])
-            visual_entries = [
+            visual_vectors = [
                 (
                     VisualVectorPayload.model_validate(item["payload"]),
-                    base64.b64decode(item["image_base64"]),
+                    [float(value) for value in item["vector"]],
                 )
                 for item in (bundle.get("visual_entries") or [])
             ]
@@ -439,10 +450,10 @@ class IngestionSteps:
             if self.settings.visual_embedding_enabled:
                 visual_encoder = VisualEmbeddingEncoder(self.settings)
                 visual_store = QdrantVisualStore(self.settings, visual_encoder)
-                builder = VisualIndexBuilder(self.settings, visual_store)
-                published_visual = builder.publish_document(
+                visual_store.ensure_collection()
+                published_visual = visual_store.replace_document_vectors(
                     task.document_id,
-                    visual_entries,
+                    visual_vectors,
                 )
                 published.append("visual")
             else:
@@ -511,7 +522,6 @@ class IngestionSteps:
         bundle = _read_bundle(self.task_store, task.document_id)
         expected_chunks = int(bundle.get("chunk_count") or 0)
         expected_representations = len(bundle.get("representation_points") or [])
-        expected_visual = len(bundle.get("visual_entries") or [])
         chunked = self._load_chunked(task.document_id)
         if len(chunked.chunks) != expected_chunks:
             raise IngestionStepError("verify_chunks", "分块数量与索引计划不一致")
@@ -537,22 +547,41 @@ class IngestionSteps:
                 task.document_id,
                 knowledge_base_id=task.knowledge_base_id,
             )
-            first_text = chunked.chunks[0].text or "PDF 文档"
-            sparse_hits = sparse_store.search(
-                first_text[:60],
-                knowledge_base_id=task.knowledge_base_id,
-                top_k=1,
-                document_id=task.document_id,
+            sparse_count = sparse_store.document_chunk_count(
+                task.knowledge_base_id,
+                task.document_id,
             )
-            sparse_ok = (
-                not sparse_hits.items or sparse_hits.items[0].document_id == task.document_id
-            )
+            # The BM25 store is the source of truth; a natural-language probe
+            # is not allowed to turn a missing document index into success.
+            sparse_ok = sparse_count == expected_chunks
+            expected_visual_keys = {
+                (
+                    str(item["payload"].get("evidence_id")),
+                    int(item["payload"].get("asset_index", 0)),
+                )
+                for item in (bundle.get("visual_entries") or [])
+            }
+            visual_count = 0
+            visual_keys: set[tuple[str, int]] = set()
             if self.settings.visual_embedding_enabled:
                 visual_encoder = VisualEmbeddingEncoder(self.settings)
                 visual_store = QdrantVisualStore(self.settings, visual_encoder)
-                visual_count = len(visual_store._scroll_ids(document_id=task.document_id))
-            else:
-                visual_count = 0
+                try:
+                    active_records = visual_store.document_active_records(
+                        document_id=task.document_id
+                    )
+                except Exception as error:
+                    if QdrantVisualStore._is_collection_missing(error):
+                        active_records = []
+                    else:
+                        raise IngestionStepError(
+                            "verify_visual_index", "视觉索引校验失败：无法读取视觉集合"
+                        ) from error
+                visual_count = len(active_records)
+                visual_keys = {
+                    (str(item.get("evidence_id")), int(item.get("asset_index", 0)))
+                    for item in active_records
+                }
         finally:
             if visual_store is not None:
                 visual_store.close()
@@ -564,16 +593,33 @@ class IngestionSteps:
         if representation_count != expected_representations:
             raise IngestionStepError("verify_multimodal_index", "多模态索引数量校验失败")
         if not sparse_ok:
-            raise IngestionStepError("verify_bm25", "BM25 索引校验失败")
-        if expected_visual and visual_count == 0:
-            raise IngestionStepError("verify_visual_index", "视觉索引缺少向量")
-        if not expected_visual and visual_count != 0:
-            raise IngestionStepError("verify_visual_index", "视觉索引应清空但仍有残留")
+            raise IngestionStepError(
+                "verify_bm25",
+                f"BM25 索引校验失败：期望 {expected_chunks} 个分块，实际 {sparse_count}",
+            )
+        if (
+            self.settings.visual_embedding_enabled
+            and task.image_count > 0
+            and not expected_visual_keys
+        ):
+            raise IngestionStepError(
+                "verify_visual_index",
+                "视觉索引校验失败：文档包含图片但没有可用的视觉向量",
+            )
+        if visual_keys != expected_visual_keys or visual_count != len(expected_visual_keys):
+            raise IngestionStepError(
+                "verify_visual_index",
+                f"视觉索引校验失败：期望 {len(expected_visual_keys)} 张活动图片，"
+                f"实际 {visual_count} 个活动代向量",
+            )
         return {
             "text_points": dense_count,
             "representation_points": representation_count,
             "sparse_ok": sparse_ok,
+            "sparse_records": sparse_count,
             "visual_points": visual_count,
+            "visual_expected": len(expected_visual_keys),
+            "visual_ready": expected_visual_keys == visual_keys,
         }
 
     # -- graph (explicitly out of scope) --------------------------------

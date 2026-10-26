@@ -136,8 +136,18 @@ class IngestionWorker:
             if existing is not None:
                 if existing.status in ("queued", "running"):
                     return existing
-                if existing.status == "completed" and not force:
-                    return existing
+                if existing.status == "completed":
+                    if not force:
+                        return existing
+                    # Completed documents are immutable through this pipeline.
+                    # Re-parsing invalidates chunks/evidence and a failed publish
+                    # could destroy the previous valid index, so forced rebuilds
+                    # are intentionally rejected until safe rollback exists.
+                    raise IngestionError(
+                        "rebuild_not_supported",
+                        "该文档已完成自动入库；当前版本不支持强制重建，"
+                        "以避免破坏既有索引。如需重建，请删除文档后重新上传。",
+                    )
                 if existing.status == "failed" and not force:
                     return existing
             if existing is None:
@@ -160,6 +170,12 @@ class IngestionWorker:
                 raise IngestionError("ingestion_task_not_found", "没有找到该文档的入库任务")
             if task.status in ("queued", "running"):
                 return task
+            if task.status == "completed":
+                raise IngestionError(
+                    "rebuild_not_supported",
+                    "该文档已完成自动入库；当前版本不支持重新处理，"
+                    "以避免破坏既有索引。如需重建，请删除文档后重新上传。",
+                )
             self._prepare_task(task, reset_attempts=True)
             self.task_store.write(task)
             self._enqueue_document(document_id)
@@ -186,6 +202,7 @@ class IngestionWorker:
         task.error_message = None
         task.chunk_count = 0
         task.image_count = 0
+        task.visual_status = "pending"
         task.timings_ms = {}
         task.vram_peak_mb = None
         task.indexes = {
@@ -315,6 +332,8 @@ class IngestionWorker:
             task.error_message = message[:2_000]
             task.finished_at = _utc_now()
             task.timings_ms[name] = round(elapsed, 3)
+            if name == "visual_index":
+                task.visual_status = "failed"
             task.updated_at = _utc_now()
             self.task_store.write(task)
             logger.warning(
@@ -350,6 +369,16 @@ class IngestionWorker:
         vram = details.get("vram_peak_mb")
         if isinstance(vram, (int, float)) and float(vram) > (task.vram_peak_mb or 0):
             task.vram_peak_mb = float(vram)
+        if name == "visual_index":
+            if bool(details.get("skipped")):
+                reason = str(details.get("reason") or "")
+                task.visual_status = (
+                    "not_enabled" if reason == "visual_embedding_disabled" else "skipped_no_images"
+                )
+            else:
+                task.visual_status = (
+                    "assets_missing" if int(details.get("images") or 0) == 0 else "pending"
+                )
         if name == "publish":
             published = details.get("published_indexes")
             if isinstance(published, list):
@@ -365,9 +394,21 @@ class IngestionWorker:
                 task.indexes["text"] = True
             if int(details.get("representation_points") or 0) > 0:  # type: ignore[arg-type]
                 task.indexes["multimodal"] = True
-            visual_points = int(details.get("visual_points") or 0)  # type: ignore[arg-type]
             if self.settings.visual_embedding_enabled:
-                task.indexes["visual"] = visual_points > 0 or task.image_count == 0
+                visual_expected = int(details.get("visual_expected") or 0)
+                task.indexes["visual"] = bool(details.get("visual_ready")) or (
+                    visual_expected == 0 and task.image_count == 0
+                )
+                if task.image_count == 0:
+                    task.visual_status = "skipped_no_images"
+                elif task.indexes["visual"]:
+                    task.visual_status = "ready"
+                else:
+                    task.visual_status = "assets_missing"
+            elif task.image_count == 0:
+                task.visual_status = "skipped_no_images"
+            else:
+                task.visual_status = "not_enabled"
         if name == "graph":
             task.indexes["graph"] = bool(details.get("ready", False))
 

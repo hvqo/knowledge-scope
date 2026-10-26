@@ -93,6 +93,13 @@ export interface IngestionTask {
     visual: boolean;
     graph: boolean;
   };
+  visual_status?:
+    | "pending"
+    | "not_enabled"
+    | "skipped_no_images"
+    | "assets_missing"
+    | "ready"
+    | "failed";
   source_sha256: string | null;
   chunk_count: number;
   image_count: number;
@@ -118,6 +125,13 @@ export interface IngestionStatusEntry {
   image_count: number;
   attempts: number;
   updated_at: string;
+  visual_status?:
+    | "pending"
+    | "not_enabled"
+    | "skipped_no_images"
+    | "assets_missing"
+    | "ready"
+    | "failed";
 }
 
 export interface IngestionStatusResponse {

@@ -181,7 +181,15 @@ function ingestionDetail(document: Document): string | null {
   }
   if (entry.status === "completed") {
     const chunks = entry.chunk_count > 0 ? `${entry.chunk_count} 个文本块` : "无文本块";
-    return `${chunks} · ${entry.image_count} 张图片`;
+    const parts = [chunks, `${entry.image_count} 张图片`];
+    if (entry.visual_status === "not_enabled") {
+      parts.push("视觉索引未启用");
+    } else if (entry.visual_status === "assets_missing") {
+      parts.push("视觉索引缺失");
+    } else if (entry.visual_status === "ready") {
+      parts.push("视觉索引就绪");
+    }
+    return parts.join(" · ");
   }
   return null;
 }

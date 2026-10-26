@@ -65,8 +65,13 @@ async def retry_ingestion(
     try:
         task = worker.retry(document_id)
     except IngestionError as error:
+        code = getattr(error, "code", "")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=(
+                status.HTTP_409_CONFLICT
+                if code == "rebuild_not_supported"
+                else status.HTTP_404_NOT_FOUND
+            ),
             detail=str(error),
         ) from None
     if task.knowledge_base_id != knowledge_base_id:

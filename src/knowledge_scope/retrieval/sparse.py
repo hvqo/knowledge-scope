@@ -961,6 +961,21 @@ class SparseIndexStore:
             self._commit_generation_locked(retained, allow_empty=True)
             return removed
 
+    def document_chunk_count(self, knowledge_base_id: UUID, document_id: UUID) -> int:
+        """Count active generation records for one KB/document."""
+
+        active = self._active_generation()
+        if active is None:
+            return 0
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) FROM sparse_chunks
+            WHERE generation_id = ? AND knowledge_base_id = ? AND document_id = ?
+            """,
+            (active.generation_id, str(knowledge_base_id), str(document_id)),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def readiness(self) -> SparseReadiness:
         """Inspect the active local index without creating or rebuilding it."""
 

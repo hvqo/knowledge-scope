@@ -10,7 +10,7 @@ from httpx import AsyncClient
 
 from knowledge_scope.ingestion.models import IngestionTask
 from knowledge_scope.ingestion.store import IngestionStoreError, IngestionTaskStore
-from knowledge_scope.ingestion.worker import IngestionWorker
+from knowledge_scope.ingestion.worker import IngestionError, IngestionWorker
 from knowledge_scope.shared.config import Settings
 from test_document_assets import create_knowledge_base, upload_document
 
@@ -71,13 +71,17 @@ class FakeSteps:
         )
 
     def verify(self, task: IngestionTask) -> dict[str, object]:
+        visual_ready = self.images >= 0
         return self._stage(
             "verify",
             {
                 "text_points": 3,
                 "representation_points": 4,
                 "sparse_ok": True,
+                "sparse_records": 3,
                 "visual_points": self.images,
+                "visual_expected": self.images,
+                "visual_ready": visual_ready,
             },
         )
 
@@ -126,6 +130,7 @@ def test_worker_full_pipeline_completes(tmp_path: Path) -> None:
     assert finished.indexes["multimodal"] is True
     assert finished.indexes["visual"] is True
     assert finished.indexes["graph"] is False
+    assert finished.visual_status == "ready"
     assert finished.error_stage is None
     assert steps.calls == [
         "parse",
@@ -171,6 +176,7 @@ def test_worker_no_image_document_still_completes(tmp_path: Path) -> None:
     assert finished.status == "completed"
     assert finished.image_count == 0
     assert finished.indexes["visual"] is True
+    assert finished.visual_status == "skipped_no_images"
 
 
 def test_worker_recovery_requeues_interrupted_then_exhausts(tmp_path: Path) -> None:
@@ -214,8 +220,12 @@ def test_worker_enqueue_is_idempotent(tmp_path: Path) -> None:
     worker._run_document(document_id)
     completed = worker.enqueue(document_id, kb)
     assert completed.status == "completed"
-    forced = worker.enqueue(document_id, kb, force=True)
-    assert forced.status == "queued"
+    with pytest.raises(IngestionError) as rebuild_error:
+        worker.enqueue(document_id, kb, force=True)
+    assert rebuild_error.value.code == "rebuild_not_supported"
+    with pytest.raises(IngestionError) as retry_error:
+        worker.retry(document_id)
+    assert retry_error.value.code == "rebuild_not_supported"
 
 
 class FakeApiWorker:
@@ -291,3 +301,32 @@ async def test_ingestion_api_disabled_without_worker(client: AsyncClient) -> Non
     )
     assert response.status_code == 503
     assert response.json()["detail"] == "自动入库任务未启用"
+
+
+def test_sparse_document_chunk_count_tracks_active_generation(tmp_path):
+    from uuid import uuid4
+
+    from knowledge_scope.retrieval.sparse import SparseChunkRecord, SparseIndexStore
+
+    store = SparseIndexStore(tmp_path / "sparse.sqlite3")
+    kb_id = uuid4()
+    document_id = uuid4()
+    record = SparseChunkRecord(
+        knowledge_base_id=kb_id,
+        chunking_config_fingerprint="a" * 64,
+        chunk_id="chunk-1",
+        document_id=document_id,
+        ordinal=0,
+        text="hello",
+        page_start=1,
+        page_end=1,
+        source_block_ids=["p1-b1"],
+        section_path=[],
+        content_types=["text"],
+        asset_refs=[],
+    )
+    store.replace_document(kb_id, document_id, [record])
+    assert store.document_chunk_count(kb_id, document_id) == 1
+    assert store.delete_document(kb_id, document_id) == 1
+    assert store.document_chunk_count(kb_id, document_id) == 0
+    store.close()

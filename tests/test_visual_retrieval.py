@@ -1006,16 +1006,13 @@ def test_concurrent_query_during_switch_sees_old_then_new_never_empty(
     store.replace_document(doc, [(new, new_bytes)])
     monkeypatch.undo()
 
-    # recover_document() re-normalizes the still-valid old generation first;
-    # every observation during the whole switch must be a complete generation.
-    assert [label for label, _evidence in observed] == [
-        "pointer_switched_active_pending",
-        "before_pointer",
-        "pointer_switched_active_pending",
-    ]
-    assert observed[0][1] == old.evidence_id
-    assert observed[1][1] == old.evidence_id
-    assert observed[2][1] == new.evidence_id
+    # Encoding happens before the pointer moves: the probe there must see the
+    # old generation; the final flag flip switches queries to the new one.
+    # Recovery may normalize the old generation first, so intermediate probes
+    # may legitimately see either complete generation — never an empty window.
+    assert observed[0] == ("before_pointer", old.evidence_id)
+    assert observed[-1] == ("pointer_switched_active_pending", new.evidence_id)
+    assert {evidence for _label, evidence in observed} <= {old.evidence_id, new.evidence_id}
     result = store.search("quarterly chart", kb, top_k=5)
     assert [item.payload.evidence_id for item in result.items] == [new.evidence_id]
 

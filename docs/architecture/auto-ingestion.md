@@ -54,6 +54,7 @@
 
 - `publish` 之前所有重结果都写入 bundle，不触碰正式索引；因此解析、分块、Embedding 失败不会污染现有检索结果。
 - `publish` 顺序为：Evidence 文件 → dense → representation → sparse → visual。
+- 视觉向量在 `visual_index` 阶段完成真实编码并写入 bundle；`publish` 只写入预生成的向量（`replace_document_vectors`），不重复加载视觉模型、不重新编码。
 - 任一步发布失败时执行补偿：删除本次已写入的 dense / representation / sparse / visual 点，并删除刚写入的 Evidence 文件，然后抛出 `publish_failed`。
 - 补偿是尽力而为的回滚，不宣称跨存储（文件系统 + Qdrant）的原子事务；若补偿本身失败，任务进入 `failed` 并保留错误信息，需要人工重试。已知边界记录在文档末尾。
 
@@ -63,6 +64,7 @@
 - 同一文档不会并发处理：任务仍在 `queued` / `running` 时重复 enqueue 直接返回现有任务。
 - 已完成阶段根据 bundle 数据判定可复用，重试时从失败阶段继续，不重复执行已成功阶段。
 - `POST /knowledge-bases/{kb}/documents/{doc}/ingestion/retry` 会重置 attempts 并重新入队；只允许对失败/未完成任务使用。
+- 已完成文档在 M8.1 中禁止重新处理：`retry` / `force=True` 返回 `rebuild_not_supported`（API 409），因为重新解析会使旧 Chunk/Evidence 失效，而当前没有安全回滚旧索引的能力；如需重建，先删除文档再重新上传。已存在文档的旧检索结果、Evidence 与原始素材不受该拒绝逻辑影响。
 - 未完成（未通过 verify）的索引不会被视为就绪：只有任务 `completed` 且四类索引标志为真（视觉索引在无图或未启用时可为空）时，前端才显示“已就绪”。
 
 ## 6. API
@@ -70,7 +72,7 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/v1/knowledge-bases/{kb}/documents/{doc}/ingestion` | 单个文档任务状态（任务 + 摘要），无任务时返回 null |
-| POST | `/api/v1/knowledge-bases/{kb}/documents/{doc}/ingestion/retry` | 重试失败/中断任务，返回 202 |
+| POST | `/api/v1/knowledge-bases/{kb}/documents/{doc}/ingestion/retry` | 重试失败/中断任务，返回 202；已完成文档返回 409 `rebuild_not_supported` |
 | GET | `/api/v1/knowledge-bases/{kb}/ingestion` | 该知识库全部任务状态（摘要列表） |
 
 前端知识库详情页对文档列表轮询单文档状态：处理中每 1.5 秒刷新，完成后停止；失败时展示失败阶段摘要并提供“重试处理”入口。
@@ -93,3 +95,20 @@
 4. **视觉索引依赖独立模型**：视觉编码模型不可用或未启用时，`visual_index` 阶段标记 skipped，文档仍可完成文本/多模态索引；但前端会显示视觉索引未就绪。
 5. **图谱不自动构建**：`graph` 阶段始终 skipped，图谱检索需要另行构建。
 6. **MinerU 仍为外部运行时**：需要 `KNOWLEDGE_SCOPE_MINERU_COMMAND` 指向可用的 MinerU 可执行文件。
+7. **已完成文档不支持重建**：删除文档前不能安全地重新解析并回滚旧索引；M8.1 选择 fail-closed（409），避免“重新入库失败清空旧索引”。
+8. **阶段耗时边界**：视觉编码在 CPU 上包含模型加载与编码（实测 2 张图约 75s/首次；后续复用进程内模型更快），`publish` 仍受 BM25 全量代提交与 Qdrant 写入影响（实测约 66s）；本轮不再做增量 BM25 或编码缓存优化。
+9. **严格校验**：BM25 以 `SparseIndexStore` 活动代记录数为准，不再用自然语言查询命中作为成功依据；视觉索引必须匹配当前活动代的实际 `(evidence_id, asset_index)` 集合，仅剩 pointer 时验证失败。
+
+## 9. M8.1 真实验收记录（2026-10-26）
+
+环境：`data_dir=/tmp/m8r-data`，CPU 文本/视觉编码 + GPU Ollama `qwen3-vl:8b`，真实 DeepSeek Flash 问答；隔离 KB `f42808db-7b35-4b24-aa95-79267d940bb4`。
+
+| 场景 | 结果 |
+| --- | --- |
+| 新 PDF 首次完整入库（含图片/统计图） | completed，chunks 1，images 2，text/bm25/multimodal/visual 全就绪，visual_status=ready |
+| 无图 PDF 完整入库 | completed，images 0，text/bm25/multimodal true，visual_status=skipped_no_images |
+| 已完成文档重新处理 | `POST retry` 409 `rebuild_not_supported`；重复上传同一 PDF 409；retrieval/search 命中 chunk 与 Evidence 素材保持不变 |
+| BM25 索引缺失 | 删除活动代后 `verify` 返回 `verify_bm25`；恢复 bundle 记录后再次验证通过 |
+| 视觉索引仅 pointer、缺图片点 | 删除数据点后 `verify` 返回 `verify_visual_index`；从真实素材重建 2 张图后验证通过 |
+| 解析失败后手动重试 | 首次 `parse_failed`（parsing 目录不可写）；恢复权限后 `POST retry` 202 → completed，四类索引就绪 |
+| Agent 图文问答 + 原图预览 | agent+unified 查询返回 analyze_image 工具轨迹、visual 分支 success、visual_sources 1；Evidence detail 200、asset 200（image/jpeg，33452 bytes） |
