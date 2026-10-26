@@ -10,6 +10,7 @@ from typing import Any
 
 from knowledge_scope.shared.config import Settings
 
+from .model_loading import MODEL_LOADING_LOCK
 from .qdrant import QDRANT_VECTOR_DIMENSION, QWEN_EMBEDDING_MODEL_ID
 
 EMBEDDING_POOLING_STRATEGY = "SentenceTransformer model-native pooling"
@@ -77,14 +78,18 @@ class QwenEmbeddingModel:
         model_kwargs: dict[str, Any] = {}
         if device.startswith("cuda"):
             model_kwargs["dtype"] = dtype
+        else:
+            # transformers >=4.57 may lazily build weights on the meta device.
+            model_kwargs["low_cpu_mem_usage"] = False
         try:
-            self._model = SentenceTransformer(
-                self.model_id,
-                device=device,
-                revision=self.model_revision,
-                model_kwargs=model_kwargs,
-                processor_kwargs={"padding_side": "left"},
-            )
+            with MODEL_LOADING_LOCK:
+                self._model = SentenceTransformer(
+                    self.model_id,
+                    device=device,
+                    revision=self.model_revision,
+                    model_kwargs=model_kwargs,
+                    processor_kwargs={"padding_side": "left"},
+                )
             self._model.max_seq_length = self.settings.embedding_max_seq_length
         except Exception as error:
             raise EmbeddingModelError(

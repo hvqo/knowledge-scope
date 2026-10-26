@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Real image-pixel embeddings from Qwen3-VL-Embedding-2B.
 
 The published checkpoint is a ``Qwen3VLForConditionalGeneration`` (weights are
@@ -22,24 +23,41 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
-import torch
 from PIL import Image
-from transformers import AutoImageProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
-from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
-from transformers.processing_utils import ProcessorMixin
+
+try:  # heavy optional dependencies, required only when visual embeddings are used.
+    import torch
+    from transformers import AutoImageProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+    from transformers.processing_utils import ProcessorMixin
+except ModuleNotFoundError:  # pragma: no cover - optional dependency group
+    torch = None  # type: ignore[assignment]
+    AutoImageProcessor = None  # type: ignore[assignment,misc]
+    AutoTokenizer = None  # type: ignore[assignment,misc]
+    Qwen3VLForConditionalGeneration = None  # type: ignore[assignment,misc]
+    Qwen3VLProcessor = object  # type: ignore[assignment,misc]
+    ProcessorMixin = object  # type: ignore[assignment,misc]
 
 from knowledge_scope.shared.config import Settings
+
+from .model_loading import MODEL_LOADING_LOCK
 
 logger = logging.getLogger(__name__)
 
 VISUAL_EMBEDDING_SCHEMA_VERSION = "1.0"
 DEFAULT_VISUAL_DIMENSION = 2048
 DEFAULT_VISUAL_INSTRUCTION = "Represent the user's input."
-_TORCH_DTYPES = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
+
+
+def _require_torch() -> None:
+    if torch is None or AutoTokenizer is None:
+        raise VisualEmbeddingError("视觉编码依赖未安装，请先安装 embedding-benchmark 依赖组")
+
+
+def _no_grad(function: object) -> object:
+    if torch is None:
+        return function
+    return torch.no_grad()(function)
 
 
 class VisualEmbeddingError(RuntimeError):
@@ -138,7 +156,7 @@ def _conversation(
 
 
 def _current_vram_mb() -> float | None:
-    if not torch.cuda.is_available():
+    if torch is None or not torch.cuda.is_available():
         return None
     return torch.cuda.memory_allocated() / 1024**2
 
@@ -176,6 +194,7 @@ class VisualEmbeddingEncoder:
         return self._settings.visual_model_path or self._settings.visual_model_id
 
     def _load(self) -> None:
+        _require_torch()
         if self._model is not None:
             return
         with self._lock:
@@ -183,7 +202,8 @@ class VisualEmbeddingEncoder:
                 return
             started = time.perf_counter()
             try:
-                dtype = _TORCH_DTYPES[self._settings.visual_dtype]
+                _require_torch()
+                dtype = getattr(torch, self._settings.visual_dtype)
                 source = self._model_source()
                 tokenizer = AutoTokenizer.from_pretrained(source, padding_side="right")
                 image_processor = AutoImageProcessor.from_pretrained(source)
@@ -192,12 +212,23 @@ class VisualEmbeddingEncoder:
                     tokenizer=tokenizer,
                 )
                 device = self._settings.visual_device
-                causal = Qwen3VLForConditionalGeneration.from_pretrained(
-                    source,
-                    dtype=dtype,
-                    low_cpu_mem_usage=device != "cpu",
-                )
-                model = causal.model.to(device).eval()
+                with MODEL_LOADING_LOCK:
+                    causal = Qwen3VLForConditionalGeneration.from_pretrained(
+                        source,
+                        dtype=dtype,
+                        low_cpu_mem_usage=device != "cpu",
+                    )
+                    try:
+                        model = causal.model.to(device).eval()
+                    except Exception:
+                        meta_count = sum(
+                            1 for parameter in causal.parameters() if parameter.is_meta
+                        )
+                        logger.warning(
+                            "visual embedding load left %s meta parameters",
+                            meta_count,
+                        )
+                        raise
                 if len(model.language_model.layers) == 0:  # pragma: no cover - defensive
                     raise VisualEmbeddingError("visual embedding model has no language layers")
             except VisualEmbeddingError:
@@ -227,7 +258,7 @@ class VisualEmbeddingEncoder:
                 self._load_ms,
             )
 
-    @torch.no_grad()
+    @_no_grad
     def _encode_batch(
         self,
         *,
@@ -235,6 +266,7 @@ class VisualEmbeddingEncoder:
         images: Sequence[Image.Image] | None,
         instruction: str,
     ) -> np.ndarray:
+        _require_torch()
         if self._model is None:
             self._load()
         assert self._tokenizer is not None
@@ -287,7 +319,7 @@ class VisualEmbeddingEncoder:
         return embeddings.float().cpu().numpy()
 
     def _vram_peak_mb(self) -> float | None:
-        if not torch.cuda.is_available():
+        if torch is None or not torch.cuda.is_available():
             return None
         return torch.cuda.max_memory_allocated() / 1024**2
 
@@ -368,7 +400,7 @@ class VisualEmbeddingEncoder:
         self._model = None
         self._tokenizer = None
         self._processor = None
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
 

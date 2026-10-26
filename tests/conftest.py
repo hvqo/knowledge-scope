@@ -168,6 +168,7 @@ async def _test_client(
     llm_gateway: object | None = None,
     vlm_provider: object | None = None,
     agent_service: object | None = None,
+    ingestion_worker: object | None = None,
 ) -> AsyncIterator[AsyncClient]:
     settings = Settings(
         _env_file=None,
@@ -175,6 +176,7 @@ async def _test_client(
         database_url=postgres_test_database,
         data_dir=data_dir,
         max_upload_size_bytes=max_upload_size_bytes,
+        ingestion_enabled=False,
     )
     application = create_app(
         settings,
@@ -184,6 +186,7 @@ async def _test_client(
         llm_gateway=llm_gateway,  # type: ignore[arg-type]
         vlm_provider=vlm_provider,  # type: ignore[arg-type]
         agent_service=agent_service,  # type: ignore[arg-type]
+        ingestion_worker=ingestion_worker,  # type: ignore[arg-type]
     )
 
     async with postgres_test_engine.connect() as connection:
@@ -277,6 +280,25 @@ def agent_client_factory(
             postgres_test_engine,
             test_data_dir,
             agent_service=agent_service,
+        )
+
+    return factory
+
+
+@pytest.fixture
+def ingestion_client_factory(
+    postgres_test_database: str,
+    postgres_test_engine: AsyncEngine,
+    test_data_dir: Path,
+) -> Callable[[object], AbstractAsyncContextManager[AsyncClient]]:
+    """Build API clients with an injected fake ingestion worker."""
+
+    def factory(ingestion_worker: object) -> AbstractAsyncContextManager[AsyncClient]:
+        return _test_client(
+            postgres_test_database,
+            postgres_test_engine,
+            test_data_dir,
+            ingestion_worker=ingestion_worker,
         )
 
     return factory

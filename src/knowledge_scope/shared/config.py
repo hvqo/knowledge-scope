@@ -115,6 +115,9 @@ class Settings(BaseSettings):
     visual_quota_ambiguous: int = Field(default=1, ge=0, le=5)
     visual_max_image_pixels: int = Field(default=12_000_000, ge=250_000)
     visual_encoder_cache_dir: str = Field(default="", max_length=2_000)
+    ingestion_enabled: bool = True
+    ingestion_max_attempts: int = Field(default=3, ge=1, le=10)
+    ingestion_visual_mode: Literal["all", "selective"] = "all"
     graph_extraction_max_tokens: int = Field(default=1024, ge=1)
     graph_extraction_max_parse_retries: int = Field(default=1, ge=0, le=1)
     # The first budget is derived from graph_extraction_max_tokens when this
