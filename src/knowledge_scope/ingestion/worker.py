@@ -202,6 +202,10 @@ class IngestionWorker:
         task.error_message = None
         task.chunk_count = 0
         task.image_count = 0
+        task.visual_indexed_count = 0
+        task.visual_missing_count = 0
+        task.visual_invalid_count = 0
+        task.visual_skipped_by_policy = 0
         task.visual_status = "pending"
         task.timings_ms = {}
         task.vram_peak_mb = None
@@ -321,6 +325,9 @@ class IngestionWorker:
             elapsed = (perf_counter() - started) * 1_000
             code = getattr(error, "code", "stage_failed")
             message = str(error) or "入库阶段失败"
+            error_details = getattr(error, "details", None)
+            if isinstance(error_details, dict) and error_details:
+                self._apply_counts(task, error_details)
             stage.status = "failed"
             stage.finished_at = _utc_now()
             stage.error_code = str(code)
@@ -333,7 +340,9 @@ class IngestionWorker:
             task.finished_at = _utc_now()
             task.timings_ms[name] = round(elapsed, 3)
             if name == "visual_index":
-                task.visual_status = "failed"
+                task.visual_status = (
+                    "assets_missing" if code == "visual_assets_missing" else "failed"
+                )
             task.updated_at = _utc_now()
             self.task_store.write(task)
             logger.warning(
@@ -356,29 +365,66 @@ class IngestionWorker:
         if task.status == "running" and name == STAGE_ORDER[-1]:
             self._finish_task(task)
 
+    def _apply_counts(
+        self,
+        task: IngestionTask,
+        details: dict[str, object],
+    ) -> None:
+        """Apply explicit count fields only.
+
+        Stages must never share an ambiguous ``images`` key: the Evidence image
+        count, indexed visual count, missing/invalid assets and policy skips
+        all mean different things.
+        """
+
+        if "chunks" in details:
+            task.chunk_count = int(details["chunks"] or 0)  # type: ignore[arg-type]
+        if "evidence_image_count" in details:
+            task.image_count = int(details["evidence_image_count"] or 0)  # type: ignore[arg-type]
+        if "visual_indexed_count" in details:
+            task.visual_indexed_count = int(  # type: ignore[arg-type]
+                details["visual_indexed_count"] or 0
+            )
+        if "visual_missing_count" in details:
+            task.visual_missing_count = int(  # type: ignore[arg-type]
+                details["visual_missing_count"] or 0
+            )
+        if "visual_invalid_count" in details:
+            task.visual_invalid_count = int(  # type: ignore[arg-type]
+                details["visual_invalid_count"] or 0
+            )
+        if "visual_skipped_by_policy" in details:
+            task.visual_skipped_by_policy = int(  # type: ignore[arg-type]
+                details["visual_skipped_by_policy"] or 0
+            )
+
     def _apply_details(
         self,
         task: IngestionTask,
         name: str,
         details: dict[str, object],
     ) -> None:
-        if "chunks" in details:
-            task.chunk_count = int(details["chunks"] or 0)  # type: ignore[arg-type]
-        if "images" in details:
-            task.image_count = int(details["images"] or 0)  # type: ignore[arg-type]
+        self._apply_counts(task, details)
         vram = details.get("vram_peak_mb")
         if isinstance(vram, (int, float)) and float(vram) > (task.vram_peak_mb or 0):
             task.vram_peak_mb = float(vram)
         if name == "visual_index":
             if bool(details.get("skipped")):
                 reason = str(details.get("reason") or "")
-                task.visual_status = (
-                    "not_enabled" if reason == "visual_embedding_disabled" else "skipped_no_images"
-                )
+                if reason == "visual_embedding_disabled":
+                    task.visual_status = (
+                        "not_enabled" if task.image_count > 0 else "skipped_no_images"
+                    )
+                else:
+                    task.visual_status = "skipped_no_images"
+            elif (
+                int(details.get("visual_missing_count") or 0) > 0
+                or int(details.get("visual_invalid_count") or 0) > 0
+                or int(details.get("visual_indexed_count") or 0) == 0
+            ):
+                task.visual_status = "assets_missing"
             else:
-                task.visual_status = (
-                    "assets_missing" if int(details.get("images") or 0) == 0 else "pending"
-                )
+                task.visual_status = "pending"
         if name == "publish":
             published = details.get("published_indexes")
             if isinstance(published, list):
@@ -394,18 +440,21 @@ class IngestionWorker:
                 task.indexes["text"] = True
             if int(details.get("representation_points") or 0) > 0:  # type: ignore[arg-type]
                 task.indexes["multimodal"] = True
+            evidence_images = int(
+                details.get("evidence_image_count") or task.image_count or 0  # type: ignore[arg-type]
+            )
             if self.settings.visual_embedding_enabled:
                 visual_expected = int(details.get("visual_expected") or 0)
                 task.indexes["visual"] = bool(details.get("visual_ready")) or (
-                    visual_expected == 0 and task.image_count == 0
+                    visual_expected == 0 and evidence_images == 0
                 )
-                if task.image_count == 0:
+                if evidence_images == 0:
                     task.visual_status = "skipped_no_images"
                 elif task.indexes["visual"]:
                     task.visual_status = "ready"
                 else:
                     task.visual_status = "assets_missing"
-            elif task.image_count == 0:
+            elif evidence_images == 0:
                 task.visual_status = "skipped_no_images"
             else:
                 task.visual_status = "not_enabled"

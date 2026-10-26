@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Focused tests for the M8 single-host PDF auto-ingestion pipeline."""
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import pytest
 from httpx import AsyncClient
 
 from knowledge_scope.ingestion.models import IngestionTask
+from knowledge_scope.ingestion.steps import IngestionStepError
 from knowledge_scope.ingestion.store import IngestionStoreError, IngestionTaskStore
 from knowledge_scope.ingestion.worker import IngestionError, IngestionWorker
 from knowledge_scope.shared.config import Settings
@@ -16,21 +18,39 @@ from test_document_assets import create_knowledge_base, upload_document
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "visual_embedding_enabled": True,
+        **overrides,
+    }
     return Settings(
         _env_file=None,
         environment="test",
         data_dir=tmp_path,
-        visual_embedding_enabled=True,
-        **overrides,  # type: ignore[arg-type]
+        **values,  # type: ignore[arg-type]
     )
 
 
 class FakeSteps:
     """Deterministic in-memory replacement for the real pipeline steps."""
 
-    def __init__(self, *, fail_at: str | None = None, images: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: str | None = None,
+        images: int = 2,
+        indexed: int | None = None,
+        missing: int = 0,
+        invalid: int = 0,
+        skipped_policy: int = 0,
+        publish_visual: bool = True,
+    ) -> None:
         self.fail_at = fail_at
         self.images = images
+        self.indexed = images if indexed is None else indexed
+        self.missing = missing
+        self.invalid = invalid
+        self.skipped_policy = skipped_policy
+        self.publish_visual = publish_visual
         self.calls: list[str] = []
 
     def _stage(self, name: str, details: dict[str, object]) -> dict[str, object]:
@@ -52,13 +72,34 @@ class FakeSteps:
         return self._stage("sparse_index", {})
 
     def multimodal_index(self, task: IngestionTask) -> dict[str, object]:
-        return self._stage("multimodal_index", {"images": self.images})
+        return self._stage("multimodal_index", {"evidence_image_count": self.images})
 
     def visual_index(self, task: IngestionTask) -> dict[str, object]:
-        return self._stage("visual_index", {"images": self.images})
+        if self.images == 0:
+            return self._stage(
+                "visual_index",
+                {"skipped": True, "reason": "no_images", "evidence_image_count": 0},
+            )
+        details = {
+            "evidence_image_count": self.images,
+            "visual_indexed_count": self.indexed,
+            "visual_missing_count": self.missing,
+            "visual_invalid_count": self.invalid,
+            "visual_skipped_by_policy": self.skipped_policy,
+            "visual_selected_count": self.indexed + self.missing + self.invalid,
+        }
+        if self.missing or self.invalid:
+            raise IngestionStepError(
+                "visual_assets_missing",
+                "视觉素材缺失或无法解码，请恢复素材后重试",
+                details=details,
+            )
+        return self._stage("visual_index", details)
 
     def publish(self, task: IngestionTask) -> dict[str, object]:
-        published = ["text", "multimodal", "bm25", "visual"]
+        published = ["text", "multimodal", "bm25"]
+        if self.publish_visual:
+            published.append("visual")
         return self._stage(
             "publish",
             {
@@ -71,7 +112,7 @@ class FakeSteps:
         )
 
     def verify(self, task: IngestionTask) -> dict[str, object]:
-        visual_ready = self.images >= 0
+        visual_ready = self.missing == 0 and self.invalid == 0
         return self._stage(
             "verify",
             {
@@ -79,9 +120,12 @@ class FakeSteps:
                 "representation_points": 4,
                 "sparse_ok": True,
                 "sparse_records": 3,
-                "visual_points": self.images,
-                "visual_expected": self.images,
+                "visual_points": self.indexed,
+                "visual_expected": self.indexed,
+                "visual_active": self.indexed,
                 "visual_ready": visual_ready,
+                "evidence_image_count": self.images,
+                "visual_skipped_by_policy": self.skipped_policy,
             },
         )
 
@@ -89,9 +133,14 @@ class FakeSteps:
         return self._stage("graph", {"skipped": True, "ready": False})
 
 
-def _worker(tmp_path: Path, steps: FakeSteps) -> tuple[IngestionWorker, IngestionTaskStore]:
-    store = IngestionTaskStore(_settings(tmp_path))
-    worker = IngestionWorker(_settings(tmp_path), store, steps=steps)
+def _worker(
+    tmp_path: Path,
+    steps: FakeSteps,
+    **settings_overrides: object,
+) -> tuple[IngestionWorker, IngestionTaskStore]:
+    settings = _settings(tmp_path, **settings_overrides)
+    store = IngestionTaskStore(settings)
+    worker = IngestionWorker(settings, store, steps=steps)
     return worker, store
 
 
@@ -125,6 +174,9 @@ def test_worker_full_pipeline_completes(tmp_path: Path) -> None:
     assert finished.attempts == 1
     assert finished.chunk_count == 3
     assert finished.image_count == 2
+    assert finished.visual_indexed_count == 2
+    assert finished.visual_missing_count == 0
+    assert finished.visual_skipped_by_policy == 0
     assert finished.indexes["text"] is True
     assert finished.indexes["bm25"] is True
     assert finished.indexes["multimodal"] is True
@@ -143,6 +195,95 @@ def test_worker_full_pipeline_completes(tmp_path: Path) -> None:
         "verify",
         "graph",
     ]
+
+
+def test_worker_visual_ready_counts_three_images(tmp_path: Path) -> None:
+    steps = FakeSteps(images=3)
+    worker, store = _worker(tmp_path, steps)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.image_count == 3
+    assert finished.visual_indexed_count == 3
+    assert finished.visual_missing_count == 0
+    assert finished.visual_status == "ready"
+
+
+def test_worker_partial_missing_assets_is_not_ready_and_retry_recovers(
+    tmp_path: Path,
+) -> None:
+    steps = FakeSteps(images=3, indexed=2, missing=1)
+    worker, store = _worker(tmp_path, steps)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    failed = store.read(task.document_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_stage == "visual_index"
+    assert failed.error_code == "visual_assets_missing"
+    assert failed.image_count == 3
+    assert failed.visual_indexed_count == 2
+    assert failed.visual_missing_count == 1
+    assert failed.visual_status == "assets_missing"
+    assert failed.indexes["visual"] is False
+
+    steps.missing = 0
+    steps.indexed = 3
+    assert worker.retry(task.document_id).status == "queued"
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.image_count == 3
+    assert finished.visual_indexed_count == 3
+    assert finished.visual_missing_count == 0
+    assert finished.visual_status == "ready"
+
+
+def test_worker_all_assets_missing_is_not_reported_as_no_images(tmp_path: Path) -> None:
+    steps = FakeSteps(images=3, indexed=0, missing=3)
+    worker, store = _worker(tmp_path, steps)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    failed = store.read(task.document_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "visual_assets_missing"
+    assert failed.image_count == 3
+    assert failed.visual_indexed_count == 0
+    assert failed.visual_missing_count == 3
+    assert failed.visual_status == "assets_missing"
+    assert failed.visual_status != "skipped_no_images"
+
+
+def test_worker_visual_disabled_with_images_reports_not_enabled(tmp_path: Path) -> None:
+    steps = FakeSteps(images=2, publish_visual=False)
+    worker, store = _worker(tmp_path, steps, visual_embedding_enabled=False)
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.image_count == 2
+    assert finished.indexes["visual"] is False
+    assert finished.visual_status == "not_enabled"
+
+
+def test_worker_selective_policy_skips_are_distinct_from_missing(tmp_path: Path) -> None:
+    steps = FakeSteps(images=3, indexed=2, skipped_policy=1)
+    worker, store = _worker(tmp_path, steps, ingestion_visual_mode="selective")
+    task = worker.enqueue(uuid4(), uuid4())
+    worker._run_document(task.document_id)
+    finished = store.read(task.document_id)
+    assert finished is not None
+    assert finished.status == "completed"
+    assert finished.image_count == 3
+    assert finished.visual_indexed_count == 2
+    assert finished.visual_skipped_by_policy == 1
+    assert finished.visual_missing_count == 0
+    assert finished.visual_status == "ready"
 
 
 def test_worker_failure_then_retry_recovers(tmp_path: Path) -> None:

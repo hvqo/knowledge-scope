@@ -112,3 +112,41 @@
 | 视觉索引仅 pointer、缺图片点 | 删除数据点后 `verify` 返回 `verify_visual_index`；从真实素材重建 2 张图后验证通过 |
 | 解析失败后手动重试 | 首次 `parse_failed`（parsing 目录不可写）；恢复权限后 `POST retry` 202 → completed，四类索引就绪 |
 | Agent 图文问答 + 原图预览 | agent+unified 查询返回 analyze_image 工具轨迹、visual 分支 success、visual_sources 1；Evidence detail 200、asset 200（image/jpeg，33452 bytes） |
+
+## 10. M8.2 图片计数与视觉就绪语义（2026-10-26）
+
+### 10.1 字段语义
+
+任务状态与状态摘要中不再用单一 `images` 字段表达多种含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `image_count` | Evidence 中的原始图片数量（图片素材被发现的数量，不是成功索引数量） |
+| `visual_indexed_count` | 当前文档成功准备并发布视觉向量的图片数量 |
+| `visual_missing_count` | 原始图片文件缺失的数量 |
+| `visual_invalid_count` | 图片文件存在但无法解码/非支持格式的数量 |
+| `visual_skipped_by_policy` | `selective` 模式下索引策略主动跳过（`text_only`）的图片数量 |
+
+各阶段只写各自明确的计数键；worker 不再从通用 `images` 键推导 `image_count`。前端仍展示“N 张图片”（原始图片数），并补充视觉索引覆盖情况，例如“视觉索引就绪（2/2 张）”“视觉索引缺失（已索引 1/2 张）”“策略跳过 1 张”。
+
+### 10.2 视觉就绪判定
+
+`visual_index` 阶段对 `ingestion_visual_mode` 做一致性校验：
+
+- `all`：策略应覆盖全部原始图片；`visual_selected_count != image_count` 视为策略计数错误。
+- `selective`：`visual_selected_count + visual_skipped_by_policy == image_count` 才视为策略计数一致。
+
+任一图片缺失或无法解码时：任务在 `visual_index` 阶段失败，`error_code=visual_assets_missing`，`visual_status=assets_missing`，并保留 `image_count`、`visual_indexed_count`、`visual_missing_count`、`visual_invalid_count`、`visual_skipped_by_policy` 供前端展示。恢复素材后 `POST .../ingestion/retry` 会重新执行失败的视觉阶段；成功后 `visual_status=ready`。
+
+`verify` 阶段继续以当前活动代（pointer 指向的 generation）的 `(evidence_id, asset_index)` 集合为准：pointer 与 pending 点不计入；期望集合与实际活动代集合必须完全一致。`image_count==0` 的文档为 `skipped_no_images`；视觉编码未启用但有原始图片时为 `not_enabled`，不会显示为完整视觉就绪。
+
+### 10.3 真实验收记录（2026-10-26）
+
+环境：`data_dir=/tmp/m8-2-data`，CPU 文本/视觉编码 + GPU Ollama `qwen3-vl:8b`，隔离 KB “M8.2 计数语义验收”。
+
+| 场景 | 结果 |
+| --- | --- |
+| 视觉阶段素材缺失注入（解析完成后移走 1/2 张图片） | 任务 failed，`error_stage=visual_index`，`error_code=visual_assets_missing`，`image_count=2`，`visual_indexed_count=0`（编码前失败），`visual_missing_count=1`，`visual_status=assets_missing` |
+| 恢复素材后 `POST retry` | 202 → completed，`visual_indexed_count=2`、`visual_missing_count=0`、`visual_status=ready`，四类索引就绪 |
+| 无图 PDF 完整入库 | completed，`image_count=0`、`visual_status=skipped_no_images` |
+| 已完成文档再次 retry | 409 `rebuild_not_supported` |

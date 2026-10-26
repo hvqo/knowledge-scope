@@ -181,13 +181,25 @@ function ingestionDetail(document: Document): string | null {
   }
   if (entry.status === "completed") {
     const chunks = entry.chunk_count > 0 ? `${entry.chunk_count} 个文本块` : "无文本块";
+    const indexed = entry.visual_indexed_count ?? 0;
+    const missing = entry.visual_missing_count ?? 0;
+    const invalid = entry.visual_invalid_count ?? 0;
+    const skipped = entry.visual_skipped_by_policy ?? 0;
     const parts = [chunks, `${entry.image_count} 张图片`];
     if (entry.visual_status === "not_enabled") {
       parts.push("视觉索引未启用");
     } else if (entry.visual_status === "assets_missing") {
-      parts.push("视觉索引缺失");
+      parts.push(`视觉索引缺失（已索引 ${indexed}/${entry.image_count} 张）`);
+    } else if (entry.visual_status === "skipped_no_images") {
+      parts.push("无需视觉索引");
     } else if (entry.visual_status === "ready") {
-      parts.push("视觉索引就绪");
+      parts.push(`视觉索引就绪（${indexed}/${entry.image_count} 张）`);
+    }
+    if (missing > 0 || invalid > 0) {
+      parts.push(`素材缺失 ${missing} 张、无效 ${invalid} 张`);
+    }
+    if (skipped > 0) {
+      parts.push(`策略跳过 ${skipped} 张`);
     }
     return parts.join(" · ");
   }

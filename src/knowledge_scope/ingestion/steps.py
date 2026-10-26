@@ -62,9 +62,15 @@ BUNDLE_SCHEMA_VERSION = "1.0"
 class IngestionStepError(RuntimeError):
     """Raised when one ingestion step cannot complete safely."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.details = dict(details or {})
 
 
 @dataclass(frozen=True)
@@ -303,7 +309,7 @@ class IngestionSteps:
         return {
             "elapsed_ms": round((perf_counter() - started) * 1_000, 3),
             "representations": len(points),
-            "images": image_count,
+            "evidence_image_count": image_count,
         }
 
     def _read_bundle_or_empty(self, task: IngestionTask) -> dict[str, Any]:
@@ -320,7 +326,11 @@ class IngestionSteps:
             bundle["visual_entries"] = []
             bundle["visual_skipped_reason"] = "visual_embedding_disabled"
             _write_bundle(self.task_store, task.document_id, bundle)
-            return {"skipped": True, "reason": "visual_embedding_disabled", "images": 0}
+            return {
+                "skipped": True,
+                "reason": "visual_embedding_disabled",
+                "evidence_image_count": 0,
+            }
         started = perf_counter()
         bundle = _read_bundle(self.task_store, task.document_id)
         try:
@@ -332,7 +342,7 @@ class IngestionSteps:
             bundle["visual_entries"] = []
             bundle["visual_skipped_reason"] = "no_images"
             _write_bundle(self.task_store, task.document_id, bundle)
-            return {"skipped": True, "reason": "no_images", "images": 0}
+            return {"skipped": True, "reason": "no_images", "evidence_image_count": 0}
         encoder: VisualEmbeddingEncoder | None = None
         store: QdrantVisualStore | None = None
         try:
@@ -346,6 +356,34 @@ class IngestionSteps:
                 artifact,
                 mode=mode,
             )
+            counts = {
+                "evidence_image_count": image_count,
+                "visual_indexed_count": 0,
+                "visual_missing_count": stats.images_missing,
+                "visual_invalid_count": stats.images_invalid,
+                "visual_skipped_by_policy": stats.images_skipped_by_policy,
+                "visual_selected_count": stats.images_selected,
+            }
+            asset_total = (
+                stats.images_selected
+                + stats.images_missing
+                + stats.images_invalid
+                + stats.images_skipped_by_policy
+            )
+            if asset_total != image_count:
+                raise IngestionStepError(
+                    "visual_policy_mismatch",
+                    "视觉索引策略计数与原始图片数量不一致",
+                    details=counts,
+                )
+            if stats.images_missing or stats.images_invalid:
+                raise IngestionStepError(
+                    "visual_assets_missing",
+                    "视觉素材缺失或无法解码："
+                    f"缺失 {stats.images_missing} 张、无效 {stats.images_invalid} 张；"
+                    "已停止入库，请恢复图片素材后重试。",
+                    details=counts,
+                )
             # Encode inside the visual stage so stage timings reflect the real
             # work and the publish phase is a pure write phase.
             if entries:
@@ -354,6 +392,8 @@ class IngestionSteps:
                 )
             else:
                 vectors, encode_stats = [], None
+        except IngestionStepError:
+            raise
         except Exception as error:
             raise IngestionStepError(
                 "visual_embedding_failed", f"图片视觉向量生成失败：{error}"
@@ -372,14 +412,21 @@ class IngestionSteps:
             for (payload, _image_bytes), vector in zip(entries, vectors, strict=True)
         ]
         bundle["visual_skipped_reason"] = None
+        bundle["visual_evidence_count"] = image_count
+        bundle["visual_selected_count"] = stats.images_selected
+        bundle["visual_indexed_count"] = len(entries)
+        bundle["visual_missing_count"] = stats.images_missing
+        bundle["visual_invalid_count"] = stats.images_invalid
+        bundle["visual_skipped_by_policy"] = stats.images_skipped_by_policy
         _write_bundle(self.task_store, task.document_id, bundle)
         return {
             "elapsed_ms": round((perf_counter() - started) * 1_000, 3),
-            "images": stats.images_indexed or len(entries),
-            "images_total": stats.images_total,
-            "images_missing": stats.images_missing,
-            "images_invalid": stats.images_invalid,
-            "skipped_by_policy": stats.images_skipped_by_policy,
+            "evidence_image_count": image_count,
+            "visual_indexed_count": len(entries),
+            "visual_missing_count": stats.images_missing,
+            "visual_invalid_count": stats.images_invalid,
+            "visual_skipped_by_policy": stats.images_skipped_by_policy,
+            "visual_selected_count": stats.images_selected,
             "embedded_images": len(vectors),
             "embedding_latency_ms": (encode_stats.latency_ms if encode_stats is not None else 0.0),
             "vram_peak_mb": max(
@@ -561,6 +608,29 @@ class IngestionSteps:
                 )
                 for item in (bundle.get("visual_entries") or [])
             }
+            expected_evidence_images = int(bundle.get("visual_evidence_count") or 0)
+            expected_selected = int(bundle.get("visual_selected_count") or 0)
+            skipped_by_policy = int(bundle.get("visual_skipped_by_policy") or 0)
+            visual_mode = self.settings.ingestion_visual_mode
+            if self.settings.visual_embedding_enabled and expected_evidence_images > 0:
+                if visual_mode == "all" and expected_selected != expected_evidence_images:
+                    raise IngestionStepError(
+                        "verify_visual_index",
+                        "视觉索引校验失败：全量模式未覆盖全部原始图片",
+                    )
+                if (
+                    visual_mode == "selective"
+                    and expected_selected + skipped_by_policy != expected_evidence_images
+                ):
+                    raise IngestionStepError(
+                        "verify_visual_index",
+                        "视觉索引校验失败：策略选择计数与原始图片数量不一致",
+                    )
+                if expected_selected != len(expected_visual_keys):
+                    raise IngestionStepError(
+                        "verify_visual_index",
+                        "视觉索引校验失败：已选图片与待编码视觉条目数量不一致",
+                    )
             visual_count = 0
             visual_keys: set[tuple[str, int]] = set()
             if self.settings.visual_embedding_enabled:
@@ -599,7 +669,7 @@ class IngestionSteps:
             )
         if (
             self.settings.visual_embedding_enabled
-            and task.image_count > 0
+            and expected_evidence_images > 0
             and not expected_visual_keys
         ):
             raise IngestionStepError(
@@ -619,7 +689,10 @@ class IngestionSteps:
             "sparse_records": sparse_count,
             "visual_points": visual_count,
             "visual_expected": len(expected_visual_keys),
+            "visual_active": visual_count,
             "visual_ready": expected_visual_keys == visual_keys,
+            "evidence_image_count": expected_evidence_images,
+            "visual_skipped_by_policy": skipped_by_policy,
         }
 
     # -- graph (explicitly out of scope) --------------------------------

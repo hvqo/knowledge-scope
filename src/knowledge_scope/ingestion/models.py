@@ -95,7 +95,14 @@ class IngestionTask(BaseModel):
     visual_status: VisualIndexStatus = "pending"
     source_sha256: str | None = None
     chunk_count: int = 0
+    # Evidence image count (original images found in the parsed document).
     image_count: int = 0
+    # Visual index accounting.  These are deliberately separate from
+    # ``image_count`` so a missing asset cannot be mistaken for "no images".
+    visual_indexed_count: int = 0
+    visual_missing_count: int = 0
+    visual_invalid_count: int = 0
+    visual_skipped_by_policy: int = 0
     timings_ms: dict[str, float] = Field(default_factory=dict)
     vram_peak_mb: float | None = None
     error_stage: str | None = None
@@ -128,6 +135,10 @@ class IngestionStatusEntry(BaseModel):
     error_message: str | None
     chunk_count: int
     image_count: int
+    visual_indexed_count: int
+    visual_missing_count: int
+    visual_invalid_count: int
+    visual_skipped_by_policy: int
     attempts: int
     updated_at: str
     visual_status: VisualIndexStatus
@@ -148,6 +159,10 @@ def status_entry(task: IngestionTask) -> IngestionStatusEntry:
         error_message=task.error_message,
         chunk_count=task.chunk_count,
         image_count=task.image_count,
+        visual_indexed_count=task.visual_indexed_count,
+        visual_missing_count=task.visual_missing_count,
+        visual_invalid_count=task.visual_invalid_count,
+        visual_skipped_by_policy=task.visual_skipped_by_policy,
         attempts=task.attempts,
         updated_at=task.updated_at,
         visual_status=task.visual_status,

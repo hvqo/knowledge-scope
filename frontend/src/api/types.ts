@@ -103,6 +103,10 @@ export interface IngestionTask {
   source_sha256: string | null;
   chunk_count: number;
   image_count: number;
+  visual_indexed_count: number;
+  visual_missing_count: number;
+  visual_invalid_count: number;
+  visual_skipped_by_policy: number;
   timings_ms: Record<string, number>;
   vram_peak_mb: number | null;
   error_stage: string | null;
@@ -123,6 +127,10 @@ export interface IngestionStatusEntry {
   error_message: string | null;
   chunk_count: number;
   image_count: number;
+  visual_indexed_count: number;
+  visual_missing_count: number;
+  visual_invalid_count: number;
+  visual_skipped_by_policy: number;
   attempts: number;
   updated_at: string;
   visual_status?:
