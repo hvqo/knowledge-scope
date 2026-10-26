@@ -372,6 +372,21 @@ class RAGCompleteData(BaseModel):
     safety_gate: RAGSafetyGate = "none"
     safety_notice: str | None = Field(default=None, max_length=400)
     visual_sources: list[RAGVisualSource] = Field(default_factory=list)
+    # M9 evidence-sufficiency audit: what the question required, how much the
+    # candidates covered before/after the single supplementary retrieval, and
+    # whether an explicit visual feature question triggered image analysis.
+    agent_evidence_required: list[str] | None = None
+    agent_evidence_missing: list[str] | None = None
+    agent_evidence_satisfied: bool | None = None
+    agent_evidence_coverage_before: dict[str, int] | None = None
+    agent_evidence_coverage_after: dict[str, int] | None = None
+    agent_evidence_conflicts: list[str] | None = None
+    agent_supplementary_retrieval: bool = False
+    agent_supplementary_query: str | None = Field(default=None, max_length=200)
+    agent_supplementary_added: int = Field(default=0, ge=0, le=20)
+    agent_supplementary_latency_ms: float | None = Field(default=None, ge=0)
+    agent_supplementary_error: str | None = Field(default=None, max_length=200)
+    agent_visual_auto_called: bool = False
     # Which pipeline produced the answer and the signed server-side trust
     # record id. ``answer_generated_by`` is set by the application wrapper, never
     # by the model, and report insertion refuses answers without a valid record.

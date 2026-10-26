@@ -61,6 +61,7 @@ def _settings(**overrides: Any) -> Settings:
         "_env_file": None,
         "environment": "test",
         "agent_enabled": True,
+        "agent_evidence_sufficiency_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -767,7 +768,13 @@ class _StubRetrieval:
         self._result = result
         self.calls: list[tuple[str, UUID]] = []
 
-    async def retrieve(self, query: str, knowledge_base_id: UUID) -> Any:
+    async def retrieve(
+        self,
+        query: str,
+        knowledge_base_id: UUID,
+        *,
+        document_id: UUID | None = None,
+    ) -> Any:
         self.calls.append((query, knowledge_base_id))
         return self._result
 
@@ -1688,3 +1695,262 @@ def test_agent_service_vision_failure_does_not_fall_back_to_number_guess() -> No
     assert complete["safety_gate"] == "vision_unavailable"
     assert complete["fact_status"] == "not_available"
     assert complete["visual_sources"][0]["execution_status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# M9 evidence sufficiency, supplementary retrieval, and visual auto-call
+# ---------------------------------------------------------------------------
+
+
+def _candidate_with_snippet(
+    index: int,
+    snippet: str,
+    *,
+    modality: str = "table",
+    document_id: UUID = DOC_ID,
+    evidence_id: str | None = None,
+    table_rows: tuple[str, ...] = (),
+    table_columns: tuple[str, ...] = (),
+    marker: str | None = None,
+) -> AgentCandidate:
+    base = _candidate(
+        index,
+        marker=marker or f"C{index}",
+        modality=modality,
+        document_id=document_id,
+        evidence_id=evidence_id,
+        table_columns=table_columns,
+    )
+    return AgentCandidate(
+        index=base.index,
+        marker=base.marker,
+        citation=base.citation.model_copy(update={"snippet": snippet}),
+        document_title=base.document_title,
+        table_columns=table_columns,
+        table_rows=table_rows,
+        table_issue=base.table_issue,
+    )
+
+
+class _SequencedRetrieval:
+    def __init__(self, results: list[Any], *, fail_after: int | None = None) -> None:
+        self._results = list(results)
+        self._fail_after = fail_after
+        self.calls: list[tuple[str, UUID, UUID | None]] = []
+
+    async def retrieve(
+        self,
+        query: str,
+        knowledge_base_id: UUID,
+        *,
+        document_id: UUID | None = None,
+    ) -> Any:
+        self.calls.append((query, knowledge_base_id, document_id))
+        if self._fail_after is not None and len(self.calls) > self._fail_after:
+            raise RuntimeError("supplementary retrieval exploded")
+        index = min(len(self.calls) - 1, len(self._results) - 1)
+        return self._results[index]
+
+
+def test_m9_supplementary_retrieval_runs_when_comparison_evidence_is_missing() -> None:
+    initial = (
+        _candidate_with_snippet(
+            1,
+            "2024年 越南 GDP 4760 亿美元",
+            table_rows=("越南", "4760"),
+            table_columns=("国家", "2024年GDP"),
+        ),
+    )
+    extra = (
+        _candidate_with_snippet(
+            1,
+            "2023年 泰国 GDP 5000 亿美元 2024年 5300 亿美元",
+            document_id=SECOND_DOC_ID,
+            evidence_id="evidence_v1_" + "f" * 64,
+            table_rows=("泰国", "5300"),
+            table_columns=("国家", "2023年GDP", "2024年GDP"),
+        ),
+    )
+    retrieval = _SequencedRetrieval(
+        [_retrieval_result(list(initial)), _retrieval_result(list(extra))]
+    )
+    gateway = _FakeGateway(
+        plans=[{"action": "final", "reason": "基于证据回答"}],
+        deltas=["越南与泰国数据见引用。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=retrieval,
+        executor=_StubExecutor([]),
+        settings=_settings(
+            agent_evidence_sufficiency_enabled=True,
+            agent_max_rounds=1,
+            agent_supplementary_retrieval_max=1,
+        ),
+    )
+    request = RAGQueryRequest(
+        query="比较越南和泰国 2023—2024 年 GDP。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    assert len(retrieval.calls) == 2
+    assert retrieval.calls[1][0] != request.query
+    assert "泰国" in retrieval.calls[1][0]
+    retrieval_statuses = [
+        event.data["status"]
+        for event in events
+        if event.event == "tool_status" and event.data["tool"] == "retrieval"
+    ]
+    assert retrieval_statuses == ["running", "completed", "running", "completed"]
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["agent_supplementary_retrieval"] is True
+    assert complete.data["agent_supplementary_added"] == 1
+    assert complete.data["agent_supplementary_error"] is None
+    assert complete.data["agent_evidence_satisfied"] is True
+    assert complete.data["agent_evidence_missing"] == []
+    assert complete.data["agent_evidence_coverage_before"]["missing"] >= 1
+    assert complete.data["agent_evidence_coverage_after"]["missing"] == 0
+    assert "泰国" in " ".join(complete.data["agent_evidence_required"])
+    markers = [item["marker"] for item in complete.data["agent_candidates"]]
+    assert markers == ["C1", "C2"]
+
+
+def test_m9_sufficient_simple_question_skips_supplementary_retrieval() -> None:
+    candidates = (
+        _candidate_with_snippet(
+            1,
+            "越南 2024年 GDP 4760 亿美元",
+            table_rows=("越南", "4760"),
+            table_columns=("国家", "2024年GDP"),
+        ),
+    )
+    retrieval = _SequencedRetrieval([_retrieval_result(list(candidates))])
+    gateway = _FakeGateway(plans=[{"action": "final"}], deltas=["4760 亿美元。"])
+    service = _service(
+        gateway=gateway,
+        retrieval=retrieval,
+        executor=_StubExecutor([]),
+        settings=_settings(
+            agent_evidence_sufficiency_enabled=True,
+            agent_max_rounds=1,
+        ),
+    )
+    request = RAGQueryRequest(
+        query="越南 2024 年 GDP 是多少？",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    assert len(retrieval.calls) == 1
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["agent_supplementary_retrieval"] is False
+    assert complete.data["agent_evidence_satisfied"] is True
+
+
+def test_m9_supplementary_retrieval_failure_keeps_initial_candidates() -> None:
+    initial = (_candidate_with_snippet(1, "2024年 越南 GDP 4760 亿美元"),)
+    retrieval = _SequencedRetrieval(
+        [_retrieval_result(list(initial))],
+        fail_after=1,
+    )
+    gateway = _FakeGateway(plans=[{"action": "final"}], deltas=["仅根据现有证据回答。"])
+    service = _service(
+        gateway=gateway,
+        retrieval=retrieval,
+        executor=_StubExecutor([]),
+        settings=_settings(
+            agent_evidence_sufficiency_enabled=True,
+            agent_max_rounds=1,
+        ),
+    )
+    request = RAGQueryRequest(
+        query="比较越南和泰国 2024 年 GDP。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["agent_supplementary_retrieval"] is False
+    assert complete.data["agent_supplementary_error"] == "RuntimeError"
+    assert len(complete.data["agent_candidates"]) == 1
+    statuses = [
+        event.data["status"]
+        for event in events
+        if event.event == "tool_status" and event.data["tool"] == "retrieval"
+    ]
+    assert statuses == ["running", "completed", "running", "failed"]
+
+
+def test_m9_auto_calls_visual_tool_when_planner_wants_to_finish() -> None:
+    candidates = (_candidate(1, marker="C1", modality="image"),)
+    executor = _StubExecutor([_completed_outcome()])
+    gateway = _FakeGateway(
+        plans=[
+            {"action": "final", "reason": "图中有柱状图"},
+            {"action": "final", "reason": "工具已完成"},
+        ],
+        deltas=["图中显示上升趋势。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result(list(candidates))),
+        executor=executor,
+        settings=_settings(agent_visual_tool_auto=True),
+    )
+    request = RAGQueryRequest(
+        query="分析图1中柱状图的变化趋势和结构关系。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    assert executor.calls == [("analyze_image", 1)]
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["agent_visual_auto_called"] is True
+    analyze_trace = [
+        item for item in complete.data["agent_tool_trace"] if item["tool"] == "analyze_image"
+    ]
+    assert analyze_trace and analyze_trace[0]["parameters"]["auto_visual"] is True
+
+
+def test_m9_same_image_with_different_question_is_not_deduplicated() -> None:
+    candidates = (_candidate(1, marker="C1", modality="image"),)
+    executor = _StubExecutor([_completed_outcome(), _completed_outcome()])
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 1,
+                "vision_task": "describe_image",
+                "question": "图里有哪些元素？",
+            },
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 1,
+                "vision_task": "describe_image",
+                "question": "图里的趋势是什么？",
+            },
+            {"action": "final"},
+        ],
+        deltas=["完成。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result(list(candidates))),
+        executor=executor,
+        settings=_settings(agent_visual_tool_auto=False),
+    )
+    request = RAGQueryRequest(
+        query="看看这张图。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+
+    assert executor.calls == [("analyze_image", 1), ("analyze_image", 1)]

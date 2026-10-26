@@ -29,6 +29,14 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
+from knowledge_scope.agent.evidence import (
+    EvidenceAssessment,
+    EvidenceRequirement,
+    assess_evidence,
+    build_supplementary_query,
+    extract_requirement,
+    visual_feature_requested,
+)
 from knowledge_scope.agent.planner import AgentPlanner
 from knowledge_scope.agent.schemas import (
     AGENT_PROMPT_VERSION,
@@ -352,6 +360,15 @@ class AgentChatService:
         table_candidates: set[int] = set()
         table_verified = False
         risk = assess_visual_risk(request.query)
+        requirement = extract_requirement(request.query)
+        assessment_before: EvidenceAssessment | None = None
+        assessment_after: EvidenceAssessment | None = None
+        supplementary_retrieval = False
+        supplementary_query: str | None = None
+        supplementary_added = 0
+        supplementary_latency_ms: float | None = None
+        supplementary_error: str | None = None
+        auto_visual = False
 
         if request.knowledge_base_id is None:  # validated by the request schema
             yield _error_event("agent", "智能体问答需要指定知识库")
@@ -364,10 +381,12 @@ class AgentChatService:
 
         step += 1
         yield _tool_status("retrieval", "running", "正在检索知识库并整理候选来源", step)
+        retrieval_tool = self._build_retrieval_tool(document_loader)
         try:
-            retrieval = await self._build_retrieval_tool(document_loader).retrieve(
+            retrieval = await retrieval_tool.retrieve(
                 retrieval_query,
                 request.knowledge_base_id,
+                document_id=request.document_id,
             )
         except Exception as error:
             logger.warning(
@@ -473,8 +492,88 @@ class AgentChatService:
             )
         )
 
+        if self._settings.agent_evidence_sufficiency_enabled:
+            assessment_before = assess_evidence(requirement, candidates)
+            if (
+                not assessment_before.satisfied
+                and self._settings.agent_supplementary_retrieval_max >= 1
+            ):
+                suppl_query = build_supplementary_query(requirement, assessment_before)
+                if suppl_query.strip() and suppl_query.strip() != request.query.strip():
+                    supplementary_query = suppl_query
+                    step += 1
+                    yield _tool_status(
+                        "retrieval",
+                        "running",
+                        f"首次检索证据不足，执行补充检索：{suppl_query}",
+                        step,
+                    )
+                    suppl_started = time.perf_counter()
+                    try:
+                        extra = await retrieval_tool.retrieve(
+                            suppl_query,
+                            request.knowledge_base_id,
+                            document_id=request.document_id,
+                        )
+                        supplementary_latency_ms = (time.perf_counter() - suppl_started) * 1000.0
+                        merged, added = _merge_candidates(
+                            candidates,
+                            extra.candidates,
+                            limit=(
+                                self._settings.agent_retrieval_limit
+                                + self._settings.agent_supplementary_candidate_limit
+                            ),
+                        )
+                        candidates = merged
+                        supplementary_added = added
+                        supplementary_retrieval = True
+                        retrieval_latency_ms += extra.retrieval_latency_ms
+                        assessment_after = assess_evidence(requirement, candidates)
+                        trace.append(
+                            RAGAgentToolTraceData(
+                                tool="retrieval",
+                                status="completed",
+                                summary=f"补充检索新增 {added} 条候选来源",
+                                parameters={
+                                    "supplementary": True,
+                                    "query": suppl_query,
+                                    "added": added,
+                                    "missing_before": list(assessment_before.missing)[:8],
+                                },
+                            )
+                        )
+                        yield _tool_status(
+                            "retrieval",
+                            "completed",
+                            f"补充检索新增 {added} 条候选来源",
+                            step,
+                        )
+                    except Exception as error:
+                        supplementary_latency_ms = (time.perf_counter() - suppl_started) * 1000.0
+                        supplementary_error = type(error).__name__
+                        logger.warning(
+                            "agent supplementary retrieval failed (%s)",
+                            supplementary_error,
+                        )
+                        trace.append(
+                            RAGAgentToolTraceData(
+                                tool="retrieval",
+                                status="failed",
+                                summary="补充检索失败，保留初次检索候选",
+                                error_code="supplementary_retrieval_failed",
+                            )
+                        )
+                        yield _tool_status(
+                            "retrieval",
+                            "failed",
+                            "补充检索失败，保留初次检索候选继续回答",
+                            step,
+                        )
+        if assessment_after is None:
+            assessment_after = assess_evidence(requirement, candidates)
+
         executor = self._build_executor(document_loader)
-        used_tool_keys: set[tuple[str, int, int]] = set()
+        used_tool_keys: set[tuple[object, ...]] = set()
         try:
             for _round in range(self._settings.agent_max_rounds):
                 plan = await self._planner.plan(
@@ -484,6 +583,11 @@ class AgentChatService:
                     round_number=tool_calls + 1,
                     history_context=history_context or None,
                 )
+                if plan.action == "final" and not auto_visual and tool_calls == 0:
+                    forced = _auto_visual_plan(request.query, candidates, risk)
+                    if forced is not None:
+                        plan = forced
+                        auto_visual = True
                 if plan.action == "final":
                     break
                 tool = plan.tool
@@ -493,6 +597,12 @@ class AgentChatService:
                     tool,
                     plan.evidence_index,
                     plan.asset_index if tool == "analyze_image" else 0,
+                    plan.vision_task if tool == "analyze_image" else None,
+                    plan.question if tool == "analyze_image" else None,
+                    plan.operation,
+                    json.dumps(plan.parameters or {}, sort_keys=True, ensure_ascii=False)
+                    if plan.parameters
+                    else "",
                 )
                 if key in used_tool_keys or tool_calls >= self._settings.agent_max_tool_calls:
                     yield _tool_status(
@@ -550,6 +660,12 @@ class AgentChatService:
                     table_candidates.add(candidate.index)
                     if second_candidate is not None:
                         table_candidates.add(second_candidate.index)
+                tool_parameters = _trace_parameters(plan, candidate, second_candidate) or {}
+                if auto_visual and outcome.tool == "analyze_image" and tool_calls == 1:
+                    tool_parameters = {
+                        **tool_parameters,
+                        "auto_visual": True,
+                    }
                 trace.append(
                     RAGAgentToolTraceData(
                         tool=outcome.tool,
@@ -557,7 +673,7 @@ class AgentChatService:
                         summary=outcome.summary,
                         evidence_id=candidate.evidence_id,
                         document_id=candidate.citation.document_id,
-                        parameters=_trace_parameters(plan, candidate, second_candidate),
+                        parameters=tool_parameters or None,
                         fact_status=outcome.fact_status,
                         error_code=outcome.error_code,
                     )
@@ -637,6 +753,15 @@ class AgentChatService:
             retrieval_latency_ms=retrieval_latency_ms,
             retrieval_degraded=retrieval_degraded,
             branch_statuses=branch_statuses,
+            requirement=requirement,
+            assessment_before=assessment_before,
+            assessment_after=assessment_after,
+            supplementary_retrieval=supplementary_retrieval,
+            supplementary_query=supplementary_query,
+            supplementary_added=supplementary_added,
+            supplementary_latency_ms=supplementary_latency_ms,
+            supplementary_error=supplementary_error,
+            auto_visual=auto_visual,
             started=started,
         ):
             yield event
@@ -906,6 +1031,15 @@ class AgentChatService:
         retrieval_latency_ms: float,
         retrieval_degraded: bool,
         branch_statuses: dict[str, str] | None,
+        requirement: EvidenceRequirement | None = None,
+        assessment_before: EvidenceAssessment | None = None,
+        assessment_after: EvidenceAssessment | None = None,
+        supplementary_retrieval: bool = False,
+        supplementary_query: str | None = None,
+        supplementary_added: int = 0,
+        supplementary_latency_ms: float | None = None,
+        supplementary_error: str | None = None,
+        auto_visual: bool = False,
         started: float,
     ) -> AsyncIterator[RAGStreamEvent]:
         if (
@@ -940,6 +1074,12 @@ class AgentChatService:
                     candidates,
                     observations,
                     history_context,
+                    evidence_notes=_evidence_answer_notes(
+                        assessment_before,
+                        assessment_after,
+                        supplementary_retrieval=supplementary_retrieval,
+                        supplementary_error=supplementary_error,
+                    ),
                 ),
             ),
         ]
@@ -1063,6 +1203,30 @@ class AgentChatService:
                 memories_used=len(request.memories) if request.memories else 0,
                 retrieval_degraded=retrieval_degraded,
                 retrieval_branch_statuses=branch_statuses,
+                agent_evidence_required=_requirement_labels(requirement),
+                agent_evidence_missing=(
+                    list(assessment_after.missing) if assessment_after is not None else None
+                ),
+                agent_evidence_satisfied=(
+                    assessment_after.satisfied if assessment_after is not None else None
+                ),
+                agent_evidence_coverage_before=(
+                    assessment_before.coverage_summary() if assessment_before is not None else None
+                ),
+                agent_evidence_coverage_after=(
+                    assessment_after.coverage_summary() if assessment_after is not None else None
+                ),
+                agent_evidence_conflicts=(
+                    list(assessment_after.conflicts)
+                    if assessment_after is not None and assessment_after.conflicts
+                    else None
+                ),
+                agent_supplementary_retrieval=supplementary_retrieval,
+                agent_supplementary_query=supplementary_query,
+                agent_supplementary_added=supplementary_added,
+                agent_supplementary_latency_ms=supplementary_latency_ms,
+                agent_supplementary_error=supplementary_error,
+                agent_visual_auto_called=auto_visual,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 finish_reason=finish_reason,
@@ -1282,6 +1446,8 @@ def _answer_prompt(
     candidates: tuple[AgentCandidate, ...],
     observations: list[AgentToolObservation],
     history_context: str,
+    *,
+    evidence_notes: Sequence[str] = (),
 ) -> str:
     observation_text = _observations_text(observations) if observations else "（本轮未调用工具。）"
     lines: list[str] = []
@@ -1312,13 +1478,22 @@ def _answer_prompt(
         if source_text:
             lines.append(source_text)
         lines.append("")
+    if evidence_notes:
+        lines.extend(
+            [
+                "证据需求与缺口（应用层检查结果，必须遵守）：",
+                *[f"- {note}" for note in evidence_notes],
+                "",
+            ]
+        )
     lines.extend(
         [
             "工具结果：",
             observation_text,
             "",
             "请只引用真正支持回答的候选证据标记；如果某个工具未成功执行，"
-            "请明确说明该能力不可用，不要给出自行计算的结果。",
+            "请明确说明该能力不可用，不要给出自行计算的结果。关键证据仍然不足时，"
+            "请明确说明缺少哪个对象、年份或指标，不要用部分证据拼凑完整比较结论。",
         ]
     )
     return "\n".join(lines)
@@ -1388,6 +1563,139 @@ def _complete_error(
             retrieval_latency_ms=retrieval_latency_ms,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         ).model_dump(mode="json"),
+    )
+
+
+_CHART_FEATURE = re.compile(
+    r"趋势|走势|峰值|低谷|柱状|折线|曲线|图表|变化|波动|上升|下降|最高|最低|分布"
+)
+
+
+def _candidate_identity(candidate: AgentCandidate) -> tuple[str, str, str]:
+    citation = candidate.citation
+    identity = str(citation.chunk_id or candidate.evidence_id or candidate.marker)
+    return (str(citation.document_id), identity, str(citation.page_start))
+
+
+def _renumber_candidates(
+    candidates: Sequence[AgentCandidate],
+) -> tuple[AgentCandidate, ...]:
+    renumbered: list[AgentCandidate] = []
+    for index, candidate in enumerate(candidates, start=1):
+        marker = f"C{index}"
+        citation = candidate.citation.model_copy(update={"marker": marker})
+        renumbered.append(
+            AgentCandidate(
+                index=index,
+                marker=marker,
+                citation=citation,
+                document_title=candidate.document_title,
+                table_columns=candidate.table_columns,
+                table_rows=candidate.table_rows,
+                table_issue=candidate.table_issue,
+            )
+        )
+    return tuple(renumbered)
+
+
+def _merge_candidates(
+    initial: Sequence[AgentCandidate],
+    extra: Sequence[AgentCandidate],
+    *,
+    limit: int,
+) -> tuple[tuple[AgentCandidate, ...], int]:
+    capacity = max(limit, 1)
+    merged = list(initial[:capacity])
+    seen = {_candidate_identity(candidate) for candidate in merged}
+    added = 0
+    for candidate in extra:
+        if len(merged) >= capacity:
+            break
+        identity = _candidate_identity(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(candidate)
+        added += 1
+    return _renumber_candidates(merged), added
+
+
+def _requirement_labels(
+    requirement: EvidenceRequirement | None,
+) -> list[str] | None:
+    if requirement is None or requirement.empty:
+        return None
+    labels: list[str] = []
+    labels.extend(requirement.objects)
+    labels.extend(str(year) for year in requirement.years)
+    labels.extend(requirement.metrics)
+    if requirement.needs_image_feature:
+        labels.append("视觉特征")
+    elif requirement.needs_image:
+        labels.append("图片")
+    if requirement.needs_table:
+        labels.append("表格")
+    if requirement.comparison:
+        labels.append("跨对象比较")
+    return labels or None
+
+
+def _evidence_answer_notes(
+    before: EvidenceAssessment | None,
+    after: EvidenceAssessment | None,
+    *,
+    supplementary_retrieval: bool,
+    supplementary_error: str | None,
+) -> tuple[str, ...]:
+    notes: list[str] = []
+    if before is not None and before.missing:
+        notes.append("首次检索后存在证据缺口：" + "；".join(before.missing[:6]))
+    if before is not None and before.conflicts:
+        notes.extend(before.conflicts)
+    if supplementary_retrieval:
+        notes.append("应用层已执行一次补充检索，并合并去重候选证据。")
+    if after is not None and after.missing:
+        notes.append(
+            "补充检索后仍缺少："
+            + "；".join(after.missing[:6])
+            + "。若无法补齐，请明确说明缺少什么，不要拼凑完整比较或精确计算。"
+        )
+    if supplementary_error:
+        notes.append("补充检索失败，仅使用首次检索证据回答。")
+    return tuple(notes)
+
+
+def _auto_visual_plan(
+    query: str,
+    candidates: tuple[AgentCandidate, ...],
+    risk: object,
+) -> AgentPlan | None:
+    """Call the image tool when a visual-feature question needs native pixels.
+
+    The planner still owns table and text decisions. This guard only prevents a
+    "final" plan from skipping the image analysis that the question requires.
+    """
+    if not visual_feature_requested(query):
+        return None
+    if not bool(getattr(risk, "visual_intent", False)):
+        return None
+    image_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.modality == "image" and candidate.tool_capable
+    ]
+    if not image_candidates:
+        return None
+    target = image_candidates[0]
+    vision_task = "analyze_chart" if _CHART_FEATURE.search(query) else "describe_image"
+    return AgentPlan(
+        action="call_tool",
+        reason="问题要求原生视觉特征分析，应用层自动调用图片分析",
+        tool="analyze_image",
+        evidence_index=target.index,
+        asset_index=0,
+        vision_task=vision_task,
+        question=query[:500],
     )
 
 

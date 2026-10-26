@@ -135,6 +135,7 @@ class UnifiedRetrievalConfig(BaseModel):
     visual_candidate_limit: StrictInt = Field(default=8, ge=1, le=100)
     visual_fusion_quota: StrictInt = Field(default=2, ge=0, le=5)
     visual_quota_ambiguous: StrictInt = Field(default=1, ge=0, le=5)
+    visual_quota_explicit: StrictInt = Field(default=4, ge=1, le=8)
     candidate_pool_limit: StrictInt = Field(default=48, ge=1, le=500)
     result_limit: StrictInt = Field(default=8, ge=1, le=500)
     rerank_text_max_chars: StrictInt = Field(default=6_000, ge=1, le=20_000)
@@ -1312,7 +1313,10 @@ class UnifiedRetrievalService:
             risk = assess_visual_risk(query)
             if risk.visual_intent:
                 visual_intent = "explicit"
-                visual_quota = self.config.visual_fusion_quota
+                visual_quota = min(
+                    self.config.visual_quota_explicit,
+                    self.config.visual_candidate_limit,
+                )
             elif risk.high_risk:
                 visual_intent = "ambiguous"
                 visual_quota = self.config.visual_quota_ambiguous
@@ -1375,6 +1379,11 @@ class UnifiedRetrievalService:
         else:
             final_items = []
         rerank_latency_ms = (perf_counter() - rerank_started) * 1_000
+        applied_visual_quota = sum(
+            1
+            for candidate in (final_items if candidates else [])
+            if any(branch.branch == "visual" for branch in candidate.branches)
+        )
 
         result = UnifiedRetrievalResult(
             query=query,
@@ -1393,7 +1402,7 @@ class UnifiedRetrievalService:
             ],
             candidate_pool_size=len(candidates),
             visual_intent=visual_intent,
-            visual_quota_applied=visual_quota,
+            visual_quota_applied=applied_visual_quota,
             normalization_latency_ms=normalization_latency_ms,
             rerank_latency_ms=rerank_latency_ms,
             total_latency_ms=(perf_counter() - started) * 1_000,
