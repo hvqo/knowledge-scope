@@ -115,7 +115,10 @@ def test_number_set_alone_cannot_detect_swapped_values() -> None:
 
 def test_swapped_country_values_are_replaced_by_deterministic_result() -> None:
     outcome = _table_outcome(
-        columns=[{"name": "国家"}, {"name": "2024年GDP"}],
+        columns=[
+            {"name": "国家", "kind": "text"},
+            {"name": "2024年GDP", "kind": "number", "unit": "亿美元"},
+        ],
         rows=[["越南", "4760"], ["泰国", "5200"]],
         units=["亿美元"],
     )
@@ -139,11 +142,11 @@ def test_swapped_years_are_not_presented_as_verified() -> None:
     outcome = _table_outcome(
         operation="growth",
         columns=[
-            {"name": "指标"},
-            {"name": "基期值"},
-            {"name": "报告期值"},
-            {"name": "绝对变化"},
-            {"name": "相对变化"},
+            {"name": "指标", "kind": "text"},
+            {"name": "基期值", "kind": "number", "unit": "亿美元"},
+            {"name": "报告期值", "kind": "number", "unit": "亿美元"},
+            {"name": "绝对变化", "kind": "number", "unit": "亿美元"},
+            {"name": "相对变化", "kind": "percent", "unit": "%"},
         ],
         rows=[["越南", "4300", "4760", "460", "10.6977"]],
         units=["亿美元", "%"],
@@ -157,7 +160,8 @@ def test_swapped_years_are_not_presented_as_verified() -> None:
     answer = _answer_text(events)
     assert "基期值 = 4300" in answer
     assert "报告期值 = 4760" in answer
-    assert "单位：亿美元 | %" in answer
+    assert "绝对变化 = 460 亿美元" in answer
+    assert "相对变化 = 10.6977%" in answer
     assert "2023 年 GDP 为 4760" not in answer
     assert "2024 年 GDP 为 4300" not in answer
     assert "10.6977" in answer
@@ -165,7 +169,10 @@ def test_swapped_years_are_not_presented_as_verified() -> None:
 
 def test_same_number_with_wrong_unit_is_not_presented_as_verified() -> None:
     outcome = _table_outcome(
-        columns=[{"name": "国家"}, {"name": "2024年GDP"}],
+        columns=[
+            {"name": "国家", "kind": "text"},
+            {"name": "2024年GDP", "kind": "number", "unit": "亿美元"},
+        ],
         rows=[["越南", "4760"]],
         units=["亿美元"],
     )
@@ -183,11 +190,11 @@ def test_correct_table_calculation_and_formula_stay_verified() -> None:
     outcome = _table_outcome(
         operation="growth",
         columns=[
-            {"name": "指标"},
-            {"name": "基期值"},
-            {"name": "报告期值"},
-            {"name": "绝对变化"},
-            {"name": "相对变化"},
+            {"name": "指标", "kind": "text"},
+            {"name": "基期值", "kind": "number", "unit": "亿美元"},
+            {"name": "报告期值", "kind": "number", "unit": "亿美元"},
+            {"name": "绝对变化", "kind": "number", "unit": "亿美元"},
+            {"name": "相对变化", "kind": "percent", "unit": "%"},
         ],
         rows=[["越南", "4300", "4760", "460", "10.6977"]],
         units=["亿美元", "%"],
@@ -200,7 +207,8 @@ def test_correct_table_calculation_and_formula_stay_verified() -> None:
     )
     answer = _answer_text(events)
     complete = _complete(events)
-    assert "10.6977" in answer
+    assert "相对变化 = 10.6977%" in answer
+    assert "10.6977 亿美元" not in answer
     assert "((4760 - 4300) / 4300) × 100% = 10.6977%" in answer
     assert "无法核验" not in answer
     assert complete["fact_status"] == "source_verified"
@@ -209,7 +217,11 @@ def test_correct_table_calculation_and_formula_stay_verified() -> None:
 
 def test_structured_table_facts_keep_row_column_and_unit_binding() -> None:
     outcome = _table_outcome(
-        columns=[{"name": "国家"}, {"name": "2023年GDP"}, {"name": "2024年GDP"}],
+        columns=[
+            {"name": "国家", "kind": "text"},
+            {"name": "2023年GDP", "kind": "number", "unit": "亿美元"},
+            {"name": "2024年GDP", "kind": "number", "unit": "亿美元"},
+        ],
         rows=[["越南", "4300", "4760"]],
         units=["亿美元"],
     )
@@ -231,7 +243,11 @@ def test_compare_result_renders_both_documents_in_order() -> None:
         payload={
             "status": "ok",
             "operation": "compare",
-            "columns": [{"name": "国家"}, {"name": "差异"}, {"name": "相对差异"}],
+            "columns": [
+                {"name": "国家", "kind": "text"},
+                {"name": "差异", "kind": "number", "unit": "亿美元"},
+                {"name": "相对差异", "kind": "percent", "unit": "%"},
+            ],
             "rows": [{"cells": ["越南", "60", "1.2766"]}],
             "formula": "difference = A - B",
             "units": ["亿美元", "%"],
@@ -240,7 +256,110 @@ def test_compare_result_renders_both_documents_in_order() -> None:
     )
     facts = _structured_table_facts(outcome)
     assert facts == [
-        "越南：差异 = 60；相对差异 = 1.2766。",
+        "越南：差异 = 60 亿美元；相对差异 = 1.2766%。",
         "公式：difference = A - B",
-        "单位：亿美元 | %",
     ]
+
+
+def _real_growth_result() -> dict[str, Any]:
+    from knowledge_scope.table_analysis.models import (
+        TableAnalysisResult,
+        TableSource,
+    )
+    from knowledge_scope.table_analysis.operations import GrowthParameters, run_growth
+    from knowledge_scope.table_analysis.parsing import parse_markdown_table
+
+    table = parse_markdown_table(
+        "| 年份 | GDP |\n| --- | --- |\n| 2023 | 4300 |\n| 2024 | 4760 |\n",
+        caption="表 1 越南 GDP 单位：亿美元",
+        unit_hint="亿美元",
+    )
+    outcome = run_growth(
+        table,
+        GrowthParameters(axis="rows", column="GDP", base_row=0, target_row=1),
+    )
+    result = TableAnalysisResult(
+        operation="growth",
+        status="ok",
+        columns=outcome.columns,
+        rows=outcome.rows,
+        formula=outcome.formula,
+        inputs=outcome.inputs,
+        units=outcome.units,
+        warnings=outcome.warnings,
+        sources=[
+            TableSource(
+                table_role="table_a",
+                document_id=DOC_ID,
+                evidence_id="evidence_v1_" + "d" * 64,
+                page_start=1,
+                page_end=1,
+                source_block_ids=["p1-b2"],
+            )
+        ],
+    )
+    return result.model_dump(mode="json")
+
+
+def test_real_table_analysis_result_has_no_metric_unit_on_percent_columns() -> None:
+    from knowledge_scope.agent.service import _structured_table_facts
+
+    payload = _real_growth_result()
+    assert payload["status"] == "ok"
+    columns = {column["name"]: column for column in payload["columns"]}
+    assert columns["相对变化"]["kind"] == "percent"
+    assert columns["相对变化"]["unit"] == "%"
+
+    outcome = AgentToolOutcome(
+        tool="analyze_table",
+        status="completed",
+        summary="表格计算完成（growth）",
+        payload=payload,
+        fact_status="source_verified",
+    )
+    facts = _structured_table_facts(outcome)
+    text = "\n".join(facts)
+    assert "基期值 = 4300 亿美元" in text
+    assert "报告期值 = 4760 亿美元" in text
+    assert "绝对变化 = 460 亿美元" in text
+    assert "相对变化 = 10.6977%" in text
+    assert "10.6977 亿美元" not in text
+
+
+def test_percentage_metric_absolute_change_uses_percentage_points() -> None:
+    from knowledge_scope.agent.service import _structured_table_facts
+    from knowledge_scope.table_analysis.models import (
+        TableAnalysisResult,
+    )
+    from knowledge_scope.table_analysis.operations import GrowthParameters, run_growth
+    from knowledge_scope.table_analysis.parsing import parse_markdown_table
+
+    table = parse_markdown_table(
+        "| 年份 | 增长率 |\n| --- | --- |\n| 2023 | 10% |\n| 2024 | 12.5% |\n"
+    )
+    outcome = run_growth(
+        table,
+        GrowthParameters(axis="rows", column="增长率", base_row=0, target_row=1),
+    )
+    result = TableAnalysisResult(
+        operation="growth",
+        status="ok",
+        columns=outcome.columns,
+        rows=outcome.rows,
+        formula=outcome.formula,
+        inputs=outcome.inputs,
+        units=outcome.units,
+        warnings=outcome.warnings,
+    )
+    facts = _structured_table_facts(
+        AgentToolOutcome(
+            tool="analyze_table",
+            status="completed",
+            summary="",
+            payload=result.model_dump(mode="json"),
+            fact_status="source_verified",
+        )
+    )
+    text = "\n".join(facts)
+    assert "绝对变化 = 2.5 百分点" in text
+    assert "相对变化 = 25.0000%" in text

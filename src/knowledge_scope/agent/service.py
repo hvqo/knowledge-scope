@@ -157,6 +157,24 @@ def _table_cell_label(value: Any) -> bool:
     return not extract_numeric_claims(text)
 
 
+def _structured_column_unit(column: dict[str, Any]) -> str:
+    """Return the unit that belongs to one concrete result column.
+
+    Derived percentage columns must not inherit the input metric's unit (for
+    example "10.6977 亿美元"); a relative change is a percentage while the
+    absolute change of a percentage metric is expressed in percentage points.
+    """
+
+    name = str(column.get("name") or "").strip()
+    kind = str(column.get("kind") or "").strip()
+    unit = str(column.get("unit") or "").strip()
+    if kind == "percent":
+        if name.startswith("绝对"):
+            return "百分点"
+        return unit or "%"
+    return unit
+
+
 def _structured_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
     """Render M2 structured results with explicit row, column, and unit binding.
 
@@ -169,13 +187,9 @@ def _structured_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
     payload = outcome.payload or {}
     if payload.get("status") != "ok":
         return []
-    columns = [
-        str(item.get("name", "")).strip()
-        for item in payload.get("columns") or []
-        if isinstance(item, dict)
-    ]
-    units = [str(unit).strip() for unit in payload.get("units") or [] if str(unit).strip()]
-    per_column_units = len(units) == len(columns)
+    column_specs = [item for item in payload.get("columns") or [] if isinstance(item, dict)]
+    legacy_units = [str(unit).strip() for unit in payload.get("units") or [] if str(unit).strip()]
+    has_column_units = any(str(item.get("unit") or "").strip() for item in column_specs)
     facts: list[str] = []
     for row in (payload.get("rows") or [])[:10]:
         cells = row.get("cells") if isinstance(row, dict) else row
@@ -187,13 +201,11 @@ def _structured_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
             text = "" if cell is None else str(cell).strip()
             if not text or _table_cell_label(cell):
                 continue
-            column = columns[index] if index < len(columns) else f"列 {index + 1}"
-            unit = ""
-            if len(units) == 1:
-                unit = f" {units[0]}"
-            elif per_column_units and units[index]:
-                unit = f" {units[index]}"
-            pairs.append(f"{column} = {text}{unit}")
+            column_spec = column_specs[index] if index < len(column_specs) else {}
+            column = str(column_spec.get("name", "")).strip() or f"列 {index + 1}"
+            unit = _structured_column_unit(column_spec)
+            suffix = "%" if unit == "%" else f" {unit}" if unit else ""
+            pairs.append(f"{column} = {text}{suffix}")
         if not pairs:
             continue
         prefix = " / ".join(labels) if labels else "结果"
@@ -201,8 +213,8 @@ def _structured_table_facts(outcome: AgentToolOutcome | None) -> list[str]:
     formula = str(payload.get("formula") or "").strip()
     if formula:
         facts.append(f"公式：{formula}")
-    if len(units) > 1 and not per_column_units:
-        facts.append("单位：" + " | ".join(units))
+    if legacy_units and not has_column_units:
+        facts.append("单位：" + " | ".join(legacy_units))
     return facts
 
 
