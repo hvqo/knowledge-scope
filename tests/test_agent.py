@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -1954,3 +1955,124 @@ def test_m9_same_image_with_different_question_is_not_deduplicated() -> None:
     anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
 
     assert executor.calls == [("analyze_image", 1), ("analyze_image", 1)]
+
+
+class _PlanCapturingExecutor:
+    def __init__(self) -> None:
+        self.asset_indices: list[int] = []
+
+    async def analyze_image(self, candidate: AgentCandidate, plan: AgentPlan) -> AgentToolOutcome:
+        self.asset_indices.append(plan.asset_index)
+        return _analyze_image_outcome(asset_index=plan.asset_index)
+
+    async def analyze_table(
+        self,
+        candidate: AgentCandidate,
+        plan: AgentPlan,
+        second_candidate: AgentCandidate | None = None,
+    ) -> AgentToolOutcome:
+        raise AssertionError("unexpected table execution")
+
+
+def test_run_tool_normalizes_planner_asset_index_to_candidate_asset() -> None:
+    cases = [(1, 0, 1), (0, 1, 0), (1, 1, 1)]
+    for candidate_asset, plan_asset, expected in cases:
+        candidate = replace(
+            _candidate(1, marker="C1", evidence_id="evidence_v1_" + "a" * 64),
+            asset_index=candidate_asset,
+        )
+        executor = _PlanCapturingExecutor()
+        service = _service(
+            gateway=_FakeGateway(plans=[], deltas=[]),
+            retrieval=_StubRetrieval(_retrieval_result([candidate])),
+            executor=executor,
+        )
+        plan = AgentPlan(
+            action="call_tool",
+            tool="analyze_image",
+            evidence_index=1,
+            asset_index=plan_asset,
+            vision_task="describe_image",
+            question="图片里有什么？",
+        )
+        outcome = anyio.run(service._run_tool, executor, candidate, plan, None)
+        assert executor.asset_indices == [expected]
+        assert outcome.payload["asset_index"] == expected
+
+
+def test_run_tool_keeps_distinct_asset_indices_of_same_evidence() -> None:
+    evidence_id = "evidence_v1_" + "b" * 64
+    candidate = replace(_candidate(1, marker="C1", evidence_id=evidence_id), asset_index=1)
+    executor = _PlanCapturingExecutor()
+    service = _service(
+        gateway=_FakeGateway(plans=[], deltas=[]),
+        retrieval=_StubRetrieval(_retrieval_result([candidate])),
+        executor=executor,
+    )
+    plan = AgentPlan(
+        action="call_tool",
+        tool="analyze_image",
+        evidence_index=1,
+        asset_index=0,
+        vision_task="analyze_chart",
+    )
+    anyio.run(service._run_tool, executor, candidate, plan, None)
+    assert executor.asset_indices == [1]
+
+
+def test_mixed_table_and_visual_completion_is_not_source_verified() -> None:
+    table_candidate = _candidate(
+        1,
+        marker="C1",
+        modality="table",
+        evidence_id="evidence_v1_" + "c" * 64,
+        table_columns=("年份", "GDP"),
+    )
+    image_candidate = _candidate(
+        2,
+        marker="C2",
+        modality="image",
+        evidence_id="evidence_v1_" + "d" * 64,
+    )
+    gateway = _FakeGateway(
+        plans=[
+            {
+                "action": "call_tool",
+                "tool": "analyze_table",
+                "evidence_index": 1,
+                "operation": "growth",
+                "parameters": {
+                    "axis": "columns",
+                    "row": 0,
+                    "base_column": 1,
+                    "target_column": 2,
+                },
+            },
+            {
+                "action": "call_tool",
+                "tool": "analyze_image",
+                "evidence_index": 2,
+                "vision_task": "analyze_chart",
+            },
+            {"action": "final", "reason": "证据足够"},
+        ],
+        deltas=["表格增长率为 10.6977%。", "两国 2024 年 GDP 相差约 440 亿美元。"],
+    )
+    service = _service(
+        gateway=gateway,
+        retrieval=_StubRetrieval(_retrieval_result([table_candidate, image_candidate])),
+        executor=_StubExecutor(
+            [_service_table_outcome(), _service_image_outcome(), _service_image_outcome()]
+        ),
+    )
+    request = RAGQueryRequest(
+        query="比较越南和泰国 2024 年 GDP，并说明柱状图趋势。",
+        knowledge_base_id=KB_ID,
+        answer_mode="agent",
+    )
+    events = anyio.run(lambda: _collect(service.stream(request, document_loader=_no_document)))
+    complete = next(event for event in events if event.event == "complete")
+    assert complete.data["fact_status"] in {"visual_estimate", "unverified"}
+    assert complete.data["fact_status"] != "source_verified"
+    assert complete.data["safety_gate"] == "visual_unverified"
+    assert complete.data["safety_notice"]

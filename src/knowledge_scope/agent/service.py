@@ -950,6 +950,9 @@ class AgentChatService:
         second_candidate: AgentCandidate | None,
     ) -> AgentToolOutcome:
         if plan.tool == "analyze_image":
+            effective_asset_index = _effective_asset_index(candidate, plan)
+            if plan.asset_index != effective_asset_index:
+                plan = plan.model_copy(update={"asset_index": effective_asset_index})
             return await executor.analyze_image(candidate, plan)
         if plan.tool == "analyze_table":
             return await executor.analyze_table(candidate, plan, second_candidate)
@@ -1187,7 +1190,7 @@ class AgentChatService:
             ).model_dump(mode="json"),
         )
         history_fields = _history_fields(history_plan)
-        if table_verified:
+        if table_verified and not visual_executions:
             fact_status = "source_verified"
             safety_gate = "none"
             safety_notice = None
@@ -1199,7 +1202,9 @@ class AgentChatService:
                 else "not_available"
             )
             safety_gate = "visual_unverified"
-            safety_notice = "视觉分析结果仅供参考，需人工核对，不能作为精确统计数据使用。"
+            safety_notice = (
+                "回答包含视觉分析或模型归纳的数值，需人工核对，不能作为精确统计数据使用。"
+            )
         else:
             fact_status = "not_available"
             safety_gate = "none"
