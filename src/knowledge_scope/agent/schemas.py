@@ -121,6 +121,7 @@ class AgentCandidate:
     table_columns: tuple[str, ...] = ()
     table_rows: tuple[str, ...] = ()
     table_issue: str | None = None
+    asset_index: int | None = None
 
     @property
     def evidence_id(self) -> str | None:
